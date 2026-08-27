@@ -1,0 +1,361 @@
+# docker-compose.storage.yml — compose override adding our NIXL storage-plugin
+# backends (SPDK_NVMe_KV, XNVME_KV) to AMD's rocm-aic stack.
+#
+# STATUS: staged, never composed or run (as of this session, 2026-08-19). Written from
+# reading the pinned ROCm/rocm-aic checkout (commit bb386562, 2026-08-14) and this
+# repo's own plugin/LMCache sources — no `docker compose` invocation of this file has
+# happened yet, because the image it depends on (rocm-aic + our two plugins compiled
+# in, per ../nixl/core/nvme-kv-plugin/ and ../nixl/core/xnvme-kv-plugin/, via the
+# sibling Dockerfile-build patch) does not exist yet either. Treat the first
+# `docker compose ... up` against this file as bring-up, not a benchmark — see
+# deploy-spdk.sh / deploy-xnvme.sh for the full caveat and stack/tracks/mori/README.md
+# for the tone this note is borrowed from.
+#
+# ── HOW TO COMPOSE THIS FILE ─────────────────────────────────────────────────────
+# This file lives in THIS repo (stack/tracks/rocm-aic/), not inside the vendored
+# rocm-aic checkout (vendor.sh clones that to stack/tracks/rocm-aic/vendor/rocm-aic/,
+# not committed here — see vendor.sh's header). rocm-aic's own docker-compose.yml
+# resolves relative build contexts and volume paths (`context: ..`, `../logs/...`,
+# `../monitoring/...`) relative to ITS OWN docker/ directory, so both files must be
+# composed with docker/ as the working directory, base file first:
+#
+#   cd stack/tracks/rocm-aic/vendor/rocm-aic/docker
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f <repo-root>/stack/tracks/rocm-aic/docker-compose.storage.yml \
+#     --profile storage-spdk up -d      # SPDK_NVMe_KV variant (rocm-aic-spdk)
+#   # or --profile storage-xnvme        # XNVME_KV variant (rocm-aic-xnvme)
+#
+# deploy-spdk.sh / deploy-xnvme.sh do this cd + -f/--profile dance for you; this
+# header is for anyone composing by hand or debugging why a relative path didn't
+# resolve.
+#
+# ── WHY TWO NEW SERVICES, NOT TWO PROFILES OF THE EXISTING `lmcache` SERVICE ──────
+# The base `lmcache` service picks its L1/L2 topology at container-start time via a
+# shell `case` inside its single `command:` (keyed off AIC_L2_BACKEND / GDS_MODE). A
+# compose service has exactly one `command:` — profiles choose which SERVICES start,
+# they cannot choose between two command bodies of the same service. So rather than
+# extend `lmcache`, this file defines two full sibling services, `lmcache-spdk` and
+# `lmcache-xnvme`, each behind its own profile, each running its own fixed
+# `--l2-adapter` invocation instead of the base entrypoint's case logic. Both reuse
+# the same shared image (`${IMAGE_REF}` — this is one monolithic image containing
+# vLLM + LMCache + NIXL + our plugins, not a per-service image, so no separate
+# `build:` block is needed here as long as `make build` in the vendored checkout has
+# already produced that tag) and copy the base `lmcache` service's caps/ulimits/
+# security_opt, which already cover everything SPDK's/xNVMe's userspace NVMe
+# initiators need (see the per-service comments below for exactly what's reused vs.
+# added).
+#
+# `vllm` only has one IPC/PID namespace to join at a time. Point it at whichever of
+# the two new services is active via VLLM_IPC_MODE=service:lmcache-spdk (or
+# -xnvme) and VLLM_PID_MODE=service:lmcache-spdk (or -xnvme) — the deploy scripts set
+# both. The `depends_on` entries added to `vllm` below MERGE additively with the base
+# file's `vllm.depends_on.lmcache` (which has `required: false`) rather than replacing
+# it — harmless, since the `cache` profile the base `lmcache` service lives behind is
+# never activated by `storage-spdk`/`storage-xnvme`.
+#
+# Also adds a `ports:` mapping to `vllm` — the base compose file's `vllm` service has
+# NONE (it's reachable only from other containers on the internal `aic` bridge
+# network, e.g. the `client` container, by design). This repo's bench/tracks.registry
+# contract (see bench/tracks.registry's header) requires a deploy script to serve at
+# http://127.0.0.1:${PORT}/v1 on the HOST, so a `ports:` entry publishing the
+# container's 8000 to the host is required for this track to be benchmarkable the
+# same way every other track in this repo is.
+#
+# ── --l2-adapter FLAG SHAPE: confirmed from two real sources, not guessed whole ──
+# The base docker-compose.yml already invokes --l2-adapter for two existing NIXL
+# storage backends — read from ROCm/rocm-aic @ bb386562, docker/docker-compose.yml:
+#
+#   AIS_MT (file-based nixl_store, hipFile P2PDMA to local NVMe), line ~279:
+#     --l2-adapter "{\"type\":\"nixl_store\",\"backend\":\"AIS_MT\",
+#       \"backend_params\":{\"file_path\":\"/data/nvme/lmcache\",
+#       \"use_direct_io\":\"$$AIC_NIXL_USE_DIRECT_IO\",
+#       \"file_size\":\"$$LMCACHE_NVME_SLOT_SIZE\"},\"pool_size\":$$LMCACHE_NVME_POOL}"
+#
+#   POSIX (file-based nixl_store, buffered I/O, NFS-over-RDMA), line ~280:
+#     --l2-adapter "{\"type\":\"nixl_store\",\"backend\":\"POSIX\",
+#       \"backend_params\":{\"file_path\":\"/data/nfs/lmcache\",
+#       \"use_direct_io\":\"false\"},\"pool_size\":$$LMCACHE_NFS_POOL}"
+#
+# Both are FILE-addressed (file_path/file_size/use_direct_io) because AIS_MT/POSIX
+# are byte-range-into-a-file nixl_store adapters — that's the SHAPE (the JSON
+# envelope: type/backend/backend_params/pool_size), not the content, we're following.
+#
+# SPDK_NVMe_KV and XNVME_KV are KV-*key*-addressed instead, and rocm-aic's own
+# sibling patch (stack/tracks/rocm-aic/patches/lmcache/
+# 15-add-spdk-xnvme-kv-l2-adapter-backends.patch, already written by a parallel task)
+# confirms exactly how rocm-aic's LMCache fork treats them: it adds both names to
+# `_VALID_NIXL_BACKENDS` and routes them (alongside OBJ/AZURE_BLOB) through
+# `NixlObjPool` + `init_storage_handlers_object(...)` in
+# `lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py`'s `NixlStorageAgent`
+# class — i.e. the OBJECT-based branch, not the file-based one, so no file_path/
+# file_size/use_direct_io keys are read or required for these two. Fetching that
+# class's real source (LMCache v0.5.3, the exact pin this repo's Makefile uses)
+# confirms `backend_params` for OBJ-mode backends is NOT inspected key-by-key by
+# LMCache at all — `NixlStorageAgent.__init__` passes it straight through:
+#   self.nixl_agent.create_backend(backend, backend_params)
+# i.e. verbatim to NIXL core's own backend constructor, the exact same call vanilla
+# LMCache's classic NixlStaticStorageBackend path (stack/tracks/lmcache/ in this
+# repo) already makes with these same two backends. That means the backend_params
+# key names CONFIRMED there carry over unchanged:
+#   SPDK_NVMe_KV -> {"trid": "<NVMe-oF transport-ID string>"}   (see
+#     stack/tracks/lmcache/lmcache-config-spdk.yaml and
+#     stack/tracks/lmcache/patches/README.md's note on patch 0003 — a single key,
+#     confirmed against spdk_nvme_kv_plugin.cpp's getParams(), NOT "dev_uri")
+#   XNVME_KV     -> {"dev_uri": "/dev/ng0n1"}                    (see
+#     stack/tracks/lmcache/lmcache-config.yaml)
+#
+# UNVERIFIED: the confirmation above covers the Python/LMCache side (backend_params
+# passthrough) and the plugin side (getParams() key names), both against a REAL
+# source read — not a guess. What remains genuinely unconfirmed is (a) NixlObjPool's
+# page_size/pool_size behavior for a KV-object backend under real load (only
+# exercised so far, in this repo, via the classic YAML-config path — never through
+# rocm-aic's newer NixlStorageAgent/--l2-adapter path at all), and (b) whether the
+# SPDK/xnvme .so's the sibling Dockerfile-build patch compiles in actually get found
+# by NIXL_PLUGIN_DIR inside THIS image the same way the existing AIS_MT/POSIX ones
+# do. Both can only be settled by actually running `docker compose ... build` +
+# `up` once the image exists — which is exactly why this whole track is staged, not
+# validated.
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # lmcache-spdk: SPDK_NVMe_KV backend against the RAM-backed bdev_kvmalloc SPDK
+  # TCP target on host <SETUP3_TARGET_NODE> (CIRRASCALE cluster, <SETUP3_TARGET_NODE_IP>:4420 — see this
+  # repo's memory handoff_2026_08_18_3node_storage_target for how that target was
+  # built and validated as a real cross-host NVMe-oF endpoint). Category (2) per
+  # the repo's category taxonomy: a workaround for hardware unavailability (no real device
+  # NVMe-KV PCIe function anywhere on the CIRRASCALE cluster) — a number off this
+  # service is never a result about the device.
+  #
+  # Caps/ulimits/security_opt copied verbatim from the base `lmcache` service
+  # (docker/docker-compose.yml) — CAP_SYS_ADMIN + IPC_LOCK + unlimited memlock +
+  # seccomp:unconfined already cover everything SPDK's DPDK-based NVMe-oF/TCP
+  # initiator needs (same set stack/tracks/mooncake/vllm/03-deploy.sh and
+  # stack/tracks/lmcache/deploy-spdk.sh grant their own SPDK-touching containers).
+  # The one thing the base service's mounts do NOT already provide is hugepages
+  # (its volumes are NVME_DATA/NFS_DATA/GDS_SLAB_DATA/config-file, none of which is
+  # /dev/hugepages) — added below.
+  # ---------------------------------------------------------------------------
+  lmcache-spdk:
+    profiles: [storage-spdk]
+    image: ${IMAGE_REF:-${IMAGE_NAME:-rocm-aic}:latest}
+    container_name: aic-lmcache-spdk
+    networks: [aic]
+    ipc: shareable
+    shm_size: "${AIC_SHM_SIZE:-64gb}"
+    cap_add:
+      - CAP_SYS_ADMIN
+      - SYS_PTRACE
+      - IPC_LOCK
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+      memlock:
+        soft: -1
+        hard: -1
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    volumes:
+      # SPDK's DPDK EAL needs hugepages -- the one mount none of the base
+      # `lmcache` service's volumes provide.
+      - /dev/hugepages:/dev/hugepages
+      - ${LOG:-../logs}/lmcache-spdk:/var/log/aic-lmcache
+    environment:
+      - LMCACHE_PORT=${LMCACHE_SPDK_PORT:-6556}
+      - LMCACHE_L1_SIZE_GB=${LMCACHE_L1_SIZE_GB:-20}
+      - LMCACHE_MAX_GPU_WORKERS=${LMCACHE_MAX_GPU_WORKERS:-1}
+      - ROCR_VISIBLE_DEVICES=${GPU:-0}
+      - PYTHONHASHSEED=0
+      - TZ=${TZ:-America/Edmonton}
+      - HIPFILE_ALLOW_COMPAT_MODE=false
+      - HIPFILE_UNSUPPORTED_FILE_SYSTEMS=false
+      - NIXL_TELEMETRY_ENABLE=${NIXL_TELEMETRY_ENABLE-y}
+      - NIXL_TELEMETRY_EXPORTER=${NIXL_TELEMETRY_EXPORTER:-prometheus}
+      - NIXL_TELEMETRY_PROMETHEUS_PORT=${NIXL_SPDK_METRICS_PORT:-19091}
+      # SPDK_NVMe_KV's one backend_params key -- a full NVMe-oF transport-ID
+      # string, NOT "dev_uri" (see the file header's --l2-adapter note). Default
+      # points at the <SETUP3_TARGET_NODE> storage target this variant is built for.
+      - AIC_SPDK_KV_TRID=${AIC_SPDK_KV_TRID:-trtype:TCP adrfam:IPv4 traddr:<SETUP3_TARGET_NODE_IP> trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0}
+      # pool_size here means "number of raw L1 pages" (NixlObjPool registers
+      # ONE storage object per l1_align_bytes-sized page for OBJ-family
+      # backends -- no file_size/pages_per_file grouping like the file-based
+      # backends above get), NOT "number of KV chunks". Confirmed empirically
+      # 2026-08-18 (see README's "Known gap" section): TinyLlama's fp8 KV
+      # layout gives l1_align_bytes=4096, so a 256-token chunk needs ~700
+      # pages -- the old default of 64 exhausted on the very first multi-page
+      # store, and NixlStorageAgent's own "nothing to store" fast-path
+      # reported that as a *successful* zero-byte store with no warning.
+      # 2000000 is NOT derived from LMCACHE_L1_SIZE_GB's default (that would
+      # be 5242880 = 20 GiB / 4096 B) -- registering that many NIXL OBJ
+      # descriptors in init_storage_handlers_object() was empirically
+      # confirmed (2026-08-18) to blow up non-linearly (2,000,000 came up
+      # healthy in ~90s; 5,242,880 was still spinning at 100%+ CPU with zero
+      # forward progress after 10+ minutes). 2,000,000 is the largest value
+      # actually verified to come up quickly AND land real STORE traffic on
+      # <SETUP3_TARGET_NODE>'s target (confirmed via nvmf_get_stats' completed_nvme_io) --
+      # treat it as a tested ceiling, not a capacity-matched value, and
+      # re-verify startup time before raising it further.
+      - AIC_SPDK_KV_POOL=${AIC_SPDK_KV_POOL:-2000000}
+    entrypoint: ["/bin/bash", "-o", "pipefail", "-c"]
+    command:
+      - |
+        exec lmcache server \
+          --no-separate-object-groups \
+          --host 0.0.0.0 \
+          --http-port 8080 \
+          --port "$$LMCACHE_PORT" \
+          --l1-size-gb "$$LMCACHE_L1_SIZE_GB" \
+          --eviction-policy LRU \
+          --max-gpu-workers "$$LMCACHE_MAX_GPU_WORKERS" \
+          --worker-reap-timeout-seconds "$${LMCACHE_WORKER_REAP_TIMEOUT:-3600}" \
+          --l2-adapter "{\"type\":\"nixl_store\",\"backend\":\"SPDK_NVMe_KV\",\"backend_params\":{\"trid\":\"$$AIC_SPDK_KV_TRID\"},\"pool_size\":$$AIC_SPDK_KV_POOL}"
+        # UNVERIFIED: confirm this exact --l2-adapter invocation against a real
+        # rocm-aic build with our plugin actually compiled in -- see file header.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import os, socket; port=int(os.getenv('LMCACHE_PORT','6556')); s=socket.create_connection(('127.0.0.1', port), 2); s.close()"
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # lmcache-xnvme: XNVME_KV backend against the real NVMe-KV device
+  # on host <SETUP2_PD_NODE_IP> (PCIe 0000:1c:00.0, IOMMU group 3, kernel nvme-bound
+  # device node). Category (1): the actual end-goal hardware.
+  #
+  # SAFETY (see
+  # kv-cache-bench-ops skill): once a container using this service is exercising
+  # the device, NEVER kill it (SIGKILL, `docker kill`, or even a graceful
+  # `docker stop`), and never wrap it in `timeout`. Any of those reliably wedges
+  # the device's controller-enable handshake -- every subsequent probe from any process,
+  # any host driver, Docker or native, hangs at ~100% CPU forever with no further
+  # log output, and the ONLY recovery is restarting the DPU-side pds_dp_app from
+  # the device's own management console (nothing on this host side clears it -- no
+  # rescan, no FLR, no setup.sh re-run). If a run needs to stop, let it finish or
+  # fail on its own.
+  #
+  # Caps/security_opt copied from the base `lmcache` service, same as
+  # lmcache-spdk above. No hugepages/memlock/IPC_LOCK-driven DPDK path here --
+  # xNVMe's io_uring_cmd path talks to the kernel-bound device node directly
+  # (matching stack/tracks/lmcache/deploy.sh's XNVME_KV-via-LMCache precedent,
+  # which needs only --cap-add SYS_ADMIN --cap-add IPC_LOCK plus the device
+  # node itself -- NOT stack/tracks/nixl/vllm/11-deploy-qwen-nixl-xnvme.sh's,
+  # which never actually exercises the device: that script's own header says the
+  # XNVME_KV plugin there is loaded/dlopen'd but unused, real transfer stays on
+  # UCX, so it mounts no device node at all).
+  # ---------------------------------------------------------------------------
+  lmcache-xnvme:
+    profiles: [storage-xnvme]
+    image: ${IMAGE_REF:-${IMAGE_NAME:-rocm-aic}:latest}
+    container_name: aic-lmcache-xnvme
+    networks: [aic]
+    ipc: shareable
+    shm_size: "${AIC_SHM_SIZE:-64gb}"
+    cap_add:
+      - CAP_SYS_ADMIN
+      - SYS_PTRACE
+      - IPC_LOCK
+    security_opt:
+      - seccomp:unconfined
+    devices:
+      - /dev/kfd
+      - /dev/dri
+      # Real device node, bound to the kernel nvme driver (NOT vfio-pci --
+      # that bind is only for the raw-PCIe/nixlbench path in
+      # stack/tracks/nixl/core/04-nvme.sh). Default matches this repo's other
+      # XNVME_KV-via-LMCache deploy (stack/tracks/lmcache/deploy.sh's
+      # NIXL_XNVME_DEV=/dev/ng0n1 default).
+      - ${AIC_XNVME_DEV:-/dev/ng0n1}
+    volumes:
+      - ${LOG:-../logs}/lmcache-xnvme:/var/log/aic-lmcache
+    environment:
+      - LMCACHE_PORT=${LMCACHE_XNVME_PORT:-6557}
+      - LMCACHE_L1_SIZE_GB=${LMCACHE_L1_SIZE_GB:-20}
+      - LMCACHE_MAX_GPU_WORKERS=${LMCACHE_MAX_GPU_WORKERS:-1}
+      - ROCR_VISIBLE_DEVICES=${GPU:-0}
+      - PYTHONHASHSEED=0
+      - TZ=${TZ:-America/Edmonton}
+      - HIPFILE_ALLOW_COMPAT_MODE=false
+      - HIPFILE_UNSUPPORTED_FILE_SYSTEMS=false
+      - NIXL_TELEMETRY_ENABLE=${NIXL_TELEMETRY_ENABLE-y}
+      - NIXL_TELEMETRY_EXPORTER=${NIXL_TELEMETRY_EXPORTER:-prometheus}
+      - NIXL_TELEMETRY_PROMETHEUS_PORT=${NIXL_XNVME_METRICS_PORT:-19092}
+      # XNVME_KV's one backend_params key -- see
+      # stack/tracks/lmcache/lmcache-config.yaml (nixl_backend_params.dev_uri).
+      - AIC_XNVME_DEV=${AIC_XNVME_DEV:-/dev/ng0n1}
+      # See lmcache-spdk's AIC_SPDK_KV_POOL comment above -- same
+      # pages-not-chunks sizing rule, and the same empirically-confirmed
+      # non-linear registration cost above ~2,000,000 objects, applies to
+      # this OBJ-family backend too. This static fallback only matters for a
+      # direct `docker compose up` bypassing deploy-xnvme.sh.
+      - AIC_XNVME_KV_POOL=${AIC_XNVME_KV_POOL:-2000000}
+      # No per-transfer debug print exists for this plugin at the LMCache
+      # --l2-adapter layer the way stack/tracks/lmcache/deploy.sh's
+      # NIXL_XNVME_KV_DEBUG=1 works for its own (different) code path --
+      # kept here as a pass-through in case the plugin itself still honors it.
+      - NIXL_XNVME_KV_DEBUG=${NIXL_XNVME_KV_DEBUG:-}
+    entrypoint: ["/bin/bash", "-o", "pipefail", "-c"]
+    command:
+      - |
+        exec lmcache server \
+          --no-separate-object-groups \
+          --host 0.0.0.0 \
+          --http-port 8080 \
+          --port "$$LMCACHE_PORT" \
+          --l1-size-gb "$$LMCACHE_L1_SIZE_GB" \
+          --eviction-policy LRU \
+          --max-gpu-workers "$$LMCACHE_MAX_GPU_WORKERS" \
+          --worker-reap-timeout-seconds "$${LMCACHE_WORKER_REAP_TIMEOUT:-3600}" \
+          --l2-adapter "{\"type\":\"nixl_store\",\"backend\":\"XNVME_KV\",\"backend_params\":{\"dev_uri\":\"$$AIC_XNVME_DEV\"},\"pool_size\":$$AIC_XNVME_KV_POOL}"
+        # UNVERIFIED: confirm this exact --l2-adapter invocation against a real
+        # rocm-aic build with our plugin actually compiled in -- see file header.
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import os, socket; port=int(os.getenv('LMCACHE_PORT','6557')); s=socket.create_connection(('127.0.0.1', port), 2); s.close()"
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # vllm: additive overrides only -- the base service's command/environment
+  # already read every knob (VLLM_MODEL, TENSOR_PARALLEL_SIZE, KV_TRANSFER_ARG,
+  # etc.) from the environment, so nothing there needs overriding. Two things
+  # this repo's deploy contract needs that the base file doesn't provide:
+  #
+  #   1. `ports:` -- the base `vllm` service has none (by design: it's reachable
+  #      only from other containers on the internal `aic` bridge network, e.g.
+  #      the `client` service). bench/tracks.registry's contract requires a
+  #      deploy script to serve at http://127.0.0.1:${PORT}/v1 on the HOST, so
+  #      this is required for the track to be benchmarkable like every other one
+  #      in this repo.
+  #   2. `depends_on` entries for the two new services -- MERGE additively with
+  #      the base file's `vllm.depends_on.lmcache` (required: false), so this
+  #      does not remove that entry, just adds ours alongside it.
+  #
+  # VLLM_IPC_MODE / VLLM_PID_MODE (service:lmcache-spdk or service:lmcache-xnvme)
+  # are set by the deploy scripts, not hardcoded here, since only one of the two
+  # profiles is ever active in a given `up`.
+  # ---------------------------------------------------------------------------
+  vllm:
+    ports:
+      - "${PORT:-8000}:8000"
+    depends_on:
+      lmcache-spdk:
+        condition: service_healthy
+        required: false
+      lmcache-xnvme:
+        condition: service_healthy
+        required: false

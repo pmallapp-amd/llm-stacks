@@ -1,0 +1,36 @@
+# docker-compose.plugin-override.yml — run a locally-built SPDK_NVMe_KV plugin
+# instead of the one baked into the rocm-aic image.
+#
+# WHY THIS EXISTS. The plugin `.so` inside `rocm-aic:latest` is whatever was
+# current when that image was built. Rebuilding a 43.5 GB image to test a
+# one-file plugin change is wasteful, and — worse — the 2026-08-25 session
+# verified changes C and D from a plugin compiled into an *ephemeral* container,
+# so the fix existed nowhere persistent and a later redeploy would silently have
+# run the OLD plugin and produced a result that looked fine and meant nothing.
+# This file makes "run a specific .so" an explicit, recorded deployment input
+# rather than something done by hand and forgotten.
+#
+# HOW IT IS USED. Never include this file unconditionally. `deploy-spdk.sh` adds
+# it to the `docker compose` invocation ONLY when AIC_SPDK_PLUGIN_SO is set, and
+# validates first that the value names an existing REGULAR FILE.
+#
+# That validation is the whole point. Docker silently materialises a bind mount
+# whose host path does not exist as an empty DIRECTORY. Mounted at the path
+# below, that would shadow the image's working plugin with a directory, and the
+# only downstream symptom is NIXL's generic "backend not found" — a failure mode
+# that has already cost this project two debugging sessions (see
+# the SPDK_SRC note in bench/lib/preflight.sh). Hence also the `:?` guard here:
+# if this file is ever included with the variable unset, compose refuses loudly
+# instead of mounting something meaningless.
+#
+# The mount is read-only: the container must never be able to modify the
+# artifact whose sha256 gets recorded in the run's provenance sidecar.
+#
+# The target path is NIXL_PLUGIN_DIR inside the image, the same directory the
+# stock AIS_MT/POSIX/UCX plugins live in. It must match the layout the plugin
+# build produces (lib/x86_64-linux-gnu/plugins/), so the override lands exactly
+# where the image's own copy sits rather than beside it.
+services:
+  lmcache-spdk:
+    volumes:
+      - ${AIC_SPDK_PLUGIN_SO:?AIC_SPDK_PLUGIN_SO must name the .so to mount — do not include this compose file without it}:/opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_SPDK_NVMe_KV.so:ro

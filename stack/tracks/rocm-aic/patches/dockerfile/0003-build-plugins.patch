@@ -1,0 +1,151 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 8e59fd2..94a6afe 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -363,6 +363,146 @@ RUN --mount=type=cache,target=/root/.cache/uv \
+         UV_SYSTEM_CERTS=1 \
+         /tmp/nixl-scripts/build-nixl.sh
+ 
++# ----- 6a. Custom NIXL storage plugins (SPDK_NVMe_KV, XNVME_KV) -------------
++# Two out-of-tree NIXL backend plugins from the kv-cache-bench repo (source of
++# truth: stack/tracks/nixl/core/{nvme-kv-plugin,xnvme-kv-plugin}/ there --
++# never forked, only compiled here). Both implement NIXL's OBJ_SEG /
++# key-addressed backend API against backend_engine.h, which is byte-identical
++# between NIXL v1.3.2 and current upstream, so they build cleanly against the
++# /opt/nixl install the previous step just produced with zero NIXL source
++# changes. This is deliberately a plain compile step, not a nixl_patches/ entry
++# -- the two plugins are compiled and shlib-installed directly into
++# NIXL_PLUGIN_DIR, exactly like build-nixl.sh's own AIS_MT/Prometheus plugins.
++#
++#   SPDK_NVMe_KV — kernel-bypass NVMe-oF via a from-source SPDK ${SPDK_REF} +
++#                  4 upstream-style KV command-set patches. Only SPDK's
++#                  headers + build/lib/*.a are needed here -- no SPDK runtime
++#                  component ships in the final image.
++#   XNVME_KV     — io_uring_cmd-based backend via a standalone libxnvme build
++#                  (NOT the SPDK-vendored xnvme subproject, to keep this step
++#                  independent of the SPDK build above).
++#
++# Plugin source + the 4 SPDK-host patches are staged into the build context at
++# plugins/ by kv-cache-bench's stack/tracks/rocm-aic/build.sh before `docker
++# build`/`make build` runs -- the test below fails loudly if that step was
++# skipped rather than silently building an image with two missing plugins.
++ARG SPDK_KV_GIT_URL=https://github.com/spdk/spdk.git
++ARG SPDK_KV_REF=v26.05
++ARG XNVME_GIT_URL=https://github.com/xnvme/xnvme.git
++ARG XNVME_REF=v0.7.5
++
++RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
++    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
++    apt-get update && \
++    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
++        libaio-dev \
++        liburing-dev \
++        libnuma-dev \
++        libssl-dev \
++        uuid-dev \
++        nasm \
++        libcunit1-dev \
++        libncurses-dev \
++        cmake \
++    && python3 -m pip install --no-cache-dir meson ninja tabulate pyelftools
++
++# nixl_log.h (pulled in transitively by our plugins via backend_engine.h)
++# #includes absl/log/log.h at compile time (symbols themselves resolve at
++# runtime from libnixl.so -- see meson.build's "-Wl,--allow-shlib-undefined"
++# comment below). rocm-aic's own build-nixl.sh never installs Abseil
++# system-wide -- NIXL v1.3.2's meson build resolves it as a private
++# subproject, so its headers aren't on any path our plugins' compiler
++# invocation searches. Fix mirrors stack/tracks/nixl/core/Dockerfile.nixl-base
++# (lines ~94-111) exactly: build the same pinned Abseil release from source
++# with a system install prefix so <absl/log/log.h> resolves like it already
++# does in that image.
++RUN cd /tmp && \
++    git clone --depth 1 --branch 20240722.0 \
++        https://github.com/abseil/abseil-cpp.git abseil-src && \
++    cd abseil-src && \
++    cmake -B build \
++        -DABSL_BUILD_TESTING=OFF \
++        -DCMAKE_BUILD_TYPE=Release \
++        -DCMAKE_INSTALL_PREFIX=/usr \
++        -DBUILD_SHARED_LIBS=ON \
++        -DABSL_PROPAGATE_CXX_STD=ON \
++        -DCMAKE_CXX_STANDARD=17 && \
++    cmake --build build -j"$(nproc)" && \
++    cmake --install build && \
++    ldconfig && \
++    rm -rf /tmp/abseil-src
++
++COPY plugins/ /tmp/kv-plugins/
++RUN test -d /tmp/kv-plugins/nvme-kv-plugin && test -d /tmp/kv-plugins/xnvme-kv-plugin \
++        && test -d /tmp/kv-plugins/spdk-host-patches \
++    || { echo "ERROR: /tmp/kv-plugins/{nvme-kv-plugin,xnvme-kv-plugin,spdk-host-patches} not found -- run kv-cache-bench's stack/tracks/rocm-aic/build.sh staging step before docker build" >&2; exit 1; }
++
++# --- SPDK ${SPDK_KV_REF} + 4 NVMe-KV command-set patches (headers + static libs only) ---
++RUN git clone --depth 1 --branch "${SPDK_KV_REF}" "${SPDK_KV_GIT_URL}" /opt/spdk-kv && \
++    cd /opt/spdk-kv && \
++    git submodule update --init --depth 1 dpdk isa-l isa-l-crypto && \
++    git config user.email "build@rocm-aic.local" && \
++    git config user.name "rocm-aic build" && \
++    shopt -s nullglob && \
++    kv_patches=(/tmp/kv-plugins/spdk-host-patches/*.diff) && \
++    if [ "${#kv_patches[@]}" -eq 0 ]; then \
++        echo "ERROR: no patches found in /tmp/kv-plugins/spdk-host-patches/" >&2; exit 1; \
++    fi && \
++    for patch in "${kv_patches[@]}"; do \
++        if git am "$patch"; then \
++            echo "[spdk-kv] applied $(basename "$patch")"; \
++        else \
++            echo "ERROR: SPDK NVMe-KV patch does not apply cleanly: $patch" >&2; exit 1; \
++        fi; \
++    done && \
++    ./configure --without-shared --without-nvme-cuse && \
++    make -j"$(nproc)"
++
++# nvme-kv-plugin's meson.build links against libspdk_nvme_tcp_only.a /
++# _pcie_only.a / libspdk_sock_posix_only.a -- not produced by a stock SPDK
++# build. prepare-spdk-libs.sh (shipped next to the plugin source) generates
++# them by extracting objects out of libspdk_nvme.a / libspdk_sock_posix.a.
++RUN SPDK_SRC=/opt/spdk-kv /tmp/kv-plugins/nvme-kv-plugin/prepare-spdk-libs.sh
++
++RUN mkdir -p /tmp/nvme-kv-build && \
++    meson setup /tmp/nvme-kv-build /tmp/kv-plugins/nvme-kv-plugin \
++        -Dnixl_path=/opt/nixl \
++        -Dspdk_path=/opt/spdk-kv \
++        -Drocm_path=/opt/rocm \
++        -Denable_vram=true \
++        --prefix=/opt/nixl \
++        --buildtype=release && \
++    ninja -C /tmp/nvme-kv-build && \
++    ninja -C /tmp/nvme-kv-build install && \
++    test -f /opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_SPDK_NVMe_KV.so
++
++# --- libxnvme ${XNVME_REF} (standalone build, not the SPDK-vendored copy) ----
++RUN git clone --depth 1 --branch "${XNVME_REF}" "${XNVME_GIT_URL}" /opt/xnvme-src && \
++    cd /opt/xnvme-src && \
++    meson setup build \
++        -Dtests=false -Dexamples=false -Dtools=false -Dwith-spdk=disabled \
++        --buildtype=release && \
++    ninja -C build && \
++    ninja -C build install && \
++    ldconfig
++
++RUN mkdir -p /tmp/xnvme-kv-build && \
++    meson setup /tmp/xnvme-kv-build /tmp/kv-plugins/xnvme-kv-plugin \
++        -Dnixl_path=/opt/nixl \
++        -Dxnvme_incdir=/usr/local/include \
++        -Dxnvme_libdir=/usr/local/lib/x86_64-linux-gnu \
++        -Drocm_path=/opt/rocm \
++        -Denable_vram=true \
++        --prefix=/opt/nixl \
++        --buildtype=release && \
++    ninja -C /tmp/xnvme-kv-build && \
++    ninja -C /tmp/xnvme-kv-build install && \
++    test -f /opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_XNVME_KV.so
++# libxnvme.so is linked via -Wl,-rpath (see xnvme-kv-plugin/meson.build), not
++# statically -- `ldconfig` above registers /usr/local/lib/x86_64-linux-gnu,
++# already on this image's default ld.so search path, so no LD_LIBRARY_PATH
++# change is needed for the runtime stage below.
++
+ # ----- 6b. hsa-snoop (HSA AQL queue snooper + Prometheus exporter) -----------
+ # GPU dispatch/queue telemetry on :9488 (/metrics), including AIS (AMD Infinity
+ # Storage) P2P metrics (ais_rx_ops_total, ais_tx_bytes_total, etc.) added in

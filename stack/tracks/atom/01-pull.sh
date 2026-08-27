@@ -3,7 +3,7 @@
 #
 # There is deliberately no build step in this track. ATOM's tested base is
 # Python 3.12 / ROCm 7.0.2 / torch 2.8, while this repo's NIXL and MORI images
-# are Python 3.14 / ROCm 7.14 / torch 2.11. CLAUDE.md documents what happens
+# are Python 3.14 / ROCm 7.14 / torch 2.11. this track's README documents what happens
 # when those are mixed (GLIBCXX / ABI failures at plugin load), so ATOM gets
 # AMD's prebuilt image rather than being ported into ours. The cost is that this
 # track does NOT share a base image with the others — say so in any write-up

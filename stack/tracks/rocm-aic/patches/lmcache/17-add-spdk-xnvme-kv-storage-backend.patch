@@ -1,0 +1,29 @@
+--- a/lmcache/v1/storage_backend/nixl_storage_backend.py
++++ b/lmcache/v1/storage_backend/nixl_storage_backend.py
+@@ -123,7 +123,7 @@
+     @staticmethod
+     def validate_nixl_backend(backend: str, device: str) -> bool:
+         device = device.split(":", 1)[0]
+-        if backend in ("GDS", "GDS_MT", "OBJ", "AIS_MT"):
++        if backend in ("GDS", "GDS_MT", "OBJ", "AIS_MT", "SPDK_NVMe_KV", "XNVME_KV"):
+             return device == "cpu" or device == "cuda"
+         elif backend in ("POSIX", "HF3FS", "AZURE_BLOB", "DOCA_MEMOS"):
+             return device == "cpu"
+@@ -667,7 +667,7 @@
+             allocator, device, backend, backend_params, enable_prog_thread, sync_mode
+         )
+
+-        if backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS"):
++        if backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS", "SPDK_NVMe_KV", "XNVME_KV"):
+             self.mem_type = "OBJ"
+         else:
+             self.mem_type = "FILE"
+@@ -1116,7 +1116,7 @@
+                 create_dirs=True,
+             )
+             return NixlFilePool(size, sharder, use_direct_io, slot_size)
+-        elif backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS"):
++        elif backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS", "SPDK_NVMe_KV", "XNVME_KV"):
+             return NixlObjectPool(size, b128=(backend == "DOCA_MEMOS"))
+         else:
+             raise ValueError(f"Unsupported NIXL backend: {backend}")
