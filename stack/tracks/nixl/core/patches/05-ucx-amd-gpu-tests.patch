@@ -1,0 +1,562 @@
+diff --git a/README.md b/README.md
+index 627a554..ade4d43 100644
+--- a/README.md
++++ b/README.md
+@@ -167,7 +167,16 @@ Common build options:
+ 
+ #### Building for AMD ROCm
+ 
+-NIXL itself builds vendor-neutrally; CPU-side hardware detection (`hwInfo::numAmdGpus`) discovers AMD GPUs via PCI vendor `0x1002` whether or not a ROCm toolchain is present. GPU-side ROCm/HIP build support for the benchmark suite lives in nixlbench — see PR #1647 for the `use_rocm` / `rocm_path` options there. When packaging a ROCm wheel, pass `-Dwheel_variant=rocm` so the wheel is named `nixl_rocm`.
++NIXL itself builds vendor-neutrally; CPU-side hardware detection (`hwInfo::numAmdGpus`) discovers AMD GPUs via PCI vendor `0x1002` whether or not a ROCm toolchain is present. GPU-side ROCm/HIP build support is available for nixlbench and UCX plugin unit tests. When packaging a ROCm wheel, pass `-Dwheel_variant=rocm` so the wheel is named `nixl_rocm`.
++
++**Building with ROCm support:**
++```bash
++# For UCX unit tests with ROCm (uses /opt/rocm by default)
++$ meson setup build -Drocm_path=default
++
++# Or specify a custom ROCm path
++$ meson setup build -Drocm_path=/path/to/rocm
++```
+ 
+ **Plugins on ROCm hosts (CUDA toolchain absent):**
+ - `UCX` — primary transport for AMD GPU memory (requires UCX built with `--with-rocm`).
+@@ -175,7 +184,6 @@ NIXL itself builds vendor-neutrally; CPU-side hardware detection (`hwInfo::numAm
+ - `GDS` / `GDS_MT`, `GPUNETIO`, `LIBFABRIC` (with `-DHAVE_CUDA`) — skip automatically because their CUDA / cuFile / DOCA dependencies are not found.
+ 
+ **Known gaps (will be addressed in follow-up PRs):**
+-- `nixlbench` (the NIXL benchmark tool) needs CUDA-driver-API → HIP translation work before it builds on ROCm. Use `examples/cpp/nixl_etcd_example` for transfer validation in the meantime.
+ - `LIBFABRIC` plugin disabled on ROCm pending header refactor.
+ - No NVSHMEM-equivalent backend yet (rocSHMEM analog is a candidate for a future plugin).
+ 
+diff --git a/meson_options.txt b/meson_options.txt
+index 00b208f..ce86190 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -27,6 +27,7 @@ option('cudapath_inc', type: 'string', value: '', description: 'Include path for
+ option('cudapath_lib', type: 'string', value: '', description: 'Library path for CUDA')
+ option('cudapath_stub', type: 'string', value: '', description: 'Extra Stub path for CUDA')
+ option('nixl_cuda_arch_list', type: 'string', value: 'auto', description: 'Comma-separated CUDA SM targets (e.g. 90,100), or auto to select defaults (sm_80+ normally, sm_90+ when build_nixl_ep is enabled). Use a single target like 100 for faster single-GPU builds.')
++option('rocm_path', type: 'string', value: '', description: 'Path to ROCm installation (default: /opt/rocm if set to "default", empty = do not use ROCm)')
+ option('wheel_variant', type: 'string', value: '', description: 'Override wheel variant suffix (e.g. -Dwheel_variant=rocm yields nixl_rocm). Empty = autodetect from CUDA major version.')
+ option('static_plugins', type: 'string', value: '', description: 'Plugins to be built-in, comma-separated')
+ option('enable_plugins', type: 'string', value: '', description: 'Comma-separated list of plugins to build. Default (empty) builds all available plugins.')
+diff --git a/test/unit/plugins/ucx/gpu_utils.h b/test/unit/plugins/ucx/gpu_utils.h
+new file mode 100644
+index 0000000..197cfd2
+--- /dev/null
++++ b/test/unit/plugins/ucx/gpu_utils.h
+@@ -0,0 +1,150 @@
++// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-FileCopyrightText: Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <iostream>
++#include <cstdlib>
++#include "test_utils.h"
++
++#ifdef HAVE_CUDA
++#include <cuda_runtime.h>
++#include <cuda.h>
++
++static void
++checkCudaError(cudaError_t result, const char *message) {
++    if (result != cudaSuccess) {
++        std::cerr << message << " (Error code: " << result << " - " << cudaGetErrorString(result)
++                  << ")" << std::endl;
++        exit(EXIT_FAILURE);
++    }
++}
++#endif
++
++#ifdef HAVE_ROCM
++#include <hip/hip_runtime.h>
++
++static void
++checkHipError(hipError_t result, const char *message) {
++    if (result != hipSuccess) {
++        std::cerr << message << " (Error code: " << result << " - " << hipGetErrorString(result)
++                  << ")" << std::endl;
++        exit(EXIT_FAILURE);
++    }
++}
++#endif
++
++inline void
++gpuSetDevice(int device, const char *message) {
++#ifdef HAVE_CUDA
++    checkCudaError(cudaSetDevice(device), message);
++#elif defined(HAVE_ROCM)
++    checkHipError(hipSetDevice(device), message);
++#else
++    nixl_exit_on_failure(false, message);
++#endif
++}
++
++inline void
++gpuMalloc(void **ptr, size_t size, const char *message) {
++#ifdef HAVE_CUDA
++    checkCudaError(cudaMalloc(ptr, size), message);
++#elif defined(HAVE_ROCM)
++    checkHipError(hipMalloc(ptr, size), message);
++#else
++    nixl_exit_on_failure(false, message);
++#endif
++}
++
++inline void
++gpuFree(void *ptr, const char *message) {
++#ifdef HAVE_CUDA
++    checkCudaError(cudaFree(ptr), message);
++#elif defined(HAVE_ROCM)
++    checkHipError(hipFree(ptr), message);
++#else
++    nixl_exit_on_failure(false, message);
++#endif
++}
++
++inline void
++gpuMemset(void *ptr, int value, size_t size, const char *message) {
++#ifdef HAVE_CUDA
++    checkCudaError(cudaMemset(ptr, value, size), message);
++#elif defined(HAVE_ROCM)
++    checkHipError(hipMemset(ptr, value, size), message);
++    checkHipError(hipStreamSynchronize(0), "Failed to synchronize stream");
++#else
++    nixl_exit_on_failure(false, message);
++#endif
++}
++
++inline void
++gpuGetDeviceCount(int *count, const char *message) {
++#ifdef HAVE_CUDA
++    checkCudaError(cudaGetDeviceCount(count), message);
++#elif defined(HAVE_ROCM)
++    checkHipError(hipGetDeviceCount(count), message);
++#else
++    *count = 0;
++#endif
++}
++
++inline void
++gpuMemcpyD2H(void *dst, const void *src, size_t size, const char *message) {
++#ifdef HAVE_CUDA
++    checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost), message);
++#elif defined(HAVE_ROCM)
++    checkHipError(hipMemcpy(dst, src, size, hipMemcpyDeviceToHost), message);
++#else
++    nixl_exit_on_failure(false, message);
++#endif
++}
++
++inline int
++gpuQueryAddr(void *address, bool &is_dev, int &dev) {
++#ifdef HAVE_CUDA
++    CUdevice cu_dev;
++    CUcontext cu_ctx;
++    CUmemorytype mem_type = CU_MEMORYTYPE_HOST;
++    uint32_t is_managed = 0;
++#define NUM_ATTRS 4
++    CUpointer_attribute attr_type[NUM_ATTRS];
++    void *attr_data[NUM_ATTRS];
++    CUresult result;
++
++    attr_type[0] = CU_POINTER_ATTRIBUTE_MEMORY_TYPE;
++    attr_data[0] = &mem_type;
++    attr_type[1] = CU_POINTER_ATTRIBUTE_IS_MANAGED;
++    attr_data[1] = &is_managed;
++    attr_type[2] = CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
++    attr_data[2] = &cu_dev;
++    attr_type[3] = CU_POINTER_ATTRIBUTE_CONTEXT;
++    attr_data[3] = &cu_ctx;
++
++    result = cuPointerGetAttributes(4, attr_type, attr_data, (CUdeviceptr)address);
++
++    is_dev = (mem_type == CU_MEMORYTYPE_DEVICE);
++    dev = cu_dev;
++
++    std::cout << "CUDA addr: " << std::hex << address << " dev=" << std::dec << dev
++              << " ctx=" << std::hex << cu_ctx << std::dec << std::endl;
++
++    return (CUDA_SUCCESS != result);
++#elif defined(HAVE_ROCM)
++    hipPointerAttribute_t attrs;
++    const hipError_t result = hipPointerGetAttributes(&attrs, address);
++
++    if (result == hipSuccess) {
++        is_dev = (attrs.type == hipMemoryTypeDevice);
++        dev = attrs.device;
++        std::cout << "HIP addr: " << std::hex << address << " dev=" << std::dec << dev << std::endl;
++        return 0;
++    }
++    return 1;
++#else
++    nixl_exit_on_failure(false, "GPU support not available");
++    return 1;
++#endif
++}
+diff --git a/test/unit/plugins/ucx/meson.build b/test/unit/plugins/ucx/meson.build
+index 7abd77d..2326b50 100644
+--- a/test/unit/plugins/ucx/meson.build
++++ b/test/unit/plugins/ucx/meson.build
+@@ -13,13 +13,35 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++# ROCm detection (mutually exclusive with CUDA; default off)
++rocm_path = get_option('rocm_path')
++if rocm_path != ''
++    if rocm_path == 'default'
++        rocm_path = '/opt/rocm'
++    endif
++    if not fs.exists(rocm_path)
++        error('rocm_path set but ROCm install root not found at ' + rocm_path +
++              '. Set -Drocm_path=<prefix> to the correct ROCm install root.')
++    endif
++    rocm_lib_path = rocm_path + '/lib'
++    rocm_inc_path = rocm_path + '/include'
++    rocm_dep = declare_dependency(
++        link_args : ['-L' + rocm_lib_path, '-lamdhip64', '-lhiprtc'],
++        include_directories : include_directories(rocm_inc_path))
++else
++    rocm_dep = disabler()
++endif
++
+ ucx_test_dep = [ ucx_dep, nixl_common_deps, ucx_backend_interface]
+ 
+-if cuda_dep.found()
++if rocm_dep.found()
++    ucx_test_dep += [ rocm_dep ]
++    cpp_args = ['-DHAVE_GPU', '-DHAVE_ROCM', '-D__HIP_PLATFORM_AMD__', '-Wno-deprecated-declarations']
++elif cuda_dep.found()
+     ucx_test_dep += [ cuda_dep ]
+-    cpp_args = '-DHAVE_CUDA'
++    cpp_args = ['-DHAVE_GPU', '-DHAVE_CUDA']
+ else
+-    cpp_args = '-UHAVE_CUDA'
++    cpp_args = ['-UHAVE_CUDA']
+ endif
+ 
+ ucx_backend_test_dep = [nixl_dep, nixl_infra, thread_dep] + ucx_test_dep + nixl_test_utils_dep
+@@ -47,12 +69,12 @@ if get_option('buildtype') != 'release'
+                include_directories: ucx_test_include_directories,
+                install: true)
+ 
+-    if cuda_dep.found()
+-        ucx_worker_cuda_bin = executable('ucx_worker_test_cuda',
++    if cuda_dep.found() or rocm_dep.found()
++        ucx_worker_gpu_bin = executable('ucx_worker_test_gpu',
+                        'ucx_worker_test.cpp',
+                        dependencies: ucx_test_dep,
+                        include_directories: ucx_test_include_directories,
+-                       cpp_args : '-DUSE_VRAM',
++                       cpp_args : ['-DUSE_VRAM'] + cpp_args,
+                        install: true)
+     endif
+ 
+diff --git a/test/unit/plugins/ucx/ucx_backend_test.cpp b/test/unit/plugins/ucx/ucx_backend_test.cpp
+index 7b962f0..3bd50b6 100644
+--- a/test/unit/plugins/ucx/ucx_backend_test.cpp
++++ b/test/unit/plugins/ucx/ucx_backend_test.cpp
+@@ -20,27 +20,11 @@
+ 
+ #include "ucx_backend.h"
+ #include "test_utils.h"
++#include "gpu_utils.h"
+ 
+ using namespace std;
+ 
+ 
+-#ifdef HAVE_CUDA
+-
+-#include <cuda_runtime.h>
+-#include <cuda.h>
+-
+-int gpu_id = 0;
+-
+-static void checkCudaError(cudaError_t result, const char *message) {
+-    if (result != cudaSuccess) {
+-        std::cerr << message << " (Error code: " << result << " - "
+-                   << cudaGetErrorString(result) << ")" << std::endl;
+-        exit(EXIT_FAILURE);
+-    }
+-}
+-#endif
+-
+-
+ class testHndlIterator {
+ private:
+     bool reuse;
+@@ -147,58 +131,21 @@ std::string memType2Str(nixl_mem_t mem_type)
+ }
+ 
+ 
+-#ifdef HAVE_CUDA
+-
+-static int cudaQueryAddr(void *address, bool &is_dev,
+-                         CUdevice &dev, CUcontext &ctx)
+-{
+-    CUmemorytype mem_type = CU_MEMORYTYPE_HOST;
+-    uint32_t is_managed = 0;
+-#define NUM_ATTRS 4
+-    CUpointer_attribute attr_type[NUM_ATTRS];
+-    void *attr_data[NUM_ATTRS];
+-    CUresult result;
+-
+-    attr_type[0] = CU_POINTER_ATTRIBUTE_MEMORY_TYPE;
+-    attr_data[0] = &mem_type;
+-    attr_type[1] = CU_POINTER_ATTRIBUTE_IS_MANAGED;
+-    attr_data[1] = &is_managed;
+-    attr_type[2] = CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
+-
+-    attr_data[2] = &dev;
+-    attr_type[3] = CU_POINTER_ATTRIBUTE_CONTEXT;
+-    attr_data[3] = &ctx;
+-
+-    result = cuPointerGetAttributes(4, attr_type, attr_data, (CUdeviceptr)address);
+-
+-    is_dev = (mem_type == CU_MEMORYTYPE_DEVICE);
+-
+-    return (CUDA_SUCCESS != result);
+-}
+-
+-#endif
+-
+-
+ void allocateBuffer(nixl_mem_t mem_type, int dev_id, size_t len, void* &addr)
+ {
+     switch(mem_type) {
+     case DRAM_SEG:
+         addr = calloc(1, len);
+         break;
+-#ifdef HAVE_CUDA
+     case VRAM_SEG:{
+         bool is_dev;
+-        CUdevice dev;
+-        CUcontext ctx;
+-
+-        checkCudaError(cudaSetDevice(dev_id), "Failed to set device");
+-        checkCudaError(cudaMalloc(&addr, len), "Failed to allocate CUDA buffer 0");
+-        cudaQueryAddr(addr, is_dev, dev, ctx);
+-        std::cout << "CUDA addr: " << std::hex << addr << " dev=" << std::dec << dev
+-            << " ctx=" << std::hex << ctx << std::dec << std::endl;
++        int dev;
++
++        gpuSetDevice(dev_id, "Failed to set device");
++        gpuMalloc(&addr, len, "Failed to allocate GPU buffer 0");
++        gpuQueryAddr(addr, is_dev, dev);
+         break;
+     }
+-#endif
+     default:
+         nixl_exit_on_failure(false, "Unsupported memory type!");
+     }
+@@ -211,12 +158,10 @@ void releaseBuffer(nixl_mem_t mem_type, int dev_id, void* &addr)
+     case DRAM_SEG:
+         free(addr);
+         break;
+-#ifdef HAVE_CUDA
+     case VRAM_SEG:
+-        checkCudaError(cudaSetDevice(dev_id), "Failed to set device");
+-        checkCudaError(cudaFree(addr), "Failed to allocate CUDA buffer 0");
++        gpuSetDevice(dev_id, "Failed to set device");
++        gpuFree(addr, "Failed to free GPU buffer 0");
+         break;
+-#endif
+     default:
+         nixl_exit_on_failure(false, "Unsupported memory type!");
+     }
+@@ -228,12 +173,10 @@ void doMemset(nixl_mem_t mem_type, int dev_id, void *addr, char byte, size_t len
+     case DRAM_SEG:
+         memset(addr, byte, len);
+         break;
+-#ifdef HAVE_CUDA
+     case VRAM_SEG:
+-        checkCudaError(cudaSetDevice(dev_id), "Failed to set device");
+-        checkCudaError(cudaMemset(addr, byte, len), "Failed to memset");
++        gpuSetDevice(dev_id, "Failed to set device");
++        gpuMemset(addr, byte, len, "Failed to memset");
+         break;
+-#endif
+     default:
+         nixl_exit_on_failure(false, "Unsupported memory type!");
+     }
+@@ -245,13 +188,11 @@ void *getValidationPtr(nixl_mem_t mem_type, void *addr, size_t len)
+     case DRAM_SEG:
+         return addr;
+         break;
+-#ifdef HAVE_CUDA
+     case VRAM_SEG: {
+         void *ptr = calloc(len, 1);
+-        checkCudaError(cudaMemcpy(ptr, addr, len, cudaMemcpyDeviceToHost), "Failed to memcpy");
++        gpuMemcpyD2H(ptr, addr, len, "Failed to memcpy");
+         return ptr;
+     }
+-#endif
+     default:
+         nixl_exit_on_failure(false, "Unsupported memory type!");
+     }
+@@ -263,11 +204,9 @@ void *releaseValidationPtr(nixl_mem_t mem_type, void *addr)
+     switch(mem_type) {
+     case DRAM_SEG:
+         break;
+-#ifdef HAVE_CUDA
+     case VRAM_SEG:
+         free(addr);
+         break;
+-#endif
+     default:
+         nixl_exit_on_failure(false, "Unsupported memory type!");
+     }
+@@ -684,29 +623,22 @@ int main()
+         }
+     }
+ 
+-#ifdef HAVE_CUDA
+     int dev_ids[2] = { 0 , 0 };
+-    int n_vram_dev;
+-    if (cudaGetDeviceCount(&n_vram_dev) != cudaSuccess) {
+-        std::cout << "Call to cudaGetDeviceCount failed, assuming 0 devices";
+-        n_vram_dev = 0;
+-    }
++    int n_vram_dev = 0;
++    gpuGetDeviceCount(&n_vram_dev, "Failed to get device count");
+ 
+-    std::cout << "Detected " << n_vram_dev << " CUDA devices" << std::endl;
++    std::cout << "Detected " << n_vram_dev << " GPU devices" << std::endl;
+     if (n_vram_dev > 1) {
+         dev_ids[1] = 1;
+         dev_ids[0] = 0;
+     }
+-#endif
+ 
+     for(int i = 0; i < 2; i++) {
+         //Test local memory to local memory transfer
+         test_intra_agent_transfer(thread_on[i], ucx[i][0], DRAM_SEG);
+-#ifdef HAVE_CUDA
+         if (n_vram_dev > 0) {
+             test_intra_agent_transfer(thread_on[i], ucx[i][0], VRAM_SEG);
+         }
+-#endif
+     }
+ 
+     for(int i = 0; i < 2; i++) {
+@@ -717,7 +649,6 @@ int main()
+                                   ucx[i][0], DRAM_SEG, 0,
+                                   ucx[i][1], DRAM_SEG, 0);
+ 
+-#ifdef HAVE_CUDA
+         if (n_vram_dev > 1) {
+             test_inter_agent_transfer(thread_on[i], false,
+                                       ucx[i][0], VRAM_SEG, dev_ids[0],
+@@ -732,7 +663,6 @@ int main()
+                                       ucx[i][0], VRAM_SEG, dev_ids[0],
+                                       ucx[i][1], DRAM_SEG, dev_ids[1]);
+         }
+-#endif
+     }
+ 
+     // Deallocate UCX engines
+diff --git a/test/unit/plugins/ucx/ucx_worker_test.cpp b/test/unit/plugins/ucx/ucx_worker_test.cpp
+index 8b0bcd5..1524dcb 100644
+--- a/test/unit/plugins/ucx/ucx_worker_test.cpp
++++ b/test/unit/plugins/ucx/ucx_worker_test.cpp
+@@ -22,26 +22,7 @@
+ 
+ #include "ucx_utils.h"
+ #include "rkey.h"
+-// TODO: meson conditional build for CUDA
+-// #define USE_VRAM
+-
+-#ifdef USE_VRAM
+-
+-#include <cuda.h>
+-#include <cuda_runtime.h>
+-
+-int gpu_id = 0;
+-
+-static void
+-checkCudaError(cudaError_t result, const char *message) {
+-    if (result != cudaSuccess) {
+-        std::cerr << message << " (Error code: " << result << " - " << cudaGetErrorString(result)
+-                  << ")" << std::endl;
+-        exit(EXIT_FAILURE);
+-    }
+-}
+-#endif
+-
++#include "gpu_utils.h"
+ 
+ using namespace std;
+ 
+@@ -94,9 +75,10 @@ main() {
+     nixl_mem_t nixl_mem_type;
+ 
+ #ifdef USE_VRAM
+-    checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
+-    checkCudaError(cudaMalloc(&buffer[0], buf_size), "Failed to allocate CUDA buffer 0");
+-    checkCudaError(cudaMalloc(&buffer[1], buf_size), "Failed to allocate CUDA buffer 1");
++    int gpu_id = 0;
++    gpuSetDevice(gpu_id, "Failed to set device");
++    gpuMalloc((void **)&buffer[0], buf_size, "Failed to allocate GPU buffer 0");
++    gpuMalloc((void **)&buffer[1], buf_size, "Failed to allocate GPU buffer 1");
+     nixl_mem_type = VRAM_SEG;
+ #else
+     buffer[0] = (uint8_t *)calloc(1, buf_size);
+@@ -125,8 +107,8 @@ main() {
+      * ========================================= */
+ 
+ #ifdef USE_VRAM
+-    checkCudaError(cudaMemset(buffer[1], 0xbb, buf_size), "Failed to memset");
+-    checkCudaError(cudaMemset(buffer[0], 0xda, buf_size), "Failed to memset");
++    gpuMemset(buffer[1], 0xbb, buf_size, "Failed to memset");
++    gpuMemset(buffer[0], 0xda, buf_size, "Failed to memset");
+ #else
+     memset(buffer[1], 0xbb, buf_size);
+     memset(buffer[0], 0xda, buf_size);
+@@ -141,8 +123,7 @@ main() {
+     completeRequest(w, std::string("WRITE"), true, ret, req);
+ 
+ #ifdef USE_VRAM
+-    checkCudaError(cudaMemcpy(chk_buffer, buffer[1], buf_size, cudaMemcpyDeviceToHost),
+-                   "Failed to memcpy");
++    gpuMemcpyD2H(chk_buffer, buffer[1], buf_size, "Failed to memcpy");
+ #else
+     memcpy(chk_buffer, buffer[1], buf_size);
+ #endif
+@@ -159,10 +140,9 @@ main() {
+      * ========================================= */
+ 
+ #ifdef USE_VRAM
+-    checkCudaError(cudaMemset(buffer[0], 0xbb, buf_size), "Failed to memset");
+-    checkCudaError(cudaMemset(buffer[1], 0xbb, buf_size / 3), "Failed to memset");
+-    checkCudaError(cudaMemset(buffer[1] + buf_size / 3, 0xda, buf_size - buf_size / 3),
+-                   "Failed to memset");
++    gpuMemset(buffer[0], 0xbb, buf_size, "Failed to memset");
++    gpuMemset(buffer[1], 0xbb, buf_size / 3, "Failed to memset");
++    gpuMemset(buffer[1] + buf_size / 3, 0xda, buf_size - buf_size / 3, "Failed to memset");
+ #else
+     memset(buffer[0], 0xbb, buf_size);
+     memset(buffer[1], 0xbb, buf_size / 3);
+@@ -178,8 +158,7 @@ main() {
+     completeRequest(w, std::string("READ"), true, ret, req);
+ 
+ #ifdef USE_VRAM
+-    checkCudaError(cudaMemcpy(chk_buffer, buffer[0], buf_size, cudaMemcpyDeviceToHost),
+-                   "Failed to memcpy");
++    gpuMemcpyD2H(chk_buffer, buffer[0], buf_size, "Failed to memcpy");
+ #else
+     memcpy(chk_buffer, buffer[0], buf_size);
+ #endif
+@@ -199,8 +178,8 @@ main() {
+ 
+ 
+ #ifdef USE_VRAM
+-    checkCudaError(cudaFree(buffer[0]), "Failed to allocate CUDA buffer 0");
+-    checkCudaError(cudaFree(buffer[1]), "Failed to allocate CUDA buffer 0");
++    gpuFree(buffer[0], "Failed to free GPU buffer 0");
++    gpuFree(buffer[1], "Failed to free GPU buffer 1");
+ #else
+     free(buffer[0]);
+     free(buffer[1]);

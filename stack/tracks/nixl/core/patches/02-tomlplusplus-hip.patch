@@ -1,0 +1,56 @@
+--- a/include/toml++/impl/preprocessor.hpp
++++ b/include/toml++/impl/preprocessor.hpp
+@@ -397,9 +397,9 @@
+ // TOML_ALWAYS_INLINE
+ #ifdef _MSC_VER
+ #define TOML_ALWAYS_INLINE __forceinline
+-#elif TOML_GCC || TOML_CLANG || TOML_HAS_ATTR(__always_inline__)
++#elif TOML_GCC || TOML_CLANG || TOML_HAS_ATTR(always_inline)
+ #define TOML_ALWAYS_INLINE                                                                                             \
+-	TOML_ATTR(__always_inline__)                                                                                       \
++	TOML_ATTR(always_inline)                                                                                       \
+ 	inline
+ #else
+ #define TOML_ALWAYS_INLINE inline
+@@ -411,8 +411,8 @@
+ #elif TOML_CUDA // https://gitlab.gnome.org/GNOME/glib/-/issues/2555
+ #define TOML_NEVER_INLINE TOML_ATTR(noinline)
+ #else
+-#if TOML_GCC || TOML_CLANG || TOML_HAS_ATTR(__noinline__)
+-#define TOML_NEVER_INLINE TOML_ATTR(__noinline__)
++#if TOML_GCC || TOML_CLANG || TOML_HAS_ATTR(noinline)
++#define TOML_NEVER_INLINE TOML_ATTR(noinline)
+ #endif
+ #endif
+ #ifndef TOML_NEVER_INLINE
+@@ -424,8 +424,8 @@
+ #define TOML_EMPTY_BASES		TOML_DECLSPEC(empty_bases)
+
+ // TOML_TRIVIAL_ABI
+-#if TOML_CLANG || TOML_HAS_ATTR(__trivial_abi__)
+-#define TOML_TRIVIAL_ABI TOML_ATTR(__trivial_abi__)
++#if TOML_CLANG || TOML_HAS_ATTR(trivial_abi)
++#define TOML_TRIVIAL_ABI TOML_ATTR(trivial_abi)
+ #else
+ #define TOML_TRIVIAL_ABI
+ #endif
+@@ -433,8 +433,8 @@
+ // TOML_NODISCARD
+ #if TOML_CPP >= 17 && TOML_HAS_CPP_ATTR(nodiscard) >= 201603
+ #define TOML_NODISCARD [[nodiscard]]
+-#elif TOML_CLANG || TOML_GCC || TOML_HAS_ATTR(__warn_unused_result__)
+-#define TOML_NODISCARD TOML_ATTR(__warn_unused_result__)
++#elif TOML_CLANG || TOML_GCC || TOML_HAS_ATTR(warn_unused_result)
++#define TOML_NODISCARD TOML_ATTR(warn_unused_result)
+ #else
+ #define TOML_NODISCARD
+ #endif
+@@ -500,7 +500,7 @@
+ #define TOML_ASSUME(expr) __builtin_assume(expr)
+ #elif TOML_HAS_CPP_ATTR(assume) >= 202207
+ #define TOML_ASSUME(expr) [[assume(expr)]]
+-#elif TOML_HAS_ATTR(__assume__)
++#elif TOML_HAS_ATTR(assume)
+ #define TOML_ASSUME(expr) __attribute__((__assume__(expr)))
+ #else
+ #define TOML_ASSUME(expr) static_cast<void>(0)

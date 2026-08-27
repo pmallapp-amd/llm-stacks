@@ -1,0 +1,10 @@
+# Dockerfile for nixl:n0 — adds runtime libs on top of nixl:base.
+# nixlbench is NOT compiled here; 02-compile-bench.sh runs it at docker run
+# time with /opt/rocm mounted so the HIP worker path is available.
+ARG BASE=nixl:base
+FROM ${BASE}
+
+RUN apt-get install -y --no-install-recommends \
+    libelf1 libdrm2 libdrm-amdgpu1 libcxxopts-dev
+
+WORKDIR /run

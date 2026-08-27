@@ -1,0 +1,613 @@
+diff --git a/meson.build b/meson.build
+index 3a9ed63..7a9caf2 100644
+--- a/meson.build
++++ b/meson.build
+@@ -195,6 +195,42 @@ else
+ endif
+ taskflow_proj = dependency('taskflow', fallback: ['taskflow', 'taskflow_dep'])
+ 
++use_rocm = get_option('use_rocm')
++
++if use_rocm
++    rocm_path = get_option('rocm_path')
++    if rocm_path == ''
++        rocm_path = '/opt/rocm'
++        if not fs.exists(rocm_path)
++            error('ROCm not found at default location /opt/rocm. Override with -Drocm_path=<path>.')
++        endif
++    endif
++
++    rocm_lib_path = rocm_path + '/lib'
++    rocm_inc_path = rocm_path + '/include'
++
++    if not fs.exists(rocm_inc_path)
++        error('ROCm include path not found: ' + rocm_inc_path)
++    endif
++    if not fs.exists(rocm_lib_path)
++        error('ROCm lib path not found: ' + rocm_lib_path)
++    endif
++
++    hip_runtime_dep = cpp.find_library('amdhip64', dirs: rocm_lib_path, required: true)
++    rocm_dep = declare_dependency(
++        dependencies : [hip_runtime_dep],
++        include_directories : include_directories(rocm_inc_path))
++
++    doca_gpunetio_dep = disabler()
++    cuda_wheel_dir = 'nixl_rocm'
++    message('ROCm build enabled:', rocm_path)
++
++    # Alias cuda_dep to rocm_dep so all downstream cuda_dep.found() checks cascade.
++    # CUDA-specific plugins (GDS, GDS_MT, GPUNETIO) are gated on cuda_dep AND other
++    # CUDA-only deps (cufile, DOCA), so they will self-disable on ROCm hosts.
++    cuda_dep = rocm_dep
++else
++
+ cuda_inc_path = get_option('cudapath_inc')
+ cuda_lib_path = get_option('cudapath_lib')
+ cuda_stub_path = get_option('cudapath_stub')
+@@ -309,6 +345,8 @@ else
+     cuda_wheel_dir = 'nixl_cu12'
+ endif
+ 
++endif # end of use_rocm else block
++
+ # Allow callers (e.g. ROCm CI/Dockerfile) to override the wheel variant suffix
+ # without otherwise affecting the build. Non-empty value wins over the
+ # autodetected CUDA-major value above: e.g. -Dwheel_variant=rocm -> nixl_rocm.
+@@ -381,7 +419,7 @@ endif
+ # UCX GPU device API detection
+ nvcc_prog = find_program('nvcc', required: false)
+ ucx_gpu_device_api_available = false
+-if ucx_dep.found() and cuda_dep.found() and nvcc_prog.found()
++if not use_rocm and ucx_dep.found() and cuda_dep.found() and nvcc_prog.found()
+     cuda = meson.get_compiler('cuda')
+     # TODO: Expose doca_gpunetio_dep through UCX
+     have_gpu_side = cuda.compiles('''
+diff --git a/meson_options.txt b/meson_options.txt
+index 00b208f..1c9832f 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -26,6 +26,8 @@ option('gds_path', type: 'string', value: '/usr/local/cuda/', description: 'Path
+ option('cudapath_inc', type: 'string', value: '', description: 'Include path for CUDA')
+ option('cudapath_lib', type: 'string', value: '', description: 'Library path for CUDA')
+ option('cudapath_stub', type: 'string', value: '', description: 'Extra Stub path for CUDA')
++option('use_rocm', type: 'boolean', value: false, description: 'Build against AMD ROCm/HIP instead of CUDA. When true, CUDA toolchain is not required.')
++option('rocm_path', type: 'string', value: '', description: 'Path to ROCm installation directory (used only when use_rocm=true). Empty falls back to /opt/rocm.')
+ option('nixl_cuda_arch_list', type: 'string', value: 'auto', description: 'Comma-separated CUDA SM targets (e.g. 90,100), or auto to select defaults (sm_80+ normally, sm_90+ when build_nixl_ep is enabled). Use a single target like 100 for faster single-GPU builds.')
+ option('wheel_variant', type: 'string', value: '', description: 'Override wheel variant suffix (e.g. -Dwheel_variant=rocm yields nixl_rocm). Empty = autodetect from CUDA major version.')
+ option('static_plugins', type: 'string', value: '', description: 'Plugins to be built-in, comma-separated')
+diff --git a/src/plugins/libfabric/libfabric_backend.cpp b/src/plugins/libfabric/libfabric_backend.cpp
+index 09a3b73..acd7bc1 100644
+--- a/src/plugins/libfabric/libfabric_backend.cpp
++++ b/src/plugins/libfabric/libfabric_backend.cpp
+@@ -218,10 +218,80 @@ nixlLibfabricEngine::vramApplyCtx() {
+     }
+     return cudaCtx_->cudaSetCtx();
+ }
++#endif
++
++/****************************************
++ * ROCm/HIP Context Management
++ *****************************************/
++
++#ifdef HAVE_ROCM
++namespace {
++struct RocmAddrInfo {
++    bool is_dev;
++    int dev_id;
++    std::string pci_bus_id;
++
++    explicit RocmAddrInfo(const hipPointerAttribute_t &attr)
++        : is_dev(attr.type == hipMemoryTypeDevice),
++          dev_id(attr.device) {
++        if (is_dev) {
++            char buf[32];
++            if (hipDeviceGetPCIBusId(buf, sizeof(buf), dev_id) == hipSuccess) {
++                pci_bus_id = buf;
++            }
++        }
++    }
++};
++
++[[nodiscard]] std::optional<RocmAddrInfo>
++rocmQueryAddr(void *address) {
++    hipPointerAttribute_t attr;
++    if (hipPointerGetAttributes(&attr, address) != hipSuccess) {
++        return std::nullopt;
++    }
++    return RocmAddrInfo(attr);
++}
++
++} // namespace
++
++nixl_status_t
++nixlLibfabricRocmCtx::rocmUpdateCtxPtr(void *address, int expected_dev) {
++    if (expected_dev == -1) {
++        return NIXL_ERR_INVALID_PARAM;
++    }
++    if (devId_ != -1 && expected_dev != devId_) {
++        return NIXL_ERR_MISMATCH;
++    }
++
++    const auto info = rocmQueryAddr(address);
++    if (!info) {
++        return NIXL_ERR_BACKEND;
++    }
++    if (!info->is_dev) {
++        return NIXL_SUCCESS;
++    }
++    if (info->dev_id != expected_dev) {
++        return NIXL_ERR_MISMATCH;
++    }
++
++    if (devId_ == -1) {
++        devId_ = expected_dev;
++    }
++    return NIXL_SUCCESS;
++}
++
++nixl_status_t
++nixlLibfabricRocmCtx::rocmSetCtx() {
++    if (devId_ < 0) {
++        return NIXL_SUCCESS;
++    }
++    hipError_t result = hipSetDevice(devId_);
++    return (result == hipSuccess) ? NIXL_SUCCESS : NIXL_ERR_BACKEND;
++}
+ 
+ void
+-nixlLibfabricEngine::vramFiniCtx() {
+-    cudaCtx_.reset();
++nixlLibfabricEngine::vramInitCtx() {
++    rocmCtx_ = std::make_unique<nixlLibfabricRocmCtx>();
+ }
+ #endif
+ 
+@@ -308,6 +378,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
+     NIXL_INFO << "System runtime: "
+               << (runtime_ == FI_HMEM_CUDA       ? "CUDA" :
+                       runtime_ == FI_HMEM_NEURON ? "NEURON" :
++                      runtime_ == FI_HMEM_ROCR   ? "ROCR" :
+                                                    "SYSTEM");
+ 
+ #ifdef HAVE_CUDA
+@@ -325,6 +396,13 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
+     }
+ #endif
+ 
++#ifdef HAVE_ROCM
++    if (runtime_ == FI_HMEM_ROCR) {
++        vramInitCtx();
++        NIXL_INFO << "ROCm/HIP context management initialized";
++    }
++#endif
++
+     // Parse striping threshold parameter
+     std::string threshold_str;
+     striping_threshold_ = NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD;
+@@ -677,6 +755,12 @@ nixlLibfabricEngine::getSupportedMems() const {
+         NIXL_DEBUG << "CUDA runtime detected, adding VRAM support";
+         mems.push_back(VRAM_SEG);
+     } else
++#endif
++#ifdef HAVE_ROCM
++        if (runtime_ == FI_HMEM_ROCR) {
++        NIXL_DEBUG << "ROCm runtime detected, adding VRAM support";
++        mems.push_back(VRAM_SEG);
++    } else
+ #endif
+         if (runtime_ == FI_HMEM_NEURON) {
+         NIXL_DEBUG << "Neuron runtime detected, adding VRAM support";
+@@ -746,6 +830,34 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
+ 
+             NIXL_DEBUG << "Queried PCI bus ID: " << pci_bus_id << " for GPU " << mem.devId;
+         }
++#endif
++#ifdef HAVE_ROCM
++        if (runtime_ == FI_HMEM_ROCR) {
++            const auto info = rocmQueryAddr(reinterpret_cast<void *>(mem.addr));
++            if (!info || !info->is_dev) {
++                NIXL_ERROR << "Failed to query ROCm device from memory "
++                           << reinterpret_cast<void *>(mem.addr);
++                return NIXL_ERR_BACKEND;
++            }
++            pci_bus_id = info->pci_bus_id;
++            if (info->dev_id != static_cast<int>(mem.devId)) {
++                NIXL_ERROR << "ROCm pointer/device mismatch: pointer on GPU " << info->dev_id
++                           << ", metadata requests GPU " << mem.devId;
++                return NIXL_ERR_INVALID_PARAM;
++            }
++            nixl_status_t status =
++                rocmCtx_->rocmUpdateCtxPtr(reinterpret_cast<void *>(mem.addr), info->dev_id);
++            if (status != NIXL_SUCCESS) {
++                NIXL_ERROR << "Failed to update ROCm context for device " << info->dev_id;
++                return status;
++            }
++            status = rocmCtx_->rocmSetCtx();
++            if (status != NIXL_SUCCESS) {
++                NIXL_ERROR << "Failed to set ROCm device context for device " << info->dev_id;
++                return status;
++            }
++            NIXL_DEBUG << "Queried PCI bus ID: " << pci_bus_id << " for AMD GPU " << mem.devId;
++        }
+ #endif
+         if (runtime_ == FI_HMEM_NEURON) {
+             // Neuron-specific address query
+@@ -1629,10 +1741,6 @@ nixlLibfabricEngine::checkPendingNotifications() {
+ void
+ nixlLibfabricEngine::cleanup() {
+     NIXL_DEBUG << "Cleaning up all resources";
+-#ifdef HAVE_CUDA
+-    // Cleanup CUDA context
+-    vramFiniCtx();
+-#endif
+ 
+     NIXL_DEBUG << "Cleanup all resources complete";
+ }
+diff --git a/src/plugins/libfabric/libfabric_backend.h b/src/plugins/libfabric/libfabric_backend.h
+index dcb88f9..e0af441 100644
+--- a/src/plugins/libfabric/libfabric_backend.h
++++ b/src/plugins/libfabric/libfabric_backend.h
+@@ -42,6 +42,16 @@
+ #include <cuda_runtime.h>
+ #endif
+ 
++#ifdef HAVE_ROCM
++#include <hip/hip_runtime_api.h>
++// HIP defines __noinline__ as a macro, which breaks __has_attribute(__noinline__)
++// in other headers (e.g. tomlplusplus). Undefine it immediately so downstream
++// headers that use __noinline__ as a plain identifier work correctly.
++#ifdef __noinline__
++#undef __noinline__
++#endif
++#endif
++
+ // Forward declarations
+ class nixlLibfabricEngine;
+ 
+@@ -72,6 +82,31 @@ public:
+ };
+ #endif
+ 
++#ifdef HAVE_ROCM
++/** ROCm/HIP context management for libfabric backend */
++class nixlLibfabricRocmCtx {
++private:
++    int devId_;
++
++public:
++    nixlLibfabricRocmCtx() noexcept : devId_(-1) {}
++
++    /** Reset ROCm device selection to initial state */
++    void
++    rocmResetCtxPtr() noexcept {
++        devId_ = -1;
++    }
++
++    /** Update ROCm device selection for given memory address and device */
++    [[nodiscard]] nixl_status_t
++    rocmUpdateCtxPtr(void *address, int expected_dev);
++
++    /** Set the current HIP device */
++    [[nodiscard]] nixl_status_t
++    rocmSetCtx();
++};
++#endif
++
+ /** Private metadata for locally registered memory */
+ class nixlLibfabricPrivateMetadata : public nixlBackendMD {
+ private:
+@@ -276,6 +311,11 @@ private:
+     bool cuda_addr_wa_; // CUDA address workaround flag
+ #endif
+ 
++#ifdef HAVE_ROCM
++    // ROCm/HIP context management
++    std::unique_ptr<nixlLibfabricRocmCtx> rocmCtx_;
++#endif
++
+     void
+     postShutdownCompletion();
+     // Progress thread for rail CQs
+@@ -294,14 +334,16 @@ private:
+ 
+ #ifdef HAVE_CUDA
+     // CUDA context management methods
+-    void
+-    vramInitCtx();
+     int
+     vramUpdateCtx(void *address, uint64_t devId, bool &restart_reqd);
+     int
+     vramApplyCtx();
++#endif
++
++#if defined(HAVE_ROCM) || defined(HAVE_CUDA)
++    // CUDA and ROCm/HIP context management methods
+     void
+-    vramFiniCtx();
++    vramInitCtx();
+ #endif
+ 
+ public:
+diff --git a/src/plugins/libfabric/meson.build b/src/plugins/libfabric/meson.build
+index 1fdb6fb..c530da5 100644
+--- a/src/plugins/libfabric/meson.build
++++ b/src/plugins/libfabric/meson.build
+@@ -28,10 +28,14 @@ libfabric_plugin_deps = [
+ 
+ compile_flags = ['-DHAVE_LIBFABRIC']
+ 
+-# Add CUDA support if available
++# Add CUDA or ROCm support if available
+ if cuda_dep.found()
+     libfabric_plugin_deps += [cuda_dep]
+-    compile_flags += ['-DHAVE_CUDA']
++    if get_option('use_rocm')
++        compile_flags += ['-DHAVE_ROCM', '-D__HIP_PLATFORM_AMD__', '-Wno-deprecated-declarations']
++    else
++        compile_flags += ['-DHAVE_CUDA']
++    endif
+ endif
+ 
+ # Build as static or shared library based on configuration
+diff --git a/src/utils/libfabric/libfabric_rail_manager.cpp b/src/utils/libfabric/libfabric_rail_manager.cpp
+index 4445b5a..e87bc3d 100644
+--- a/src/utils/libfabric/libfabric_rail_manager.cpp
++++ b/src/utils/libfabric/libfabric_rail_manager.cpp
+@@ -202,11 +202,20 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
+     topology = std::make_unique<nixlLibfabricTopology>();
+ 
+     // Determine system runtime type once at initialization
++#if defined(HAVE_CUDA)
+     if (topology->getNumNvidiaAccel() > 0) {
+         runtime_ = FI_HMEM_CUDA;
+         NIXL_INFO << "System runtime: CUDA for " << topology->getNumNvidiaAccel()
+                   << " NVIDIA GPU(s)";
+-    } else if (topology->getNumAwsAccel() > 0) {
++    } else
++#endif
++#if defined(HAVE_ROCM)
++        if (topology->getNumAmdAccel() > 0) {
++        runtime_ = FI_HMEM_ROCR;
++        NIXL_INFO << "System runtime: ROCR for " << topology->getNumAmdAccel() << " AMD GPU(s)";
++    } else
++#endif
++        if (topology->getNumAwsAccel() > 0) {
+         runtime_ = FI_HMEM_NEURON;
+         NIXL_INFO << "System runtime: NEURON for " << topology->getNumAwsAccel()
+                   << " AWS Trainium device(s)";
+@@ -772,7 +781,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
+ 
+     enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
+     if (mem_type == VRAM_SEG) {
+-        iface = topology->getMrAttrIface(device_id);
++        iface = runtime_;
+     }
+ 
+     // Resize output vectors to match all rails
+diff --git a/src/utils/libfabric/libfabric_topology.cpp b/src/utils/libfabric/libfabric_topology.cpp
+index e35b759..1c65fae 100644
+--- a/src/utils/libfabric/libfabric_topology.cpp
++++ b/src/utils/libfabric/libfabric_topology.cpp
+@@ -36,6 +36,7 @@
+ nixlLibfabricTopology::nixlLibfabricTopology()
+     : num_aws_accel(0),
+       num_nvidia_accel(0),
++      num_amd_accel(0),
+       num_numa_nodes(0),
+       num_devices(0),
+       topology_discovered(false),
+@@ -100,8 +101,8 @@ nixlLibfabricTopology::discoverTopology() {
+         // build nic info map regardless of accelerator to EFA mapping
+         buildNicInfoMap();
+ 
+-        // Build nVidia accelerator to EFA mapping based on PCIe topology
+-        if (num_nvidia_accel > 0) {
++        // Build accelerator to NIC mapping based on PCIe topology
++        if (num_nvidia_accel > 0 || num_amd_accel > 0) {
+             status = buildAccelToEfaMapping();
+             if (status != NIXL_SUCCESS) {
+                 NIXL_ERROR << "Failed to build accelerator to EFA mapping";
+@@ -115,6 +116,7 @@ nixlLibfabricTopology::discoverTopology() {
+ 
+         // Set basic values without hwloc discovery
+         num_nvidia_accel = 0; // TCP doesn't need accelerator topology
++        num_amd_accel = 0; // TCP doesn't need accelerator topology
+         num_aws_accel = 0; // TCP doesn't need accelerator topology
+         num_numa_nodes = 1; // Simple fallback
+ 
+@@ -258,7 +260,8 @@ nixlLibfabricTopology::getNumaRailCount() const {
+ void
+ nixlLibfabricTopology::printTopologyInfo() const {
+     NIXL_INFO << "Topology: " << num_numa_nodes << " NUMA nodes, " << num_devices << " NICs, "
+-              << num_nvidia_accel << " NVIDIA GPUs, " << num_aws_accel << " AWS accelerators";
++              << num_nvidia_accel << " NVIDIA GPUs, " << num_amd_accel << " AMD GPUs, "
++              << num_aws_accel << " AWS accelerators";
+     if (avg_nic_speed > 0) {
+         NIXL_INFO << "Avg NIC bandwidth: " << avg_nic_speed << " Gbps";
+     }
+@@ -294,6 +297,8 @@ nixlLibfabricTopology::getTopologyString() const {
+     std::stringstream ss;
+     ss << "Libfabric Topology: ";
+     ss << "AWS_Accelerators=" << num_aws_accel << ", ";
++    ss << "NVIDIA_Accelerators=" << num_nvidia_accel << ", ";
++    ss << "AMD_Accelerators=" << num_amd_accel << ", ";
+     ss << "NUMA=" << num_numa_nodes << ", ";
+     ss << "EFA=" << num_devices << ", ";
+     ss << "Discovered=" << (topology_discovered ? "Yes" : "No");
+@@ -406,6 +411,7 @@ nixl_status_t
+ nixlLibfabricTopology::discoverAccelWithHwloc() {
+     num_aws_accel = 0;
+     num_nvidia_accel = 0;
++    num_amd_accel = 0;
+     // Find all PCI devices and log detailed information
+     static const char *vendor_names[2] = {"NEURON", "NVIDIA"};
+     hwloc_obj_t pci_obj = nullptr;
+@@ -419,20 +425,33 @@ nixlLibfabricTopology::discoverAccelWithHwloc() {
+             uint16_t class_id = pci_obj->attr->pcidev.class_id;
+ 
+             NIXL_TRACE << "Found " << vendor_names[is_nvidia_accel] << " accelerator "
+-                       << num_aws_accel << ": " << pcie_addr << " (vendor=" << std::hex << vendor_id
+-                       << ", device=" << device_id << ", class=" << class_id << std::dec << ")";
+-
+-            num_aws_accel++;
+-            num_nvidia_accel += is_nvidia_accel;
++                       << (is_nvidia_accel ? num_nvidia_accel : num_aws_accel) << ": " << pcie_addr
++                       << " (vendor=" << std::hex << vendor_id << ", device=" << device_id
++                       << ", class=" << class_id << std::dec << ")";
++
++            if (is_nvidia_accel) {
++                num_nvidia_accel++;
++            } else {
++                num_aws_accel++;
++            }
++        } else if (isAmdAccel(pci_obj)) {
++            const std::string pcie_addr = getPcieAddressFromHwlocObj(pci_obj);
++            const uint16_t vendor_id = pci_obj->attr->pcidev.vendor_id;
++            const uint16_t device_id = pci_obj->attr->pcidev.device_id;
++            const uint16_t class_id = pci_obj->attr->pcidev.class_id;
++            NIXL_TRACE << "Found AMD accelerator " << num_amd_accel << ": " << pcie_addr
++                       << " (vendor=" << std::hex << vendor_id << ", device=" << device_id
++                       << ", class=" << class_id << std::dec << ")";
++            num_amd_accel++;
+         }
+     }
+ 
+-    NIXL_TRACE << "Discovered " << num_aws_accel << " "
+-               << vendor_names[num_aws_accel == num_nvidia_accel] << " devices via hwloc";
++    NIXL_TRACE << "Discovered " << num_aws_accel << " AWS, " << num_nvidia_accel << " NVIDIA, "
++               << num_amd_accel << " AMD accelerators via hwloc";
+ 
+     // If we found more than 8 NVIDIA accelerators on P5en, investigate further
+     if (num_nvidia_accel > 8) {
+-        NIXL_WARN << "Found " << num_aws_accel
++        NIXL_WARN << "Found " << num_nvidia_accel
+                   << " NVIDIA accelerators, but P5en should have 8. Investigating...";
+ 
+         // List all NVIDIA devices to understand what we're seeing
+@@ -576,7 +595,7 @@ nixlLibfabricTopology::buildTopologyAwareGrouping() {
+     // Step 2: Discover accelerators
+     hwloc_obj_t pci_obj = nullptr;
+     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
+-        if (isNvidiaAccel(pci_obj)) {
++        if (isNvidiaAccel(pci_obj) || isAmdAccel(pci_obj)) {
+             AccelInfo accel;
+             accel.hwloc_node = pci_obj;
+             accel.domain_id = pci_obj->attr->pcidev.domain;
+@@ -722,7 +741,7 @@ nixlLibfabricTopology::getPcieAddressFromHwlocObj(hwloc_obj_t obj) const {
+     return getPcieAddressFromHwlocPcidev(obj->attr->pcidev);
+ }
+ 
+-bool
++[[nodiscard]] bool
+ nixlLibfabricTopology::isNvidiaAccel(hwloc_obj_t obj) const {
+     if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+         return false;
+@@ -733,11 +752,11 @@ nixlLibfabricTopology::isNvidiaAccel(hwloc_obj_t obj) const {
+     }
+     // Only count devices with GPU class (0x300-0x3ff for display controllers)
+     // Class 0x302 is 3D controller (GPU), 0x680 is other devices (network, etc.)
+-    uint16_t class_id = obj->attr->pcidev.class_id;
++    const uint16_t class_id = obj->attr->pcidev.class_id;
+     return (class_id >= 0x300 && class_id < 0x400);
+ }
+ 
+-bool
++[[nodiscard]] bool
+ nixlLibfabricTopology::isNeuronAccel(hwloc_obj_t obj) const {
+     if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+         return false;
+@@ -758,6 +777,21 @@ nixlLibfabricTopology::isNeuronAccel(hwloc_obj_t obj) const {
+                      obj->attr->pcidev.device_id) != std::end(NEURON_DEVICE_IDS);
+ }
+ 
++[[nodiscard]] bool
++nixlLibfabricTopology::isAmdAccel(hwloc_obj_t obj) const noexcept {
++    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
++        return false;
++    }
++    // AMD vendor ID is 0x1002.  Match two PCI class ranges:
++    //   0x0300-0x03ff  Display/3D controllers (discrete GPUs: MI200, MI300X, RX series)
++    //   0x1200-0x12ff  Processing Accelerators (MI300A APU — appears without a display class)
++    if (obj->attr->pcidev.vendor_id != 0x1002) {
++        return false;
++    }
++    const uint16_t class_id = obj->attr->pcidev.class_id;
++    return (class_id >= 0x300 && class_id < 0x400) || (class_id >= 0x1200 && class_id < 0x1300);
++}
++
+ bool
+ nixlLibfabricTopology::isEfaDevice(hwloc_obj_t obj) const {
+     if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+diff --git a/src/utils/libfabric/libfabric_topology.h b/src/utils/libfabric/libfabric_topology.h
+index 1bd721f..4d01d98 100644
+--- a/src/utils/libfabric/libfabric_topology.h
++++ b/src/utils/libfabric/libfabric_topology.h
+@@ -44,6 +44,7 @@ private:
+     // System information
+     int num_aws_accel; // AWS Trainium accelerators
+     int num_nvidia_accel; // NVIDIA GPU accelerators
++    int num_amd_accel; // AMD GPU accelerators
+     int num_numa_nodes;
+     int num_devices;
+ 
+@@ -141,10 +142,12 @@ private:
+     getPcieAddressFromHwlocPcidev(const hwloc_obj_attr_u::hwloc_pcidev_attr_s &pcidev) const;
+     std::string
+     getPcieAddressFromHwlocObj(hwloc_obj_t obj) const;
+-    bool
++    [[nodiscard]] bool
+     isNvidiaAccel(hwloc_obj_t obj) const;
+-    bool
++    [[nodiscard]] bool
+     isNeuronAccel(hwloc_obj_t obj) const;
++    [[nodiscard]] bool
++    isAmdAccel(hwloc_obj_t obj) const noexcept;
+     bool
+     isEfaDevice(hwloc_obj_t obj) const;
+ 
+@@ -211,6 +214,11 @@ public:
+         return num_nvidia_accel;
+     }
+ 
++    int
++    getNumAmdAccel() const {
++        return num_amd_accel;
++    }
++
+     const std::vector<std::string> &
+     getAllDevices() const {
+         return all_devices;
+@@ -230,11 +238,6 @@ public:
+     bool
+     isValidDevice(const std::string &efa_device) const;
+ 
+-    enum fi_hmem_iface
+-    getMrAttrIface(int device_id) const {
+-        return (device_id < num_nvidia_accel) ? FI_HMEM_CUDA : FI_HMEM_NEURON;
+-    }
+-
+     /** @brief Invalid NUMA node id constant. */
+     static const uint16_t INVALID_NUMA_NODE_ID = UINT16_MAX;
+ 
+diff --git a/src/utils/libfabric/meson.build b/src/utils/libfabric/meson.build
+index 93c0390..f6b4e37 100644
+--- a/src/utils/libfabric/meson.build
++++ b/src/utils/libfabric/meson.build
+@@ -61,10 +61,14 @@ if libfabric_dep.found()
+     endif
+ endif
+ 
+-# Add CUDA support if available
++# Add CUDA or ROCm support if available
+ if cuda_dep.found()
+     libfabric_utils_deps += [cuda_dep]
+-    libfabric_utils_cpp_args += ['-DHAVE_CUDA']
++    if get_option('use_rocm')
++        libfabric_utils_cpp_args += ['-DHAVE_ROCM', '-D__HIP_PLATFORM_AMD__', '-Wno-deprecated-declarations']
++    else
++        libfabric_utils_cpp_args += ['-DHAVE_CUDA']
++    endif
+ endif
+ 
+ # Create static library

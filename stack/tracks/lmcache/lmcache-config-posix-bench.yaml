@@ -1,0 +1,11 @@
+# lmcache-config-posix-bench.yaml — POSIX equivalent of lmcache-config-bench.yaml
+# for kv_offload_bench.py's store->evict->retrieve comparison.
+chunk_size: 256
+nixl_buffer_device: cpu
+max_local_cpu_size: 0.1  # GiB
+extra_config:
+  enable_nixl_storage: true
+  nixl_backend: POSIX
+  nixl_pool_size: 256
+  nixl_path: /mnt/nixl-posix-cache
+  use_direct_io: true

@@ -1,0 +1,36 @@
+# cross-track-serving — the same serving sweep, under the same profile, across
+# every KV-transfer layer. This is the file that makes "swap the track" a field
+# edit instead of a script edit.
+#
+# Run it:   bash bench/run-manifest.sh cross-track-serving --dry-run
+#           bash bench/run-manifest.sh cross-track-serving
+#           bash bench/run-manifest.sh cross-track-serving --only mooncake
+#
+# The comparison is only valid because every row names the SAME profile: same
+# depths, same pp/tg, same concurrency, EXACT_TG=1 so output length is fixed.
+# Change the profile field on one row and you no longer have a comparison — the
+# provenance stamp on each result records which profile it ran under, so that
+# mistake is at least visible afterwards.
+#
+# Each row deploys its track through bench/tracks.registry if nothing is
+# already healthy on the port; MODEL comes from the track's registry default
+# unless a row overrides it. Rows are deliberately given different ports where
+# the tracks can coexist, but note they still contend for the same GPU — run
+# them one at a time on a single-GPU host (this runner is sequential by design).
+#
+# name | benchmark | track | profile | host | env (';' separated)
+
+nixl|llama-benchy|nixl|throughput|*|BASE_URL=http://127.0.0.1:8000/v1
+mooncake|llama-benchy|mooncake|throughput|*|BASE_URL=http://127.0.0.1:8000/v1
+lmcache|llama-benchy|lmcache|throughput|*|BASE_URL=http://127.0.0.1:8000/v1
+lmcache-posix|llama-benchy|lmcache-posix|throughput|*|BASE_URL=http://127.0.0.1:8000/v1
+
+# Smoke variants: prove each track deploys and answers before committing a GPU
+# to the full sweep above. Same tracks, one-point profile.
+nixl-smoke|llama-benchy|nixl|smoke|*|BASE_URL=http://127.0.0.1:8000/v1
+mooncake-smoke|llama-benchy|mooncake|smoke|*|BASE_URL=http://127.0.0.1:8000/v1
+
+# The P/D delta (baseline vs prefill/decode split) is a different question and a
+# different tool — same profile on both tracks so the two deltas are comparable.
+nixl-pd|vllm-serving-nixl|-|pd-handoff|*|NIXL_BACKEND=UCX
+mooncake-pd|vllm-serving-mooncake|-|pd-handoff|*|

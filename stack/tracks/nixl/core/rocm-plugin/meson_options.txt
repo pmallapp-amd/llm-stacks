@@ -1,0 +1,4 @@
+option('nixl_path', type: 'string', value: '/usr/local/nixl',
+    description: 'NIXL install prefix')
+option('rocm_path', type: 'string', value: '/opt/rocm',
+    description: 'ROCm install prefix')
