@@ -1,0 +1,8 @@
+option('nixl_path', type: 'string', value: '/usr/local/nixl',
+    description: 'NIXL install prefix')
+option('spdk_path', type: 'string', value: '/spdk-src',
+    description: 'kv_spdk SDK root — contains include/ and lib/*.a (from sdk/kv-spdk-sdk.tar.gz or full kv_spdk)')
+option('rocm_path', type: 'string', value: '/opt/rocm',
+    description: 'ROCm install prefix (staged VRAM_SEG support)')
+option('enable_vram', type: 'boolean', value: true,
+    description: 'Build staged VRAM_SEG support (requires ROCm/HIP) — disable on hosts with no GPU')

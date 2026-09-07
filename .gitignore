@@ -1,0 +1,27 @@
+# Default-deny. This branch is an isolated single-stack extraction whose working
+# tree is shared with `main`, which carries a dozen further trees (bench/, docs/,
+# validation/, stack/, tools/, CLAUDE.md ...). Without a default-deny rule every
+# one of those shows as untracked here, and a single `git add -A` would pull the
+# material this branch exists to exclude straight into it.
+/*
+
+!/.gitignore
+!/LICENSE
+!/README.md
+!/build.sh
+!/deploy.sh
+!/target.sh
+!/proxy.py
+!/patches/
+!/plugins/
+
+# build.sh clones ROCm/rocm-aic here; built fresh per host, never committed
+/vendor/
+# plugin build output — the .so is built inside the image, not on the host
+/plugins/*/install/
+/plugins/*/build*/
+
+__pycache__/
+*.py[cod]
+*.swp
+.DS_Store

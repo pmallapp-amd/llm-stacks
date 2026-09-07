@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kv-cache <noreply@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] lmcache: split L2-adapter stores that exceed max_value_size
+
+Carried out-of-tree. See README.md.
+---
+--- a/lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py
+@@ -199,6 +199,15 @@
+         self.nixl_agent = NixlAgent(self.agent_name, nixl_conf)
+         self.nixl_agent.create_backend(backend, backend_params)
+
++        # Some KV-addressed NIXL backends (SPDK_NVMe_KV, XNVME_KV) enforce a
++        # hard max single-value size well below a full L1 chunk page (e.g.
++        # SPDK_NVMe_KV: 524288 B vs. a multi-MiB MP-mode chunk) - split each
++        # page/slot into mem_split_n <=max_value_size sub-descriptors below,
++        # transparent to callers. 1 means "no split" (default, matches
++        # unmodified upstream behavior for every backend that doesn't declare
++        # a max_value_size, e.g. OBJ, AZURE_BLOB).
++        self.mem_split_n = self._resolve_mem_split(l1_memory_desc.align_bytes)
++
+         self.init_mem_handlers(
+             self.device,
+             l1_memory_desc.ptr,
+@@ -237,15 +246,69 @@
+         # Concurrent calls produce nixlInvalidParamError: NIXL_ERR_INVALID_PARAM.
+         self._xfer_handle_lock = threading.Lock()
+
++    def _resolve_mem_split(self, page_size: int) -> int:
++        """How many <=max_value_size sub-descriptors one page/slot needs.
++
++        Queries the backend's declared max_value_size (only discoverable via
++        get_plugin_params() - NIXL core doesn't negotiate this automatically)
++        and, if the page size exceeds it, returns the number of equal-ish
++        sub-descriptors each page must be split into so no single transfer
++        descriptor - and therefore no single on-wire KV value - exceeds the
++        backend's limit. Backends that don't declare max_value_size (OBJ,
++        AZURE_BLOB, file-based backends) get 1, i.e. unchanged behavior.
++        """
++        params = self.nixl_agent.get_plugin_params(self.backend)
++        max_size_str = params.get("max_value_size") if params else None
++        logger.info(
++            "nixl_store backend %s: page_size=%d, declared max_value_size=%r",
++            self.backend,
++            page_size,
++            max_size_str,
++        )
++        if not max_size_str:
++            return 1
++        max_size = int(max_size_str)
++        if max_size <= 0 or page_size <= max_size:
++            return 1
++        n = (page_size + max_size - 1) // max_size
++        logger.info(
++            "nixl_store backend %s declares max_value_size=%d < page_size=%d; "
++            "splitting each page/slot into %d sub-objects",
++            self.backend,
++            max_size,
++            page_size,
++            n,
++        )
++        return n
++
+     def init_mem_handlers(self, device, buffer_ptr, buffer_size, page_size, device_id):
+         """
+         Initialize memory handlers for the given device and buffer.
+         """
+         reg_list = [(buffer_ptr, buffer_size, device_id, "")]
+-        xfer_desc = [
+-            (base_addr, page_size, device_id)
+-            for base_addr in range(buffer_ptr, buffer_ptr + buffer_size, page_size)
+-        ]
++        n = self.mem_split_n
++        if n == 1:
++            xfer_desc = [
++                (base_addr, page_size, device_id)
++                for base_addr in range(buffer_ptr, buffer_ptr + buffer_size, page_size)
++            ]
++        else:
++            # Split each page into n consecutive sub-descriptors so no single
++            # transfer descriptor exceeds the storage backend's
++            # max_value_size - see _resolve_mem_split(). Registration stays a
++            # single whole-buffer entry; only the transfer-descriptor
++            # granularity used for indexing (via _expand_split_indices)
++            # shrinks.
++            sub_size = (page_size + n - 1) // n
++            xfer_desc = []
++            for base_addr in range(buffer_ptr, buffer_ptr + buffer_size, page_size):
++                remaining = page_size
++                off = 0
++                for _ in range(n):
++                    this_size = min(sub_size, remaining)
++                    xfer_desc.append((base_addr + off, this_size, device_id))
++                    off += this_size
++                    remaining -= this_size
+
+         if device == "cpu":
+             mem_type = "DRAM"
+@@ -347,9 +410,30 @@
+         # Register and prepare xfer handler
+         reg_list = []
+         xfer_desc = []
+-        for i, key in enumerate(keys):
+-            reg_list.append((0, page_size, i, key))
+-            xfer_desc.append((0, page_size, i))
++        n = self.mem_split_n
++        if n == 1:
++            for i, key in enumerate(keys):
++                reg_list.append((0, page_size, i, key))
++                xfer_desc.append((0, page_size, i))
++        else:
++            # Split each logical pool slot i into n storage sub-objects.
++            # Same devId=i for every sub-part (NixlObjPool's single index per
++            # slot is unaffected), distinct byte offset AND distinct metaInfo
++            # per sub-part. The `#{j}` suffix is LOAD-BEARING, not cosmetic:
++            # XNVME_KV has always keyed off metaInfo (ignoring addr), and
++            # SPDK_NVMe_KV now does too, so dropping it would collapse all n
++            # sub-parts onto one key and silently overwrite. The offset keeps
++            # the pre-metaInfo SPDK path and FILE_SEG working.
++            sub_size = (page_size + n - 1) // n
++            for i, key in enumerate(keys):
++                remaining = page_size
++                off = 0
++                for j in range(n):
++                    this_size = min(sub_size, remaining)
++                    reg_list.append((off, this_size, i, f"{key}#{j}"))
++                    xfer_desc.append((off, this_size, i))
++                    off += this_size
++                    remaining -= this_size
+         reg_descs = self.nixl_agent.register_memory(reg_list, mem_type="OBJ")
+         xfer_descs = self.nixl_agent.get_xfer_descs(xfer_desc, mem_type="OBJ")
+         xfer_handler = self.nixl_agent.prep_xfer_dlist(
+@@ -360,8 +444,31 @@
+         self.storage_xfer_descs = xfer_descs
+         self.storage_xfer_handler = xfer_handler
+
++    def _expand_split_indices(self, mem_indices, storage_indices):
++        """Expand each logical page/slot index into mem_split_n consecutive
++        sub-descriptor indices.
++
++        Correct because init_mem_handlers() and init_storage_handlers_object()
++        above both lay out each logical index's n sub-descriptors as n
++        *consecutive* entries in their respective registered lists (positions
++        [idx*n, idx*n+n)) - so multiplying by n and expanding a range
++        reproduces the exact positions, on both the mem and storage sides, in
++        matching order. Position k in the expanded mem list and position k in
++        the expanded storage list therefore always refer to the same
++        sub-part j of the same logical (mem page, storage slot) pair.
++        """
++        if self.mem_split_n == 1:
++            return mem_indices, storage_indices
++        n = self.mem_split_n
++        expanded_mem = [idx * n + j for idx in mem_indices for j in range(n)]
++        expanded_storage = [idx * n + j for idx in storage_indices for j in range(n)]
++        return expanded_mem, expanded_storage
++
+     def get_mem_to_storage_handle(self, mem_indices, storage_indices) -> NixlXferHandle:
+         """Get a Nixl transfer handle for transferring data from memory to storage."""
++        mem_indices, storage_indices = self._expand_split_indices(
++            mem_indices, storage_indices
++        )
+
+         # Serialise: makeXferReq is not thread-safe on shared dlist handles.
+         with self._xfer_handle_lock:
+@@ -375,6 +482,9 @@
+
+     def get_storage_to_mem_handle(self, mem_indices, storage_indices) -> NixlXferHandle:
+         """Get a Nixl transfer handle for transferring data from storage to memory."""
++        mem_indices, storage_indices = self._expand_split_indices(
++            mem_indices, storage_indices
++        )
+         # Serialise: makeXferReq is not thread-safe on shared dlist handles.
+         with self._xfer_handle_lock:
+             return self.nixl_agent.make_prepped_xfer(
