@@ -8,6 +8,7 @@
 !/.gitignore
 !/LICENSE
 !/README.md
+!/HANDOFF.md
 !/build.sh
 !/deploy.sh
 !/target.sh
