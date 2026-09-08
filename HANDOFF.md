@@ -130,24 +130,38 @@ Consequences:
 
 ---
 
-## ⚠️ `deploy.sh` destroys a co-resident in-process deployment
+## `deploy.sh` destroying a co-resident in-process deployment — FIXED
 
 Two independent failure modes, both hit when deploying a second in-process instance on one host:
 
-1. `CONTAINER_NAME="aic-${BACKEND}-${PD_ROLE:-single}"` is hardcoded (`deploy.sh:1258`) and line
-   1319 does `docker rm -f` on it. `COMPOSE_PROJECT` is only applied as a docker *label* on this
-   path, so it does not disambiguate.
-2. `CONFIG_FILE` resolves to a fixed path, `pd-configs/lmcache-single-spdk.yaml`, which is
-   bind-mounted **read-only into the already-running container**. A second deploy rewrites it
-   underneath the live instance.
+1. `CONTAINER_NAME="aic-${BACKEND}-${PD_ROLE:-single}"` was hardcoded and `docker rm -f`'d
+   unconditionally. `COMPOSE_PROJECT` does not disambiguate it — on this path that value is only
+   ever attached as a docker *label*.
+2. `CONFIG_FILE` resolved to a fixed path, `pd-configs/lmcache-single-spdk.yaml`, which is
+   bind-mounted **into the already-running container**. A second deploy rewrote it underneath the
+   live instance — and it did so *before* the removal, so even a failed deploy left the running
+   container pointing at someone else's config.
 
 Failure mode 2 already bit: the decode node's mounted `config.yaml` reads `nixl_pool_size: 0`,
 while the process actually running there loaded `2000000` and logged
 `Created backend: NixlStorageBackend (NixlStaticStorageBackend)`. **The file on disk does not
-describe the running container.** Read the container's own startup log, not the config file.
+describe the running container.** That instance is still live and still mismatched — read the
+container's own startup log, not the config file, and expect it to adopt the *other* config if it
+is ever restarted.
 
-Until this is fixed, deploy a second in-process instance by replicating `deploy.sh`'s `docker run`
-block by hand with a distinct `--name` and a distinct config path.
+The fix keys the container name, the config file and the log directory off a new `INSTANCE`
+(default `${PD_ROLE:-single}`, so no existing name changes), moves the removal to *before* the
+config write, and refuses two specific accidents:
+
+| situation | behaviour |
+|---|---|
+| redeploy same instance, same port | proceeds |
+| second deploy, `INSTANCE` not set, different port | **refuses** — points at `INSTANCE=` / `REPLACE=1` |
+| same, with `REPLACE=1` | proceeds |
+| `INSTANCE=<other>`, free port | proceeds |
+| `INSTANCE=<other>`, port already held | **refuses** — names the holder |
+
+All five verified against live container state under `set -euo pipefail`.
 
 ---
 
@@ -155,7 +169,7 @@ block by hand with a distinct `--name` and a distinct config path.
 
 | Node (placeholder) | Role | State |
 |---|---|---|
-| `<SETUP3_PREFILL_NODE>` | diagnosis host | `aic-spdk-single` :8303 (dynamic, GPU 0) and `aic-spdk-static` :8304 (static, GPU 1), both `rocm-aic:kv-dbg2` |
+| `<SETUP3_PREFILL_NODE>` | diagnosis host | `aic-spdk-single` :8303 (dynamic, GPU 0), `rocm-aic:kv-dbg2`. The static control `aic-spdk-static` :8304 was torn down once it had served its purpose; GPU 1 is free. |
 | `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — **untouched throughout** |
 | `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted |
 

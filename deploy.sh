@@ -110,6 +110,19 @@
 #   AIC_XNVME_DEV=<path>       BACKEND=xnvme device node (/dev/ng0n1)
 #   AIC_KV_POOL=<n>            NIXL OBJ pool size (2000000) — see the note at the
 #                              assignment below before changing it.
+#   INSTANCE=<name>            In-process mode: this deployment's identity.
+#                              Defaults to PD_ROLE, else "single", so existing
+#                              names are unchanged. It determines the container
+#                              name (aic-<backend>-<instance>), the LMCache
+#                              config file, and the log directory. SET THIS to
+#                              run a second in-process deployment on one host —
+#                              without it the second deploy removes the first
+#                              and rewrites the config file bind-mounted into
+#                              it. deploy.sh now refuses that rather than doing
+#                              it silently.
+#   REPLACE=1                  Permit removing an existing running container of
+#                              the same INSTANCE that is serving a DIFFERENT
+#                              port. Off by default; the refusal is the point.
 #   NIXL_KV_DEBUG_XFER=<n>     Diagnostic. Dump the NIXL descriptor lists for the
 #                              first <n> postXfer()/queryMem() calls: per-side
 #                              descriptor counts, per-descriptor lengths, the
@@ -1248,21 +1261,93 @@ else
     HF_OVERRIDES=${HF_OVERRIDES:-}
     AIC_SPDK_KV_SLOT_OFFSET=${AIC_SPDK_KV_SLOT_OFFSET:-0}
     AIC_NIXL_STAGING_GB=${AIC_NIXL_STAGING_GB:-8}
-    COMPOSE_PROJECT=${COMPOSE_PROJECT:-rocm-aic-${BACKEND}-${PD_ROLE:-single}}
+    # Every per-deployment path and name hangs off INSTANCE. Defaulting it to
+    # PD_ROLE (or "single") keeps every existing name byte-identical, so this
+    # is not a rename — it is the knob that lets a SECOND in-process deployment
+    # exist on one host at all.
+    INSTANCE=${INSTANCE:-${PD_ROLE:-single}}
+    COMPOSE_PROJECT=${COMPOSE_PROJECT:-rocm-aic-${BACKEND}-${INSTANCE}}
     if [ -n "${PD_ROLE}" ]; then
         DEPLOY_DEGRADED=${DEPLOY_DEGRADED-unvalidated-first-run,experimental-pd-via-shared-storage}
     else
         DEPLOY_DEGRADED=${DEPLOY_DEGRADED-unvalidated-first-run}
     fi
 
-    CONTAINER_NAME="aic-${BACKEND}-${PD_ROLE:-single}"
+    CONTAINER_NAME="aic-${BACKEND}-${INSTANCE}"
     CONFIG_DIR="${ROCM_AIC_DIR}/pd-configs"
-    CONFIG_FILE="${CONFIG_DIR}/lmcache-${PD_ROLE:-single}-${BACKEND}.yaml"
+    CONFIG_FILE="${CONFIG_DIR}/lmcache-${INSTANCE}-${BACKEND}.yaml"
+    LOG_SUBDIR="${ROCM_AIC_DIR}/logs/${INSTANCE}"
+
+    # Which port is container $1 serving, if it is RUNNING? Empty otherwise.
+    #
+    # Read from the container's own argv rather than from a deployment record:
+    # the record is written at the END of a deploy, so a deploy that died
+    # half-way leaves a live container with no record at all — exactly the case
+    # where clobbering it would be most surprising.
+    container_port() {
+        [ "$(docker inspect "$1" --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] \
+            || return 0
+        docker inspect "$1" --format '{{json .Config.Cmd}}' 2>/dev/null \
+            | tr ',' '\n' | grep -A1 '"--port"' | tail -1 | tr -dc '0-9' || true
+    }
+
+    # A second in-process deployment on one host used to destroy the first, two
+    # separate ways:
+    #
+    #   1. CONTAINER_NAME did not vary with anything an operator sets per
+    #      deployment, and the `docker rm -f` is unconditional. COMPOSE_PROJECT
+    #      does not disambiguate it — on this path that value is only ever
+    #      attached as a docker LABEL.
+    #   2. CONFIG_FILE is bind-mounted INTO the running container, so merely
+    #      writing it re-configured a live instance underneath itself. That is
+    #      how the decode node ended up with a config file claiming
+    #      nixl_pool_size: 0 while the process actually running there had loaded
+    #      2000000 — the file on disk stopped describing its own container, and
+    #      the next restart would silently have adopted the other config.
+    #
+    # (1) is fixed by keying both off INSTANCE, and by refusing below to remove
+    # a running container that serves a DIFFERENT port than this deploy targets.
+    # (2) is fixed by moving the removal to BEFORE the config write, so the file
+    # is only ever written once nothing has it mounted.
+    EXISTING_PORT=$(container_port "${CONTAINER_NAME}")
+    if [ -n "${EXISTING_PORT}" ] && [ "${EXISTING_PORT}" != "${PORT}" ] \
+       && [ "${REPLACE:-0}" != "1" ]; then
+        echo "ERR: container '${CONTAINER_NAME}' is already running and serving port" >&2
+        echo "     ${EXISTING_PORT}, but this deploy targets port ${PORT}." >&2
+        echo "" >&2
+        echo "     Continuing would remove that container AND rewrite" >&2
+        echo "     ${CONFIG_FILE}," >&2
+        echo "     which is bind-mounted into it." >&2
+        echo "" >&2
+        echo "     To run a SECOND instance alongside it, give this one its own" >&2
+        echo "     identity:      INSTANCE=<name> ... bash deploy.sh" >&2
+        echo "     To replace the existing one:  REPLACE=1 ... bash deploy.sh" >&2
+        exit 1
+    fi
+
+    # A different instance already holding this port is always a mistake:
+    # --network host means the second vLLM would fail to bind, after a long
+    # model load.
+    PORT_HOLDER=""
+    for c in $(docker ps --format '{{.Names}}' 2>/dev/null || true); do
+        if [ "$(container_port "${c}")" = "${PORT}" ]; then PORT_HOLDER="${c}"; break; fi
+    done
+    if [ -n "${PORT_HOLDER}" ] && [ "${PORT_HOLDER}" != "${CONTAINER_NAME}" ]; then
+        echo "ERR: port ${PORT} is already served by container '${PORT_HOLDER}'." >&2
+        echo "     Choose a free PORT, or stop that container first." >&2
+        exit 1
+    fi
 
     [ -n "${PD_ROLE}" ] && echo "  slot off  : ${AIC_SPDK_KV_SLOT_OFFSET}"
+    echo "  instance  : ${INSTANCE}  (container ${CONTAINER_NAME})"
+    echo ""
+    echo "=== remove any previous '${CONTAINER_NAME}' ==="
+    # Deliberately BEFORE the config write below. See (2) above.
+    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+
     echo ""
     echo "=== prep dirs + LMCache config ==="
-    mkdir -p "${HF_HOME}/hub" "${CONFIG_DIR}" "${ROCM_AIC_DIR}/logs/${PD_ROLE:-single}"
+    mkdir -p "${HF_HOME}/hub" "${CONFIG_DIR}" "${LOG_SUBDIR}"
 
     # kv_both stores AND retrieves, so it needs both location keys; each P/D half
     # needs exactly one, and vLLM's own kv_role gating (vllm_v1_adapter.py:1050,
@@ -1316,7 +1401,8 @@ EOF
 
     echo ""
     echo "=== docker run ==="
-    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    # No `docker rm -f` here — it happens BEFORE the config write above, so
+    # that write can never land on a file a live container still has mounted.
 
     CONTEXT_ARGS=()
     [ -n "${MAX_MODEL_LEN}" ] && CONTEXT_ARGS+=(--max-model-len "${MAX_MODEL_LEN}")
@@ -1336,7 +1422,7 @@ EOF
         -v /dev/hugepages:/dev/hugepages \
         -v "${HF_HOME}:/root/.cache/huggingface" \
         -v "${CONFIG_FILE}:/etc/lmcache/config.yaml:ro" \
-        -v "${ROCM_AIC_DIR}/logs/${PD_ROLE:-single}:/var/log/aic" \
+        -v "${LOG_SUBDIR}:/var/log/aic" \
         -e HF_TOKEN="${HF_TOKEN}" \
         -e ROCR_VISIBLE_DEVICES="${GPU}" \
         -e LMCACHE_CONFIG_FILE=/etc/lmcache/config.yaml \
