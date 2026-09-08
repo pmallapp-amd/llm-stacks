@@ -275,7 +275,40 @@ curl -s http://127.0.0.1:9000/v1/completions -H 'Content-Type: application/json'
   -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"The capital of France is","max_tokens":16}'
 ```
 
-> ### ⚠️ P/D cache reuse does not work with `SPDK_NVMe_KV` — verified 2026-09-07
+> ### ⚠️ UPDATE 2026-09-08 — the lookup is fixed; the READ PATH is now the blocker
+>
+> `queryMem()` (NVMe KV Exist) is implemented in `plugins/nvme-kv/`, so
+> `NixlDynamicStorageBackend` (`AIC_KV_POOL=0`) now resolves lookups correctly across
+> processes — verified in both directions: a prefilled prompt returns `hit tokens: 1024,
+> need to load: 1024` on the decode node, a never-prefilled one still returns `0, 0`.
+> The uuid4 analysis below is therefore **obsolete as the binding constraint**.
+>
+> **What blocks P/D now is that the dynamic backend's READ returns wrong data.** This is
+> NOT P/D-specific — it reproduces on a single node:
+>
+> ```
+> PASS1 (store):                     ' the very first code word listed was "charlie golf"'
+> PASS2 (after restart, from store): ' fox20000039999999'
+>                                    hit tokens: 1280, need to load: 1280
+> ```
+>
+> Correct key, full byte count (`Retrieved 1280 of 1280 tokens ... 0.92 GB/s`), wrong content.
+> Suspected granularity mismatch: `_build_descs()` emits **one storage object per chunk**
+> (5.5 MB) while `_acquire_storage_handle()` registers it with
+> `page_size = memory_allocator.align_bytes` (4096) and the memory side stays page-granular.
+> The static pool matched 1:1 (one object per page); the dynamic one does not. Mechanism not
+> yet confirmed.
+>
+> **Use `AIC_KV_POOL` at its default (static) until this is fixed.** Static + single node is
+> verified correct. Dynamic is correct for *lookup* and wrong for *data*.
+>
+> **A retrieve must be forced through storage to be tested at all.** vLLM's own prefix cache
+> will serve a repeated prompt (`need to load: 0`) and the output will match, proving nothing.
+> Restart the container between passes — `need to load` must be non-zero.
+>
+> ---
+>
+> ### ⚠️ P/D cache reuse does not work with `SPDK_NVMe_KV` — verified 2026-09-07 (superseded above)
 >
 > Everything below will run. The prefill node **stores** correctly, the decode node serves correct
 > answers, and `completed_nvme_io` moves. But the decode node will **never get a cache hit**:
