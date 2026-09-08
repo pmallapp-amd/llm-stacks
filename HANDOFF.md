@@ -16,8 +16,13 @@ Branch `rocm-aic`, **not pushed**. The plugin instrumentation described below is
 
 The KV corruption is **not in the storage stack**. The NVMe target, the NIXL plugin, and LMCache's
 memory-object layer all carry the bytes faithfully. The bytes are **already wrong before they are
-stored** — the gather out of vLLM's GPU KV cache into LMCache's staging buffer fills only the K
-half of each chunk.
+stored**: LMCache's legacy V2 GPU connector allocates a 2-plane *split* K/V destination for vLLM
+0.26's 1-plane *fused* KV cache, so the copy kernel reads with half the correct per-token stride.
+Half the tokens, the wrong tokens, and no V at all.
+
+This is an upstream LMCache defect, not a rocm-aic one. It affects **every** backend on this path —
+static included. Only the dynamic backend ever reads its data back, which is why only it looked
+broken.
 
 The second finding is the more uncomfortable one: **the "verified correct" static backend was never
 reading from storage at all.** It recomputes. That is why it looked correct, and why the benchmark
@@ -28,7 +33,7 @@ taken against it does not measure the KV path.
 | NVMe KV target (store + retrieve) | ✅ correct — full length, exact `cdw0`, no truncation |
 | NIXL plugin descriptors / keys | ✅ correct — counts, lengths, and derived keys all match |
 | LMCache page mapping (store↔read) | ✅ correct — page md5s identical byte-for-byte across processes |
-| **GPU → staging gather (store side)** | ❌ **writes K, leaves V unwritten** |
+| **GPU → staging gather (store side)** | ❌ **root cause — 2-plane destination for a 1-plane fused cache** |
 | Static backend read path | ⚠️ **never exercised** — cannot hit across a restart by construction |
 | P+D disaggregation | ❌ still blocked, but on the defect above, not on anything in this repo |
 
@@ -36,26 +41,23 @@ taken against it does not measure the KV path.
 
 ## NEXT ACTION
 
-**Confirm the fault site inside `lmc_ops.multi_layer_kv_transfer`, then decide where the fix
-belongs — almost certainly upstream in LMCache, not here.**
+**Try `use_gpu_connector_v3: True` in the LMCache config.** It is a one-line change to the YAML,
+costs one container restart, and is the only in-tree code path that already reads the format spec's
+`kv_size` instead of assuming 2. If it produces a correct gather, P+D is unblocked without
+patching LMCache at all.
 
-The cleanest discriminator is a **poison test**: fill the destination `memory_obj.tensor` with a
-distinctive pattern (e.g. `0xA5A5`) immediately before the gather, run one store, and read the V
-region back.
+`LMCacheMetadata.get_shapes()` (`v1/metadata.py:87-105`) reads `group.shape_desc.kv_size`
+"rather than `self.use_mla`… so heterogeneous groups are handled" — which is exactly the bug below.
+But that branch is only live under `use_gpu_connector_v3`, whose default is `False`
+(`v1/config.py:580-584`). This deployment sets neither it nor `use_layerwise`, so it lands on the
+legacy V2 connector.
 
-| Observation | Conclusion |
-|---|---|
-| V region still reads `0xA5A5` | V is **never written** — the gather only emits the K half |
-| V region reads zeros or the repeated constant | something *is* writing it; the fault is a wrong source offset, not an omission |
+Verify with the same protocol that found the bug: store a ≥800-word prompt, restart the container,
+re-send it, require `need to load` non-zero, and check the output is coherent. If v3 is not viable,
+the fix is a patch to `VLLMPagedMemGPUConnectorV2.get_shape()` and
+`integration/vllm/utils.py:278` — carried in `patches/` like the rest.
 
-Instrument LMCache's GPU connector immediately after `lmc_ops.multi_layer_kv_transfer` returns
-(`/usr/local/lib/python3.12/dist-packages/lmcache/v1/gpu_connector/`), and for layers 0, 10 and 21
-compare `memory_obj.tensor[0, L]` (K) and `[1, L]` (V) against a direct torch gather from
-`kv_caches[L]` using the request's `slot_mapping`, de-interleaving the packed trailing axis
-yourself. The copy kernel itself is compiled into `lmcache.c_ops` and cannot be read — measure its
-effect instead.
-
-**Do not rebuild the image to test this.** Patch the Python in place:
+**Do not rebuild the image to test this.** Patch the Python or the config in place:
 
 ```bash
 docker cp <file> aic-spdk-single:/usr/local/lib/python3.12/dist-packages/lmcache/v1/...
@@ -81,17 +83,57 @@ gathered from a **cold, correct prefill whose own completion was coherent Englis
 So the model's KV cache was good, and the gather turned it into a half-empty chunk. Everything
 below faithfully stored and returned those already-wrong bytes.
 
-The format mismatch that explains it: vLLM 0.26.0 presents a **rank-4 fused** KV cache, and
-`gpu_connector/kv_format/detectors/vllm.py:43-51` classifies *any* rank-4 vLLM tensor list as
-`EngineKVFormat.NL_X_NB_BS_NH_CS`, whose trailing `CS` axis is `2 * head_size` — K and V packed
-together. LMCache's destination metadata is `kv_shape=(22, 2, 256, 4, 64)`, a **split** K/V layout
-with `head_size=64`. The de-interleave of the packed axis into the separate one is where the K half
-survives and the V half does not.
+### Root cause — confirmed
 
-Note the two readings of the byte counts, which the poison test separates: 2,883,584 + 1,310,720 is
-exactly 4 MiB, which could mean a write bounded at 4 MiB — or could be 22 planes of real data
-followed by 10 planes of coincidental allocator residue. Do not assume the round number is
-meaningful.
+**LMCache allocates a 2-plane split destination for a KV cache that is 1-plane fused, and the copy
+kernel derives its source stride from that wrong shape.**
+
+vLLM 0.26.0 presents a rank-4 **fused** cache: `22 × [517853, 16, 4, 128]`, where the trailing
+`CS = 2 * head_size = 128` packs K and V together.
+`gpu_connector/kv_format/detectors/vllm.py:43-51` correctly classifies it
+`EngineKVFormat.NL_X_NB_BS_NH_CS`, and `NL_X_NB_BS_NH_CS_Spec.kv_size()` correctly returns **1** —
+"K/V stay packed in the content axis; a single fused plane", per-token width `NH*CS = 512`.
+
+Two places ignore that and hardcode 2:
+
+- `VLLMPagedMemGPUConnectorV2.get_shape()` (`gpu_connectors.py:416-418`):
+  `kv_size = 1 if self.use_mla else 2` → a split `KV_2LTD [2, NL, T, num_kv_head*head_size]`,
+  i.e. per-token width **256**.
+- `integration/vllm/utils.py:278`:
+  `kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)`. This is
+  computed from the model config at engine init — *before* the KV tensors exist and before
+  `_initialize_pointers` detects the format — so it structurally **cannot** know the cache is fused.
+
+The byte totals coincide (`2*22*256*256 == 1*22*256*512`), which is why nothing downstream ever
+complains.
+
+Measured consequence: the transfer reads token *i* from engine element offset `slot_mapping[i]*256`
+when the true per-token stride is `512`. So the source token index is effectively **halved**, only
+half the payload per token is copied, only **128 of 256** tokens are represented, what lands in the
+"K" plane is really K and V interleaved by head *for the wrong tokens*, and the V plane is **never
+written at all**.
+
+A brute-force needle search over all 11.5 M int16 of the request's KV slots located every
+destination row at exactly one place: `dest[0,L][row r]` = layer `L`, token
+`slot_mapping[start]/2 + r/2`, byte offset `(r%2)*512`. 12/12 exact md5 matches to that wrong-stride
+model across 4 chunks × 3 layers; 0/12 to any correct gather.
+
+**The kernel is not at fault — the destination shape is.** Handing the *same*
+`multi_layer_kv_transfer`, same format, same `head_size=128`, same pointers, a single-plane
+`[1, 22, 256, 512]` buffer produced a byte-exact correct fused gather with zero poison remaining.
+Keeping 2 planes but passing `head_size=64` still wrote only plane 0.
+
+### How the poison test settled it
+
+Filling both `memory_obj.tensor` and `self.gpu_buffer` with `0xA5A5` before the gather: the V plane
+read back `poison=65536/65536` at L=0, 10 and 21, on every chunk. On the *following* un-poisoned
+chunk the V plane was **still** 100% poison — carried over from the previous chunk's fill of the
+reused `gpu_buffer`.
+
+That kills the "write bounded at 4 MiB" alternative outright. 2,883,584 + 1,310,720 = exactly
+4 MiB was a **coincidence**: the V region's content tracks allocator history, so it is untouched
+residue. It also explains why the junk block was identical across unrelated prompts — `gpu_buffer`
+is allocated once in `__init__` and its V half is never written by anything.
 
 ---
 
