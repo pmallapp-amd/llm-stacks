@@ -53,6 +53,74 @@ extern "C" {
 #include "spdk/thread.h"
 }
 
+// ---- Transfer-granularity debug dump ----------------------------------------
+//
+// Inert unless NIXL_KV_DEBUG_XFER is set to a positive number, which is a count
+// of postXfer()/queryMem() CALLS to dump — not descriptors. One call can carry
+// thousands of them, and dumping every one buries the answer in its own output.
+//
+// This exists to settle a question that cannot be answered from the Python side
+// alone: at the NIXL dlist level, does the memory side of a transfer have the
+// same descriptor count and the same per-descriptor lengths as the storage
+// side, and what identity does each storage descriptor actually carry? The
+// answer decides whether a granularity fix belongs in this plugin or in
+// LMCache's descriptor construction.
+//
+// The counters are process-global rather than per-engine deliberately: the
+// budget is a bound on log volume, and two engines in one process should share
+// one bound rather than each getting a full budget.
+
+static uint64_t dbg_xfer_budget() {
+    static const uint64_t n = [] {
+        const char *e = std::getenv("NIXL_KV_DEBUG_XFER");
+        return e ? std::strtoull(e, nullptr, 10) : 0ULL;
+    }();
+    return n;
+}
+
+static std::atomic<uint64_t> g_dbg_xfer_calls{0};
+static std::atomic<uint64_t> g_dbg_query_calls{0};
+static std::atomic<uint64_t> g_dbg_cpl_lines{0};
+
+// Claim one dump slot from `counter`; false once the budget is spent. Checking
+// the budget first keeps the disabled path to a single load of a function-local
+// static, so leaving this compiled in costs nothing on the hot path.
+static bool dbg_claim(std::atomic<uint64_t> &counter) {
+    const uint64_t budget = dbg_xfer_budget();
+    if (!budget) return false;
+    return counter.fetch_add(1, std::memory_order_relaxed) < budget;
+}
+
+// Completion-side dumps are budgeted separately, and more generously, because
+// completions are per-DESCRIPTOR where the dlist dump is per-CALL.
+static bool dbg_claim_cpl() {
+    const uint64_t budget = dbg_xfer_budget();
+    if (!budget) return false;
+    return g_dbg_cpl_lines.fetch_add(1, std::memory_order_relaxed) < budget * 8;
+}
+
+// The 12-byte on-device key as hex — the only representation that lets a store
+// line and a retrieve/query line be compared by eye.
+static std::string dbg_key_hex(const uint8_t *key, uint8_t key_len) {
+    static const char kHex[] = "0123456789abcdef";
+    std::string s;
+    s.reserve(static_cast<size_t>(key_len) * 2);
+    for (uint8_t i = 0; i < key_len; ++i) {
+        s.push_back(kHex[key[i] >> 4]);
+        s.push_back(kHex[key[i] & 0xF]);
+    }
+    return s;
+}
+
+// metaInfo is the field make_key() prefers over devId/addr, so whether it is
+// EMPTY is the single most diagnostic bit in the whole dump: empty means the
+// on-wire key silently falls back to a storage-pool slot index, and pool slots
+// are allocated from 0 independently by every process.
+static std::string dbg_meta_brief(const std::string &m) {
+    if (m.empty()) return "<EMPTY>";
+    return m.size() <= 64 ? m : m.substr(0, 61) + "...";
+}
+
 // ---- NUMA-local CPU discovery -----------------------------------------------
 // Reactor threads must be pinned to cores on the SAME NUMA node as the NVMe
 // device, not just "any core but 0" — cross-socket polling/DMA measurably
@@ -131,13 +199,44 @@ void nixlSpdkKvEngine::kv_complete_cb(SpdkKvWorkEx *work, bool ok) {
 void nixlSpdkKvEngine::kv_store_cb_async(void *arg,
                                           const struct spdk_nvme_cpl *cpl) {
     auto *work = static_cast<SpdkKvWorkEx *>(arg);
-    kv_complete_cb(work, spdk_nvme_cpl_is_success(cpl));
+    const bool ok = spdk_nvme_cpl_is_success(cpl);
+    if (dbg_claim_cpl()) {
+        printf("[SPDK_NVMe_KV][dbg] store cpl key=%s len=%u status=%s "
+               "(sct=%u sc=%u)\n",
+               dbg_key_hex(work->key, work->key_len).c_str(), work->buf_len,
+               ok ? "SUCCESS" : "FAIL",
+               cpl->status.sct, cpl->status.sc);
+        fflush(stdout);
+    }
+    kv_complete_cb(work, ok);
 }
 
 void nixlSpdkKvEngine::kv_retrieve_cb_async(void *arg,
                                               const struct spdk_nvme_cpl *cpl) {
     auto *work = static_cast<SpdkKvWorkEx *>(arg);
     bool ok = spdk_nvme_cpl_is_success(cpl);
+
+    // The device reports the TRUE stored value length in cdw0, and the KV
+    // target completes SUCCESS in BOTH truncation directions: a stored value
+    // SHORTER than the request leaves the tail of the destination untouched,
+    // and one LONGER is silently clipped (see kvmalloc_handle_retrieve in
+    // patches/0002-spdk-bdev-kvmalloc.patch, which does
+    // copy_len = min(data_len, entry->value_len) and then completes SUCCESS
+    // with value_len in cdw0). Nothing in the status code distinguishes those
+    // from a full transfer, so a retrieve that returns the right byte count
+    // and the wrong bytes is indistinguishable from a correct one unless cdw0
+    // is read. Dumped before the VRAM branch so this reports the DEVICE's
+    // verdict, not one already overwritten by a local copy failure.
+    if (dbg_claim_cpl()) {
+        printf("[SPDK_NVMe_KV][dbg] retrieve cpl key=%s requested=%u cdw0=%u "
+               "status=%s (sct=%u sc=%u)%s\n",
+               dbg_key_hex(work->key, work->key_len).c_str(), work->buf_len,
+               cpl->cdw0, ok ? "SUCCESS" : "FAIL",
+               cpl->status.sct, cpl->status.sc,
+               (ok && cpl->cdw0 != work->buf_len) ? "  <-- LENGTH MISMATCH" : "");
+        fflush(stdout);
+    }
+
 #ifndef NIXL_KV_NO_VRAM
     // VRAM_SEG READ: copy the just-retrieved staging-buffer slice into VRAM
     // before signalling completion.
@@ -913,6 +1012,57 @@ nixl_status_t nixlSpdkKvEngine::postXfer(
     // ternary, which would copy the meta_info string on every key derivation.
     static const std::string kEmptyMeta;
 
+    // Granularity dump — inert unless NIXL_KV_DEBUG_XFER is set. See the helper
+    // block near the top of this file for why this measurement is the one that
+    // decides where a descriptor-granularity fix belongs.
+    if (dbg_claim(g_dbg_xfer_calls)) {
+        const int rn = remote.descCount();
+        printf("[SPDK_NVMe_KV][dbg] postXfer op=%s local{count=%d type=%d} "
+               "remote{count=%d type=%d} inprocess=%d%s\n",
+               operation == NIXL_WRITE ? "WRITE" : "READ",
+               n, static_cast<int>(local.getType()),
+               rn, static_cast<int>(remote.getType()),
+               inprocess_mode_ ? 1 : 0,
+               n == rn ? "" : "  <-- DESC COUNT MISMATCH");
+
+        // Per-descriptor detail is capped; the totals below are not, so a
+        // mismatch that only shows up in aggregate is still visible.
+        const int dump_n = std::min(n, 8);
+        for (int i = 0; i < dump_n; ++i) {
+            const bool have_r = (i < rn);
+            const auto *fmd = have_r
+                ? static_cast<nixlSpdkKvMD *>(remote[i].metadataP) : nullptr;
+            const std::string &mi = fmd ? fmd->meta_info : kEmptyMeta;
+            uint8_t k[SPDK_NVME_KV_KEY_MAX_LEN] = {};
+            uint8_t kl = 0;
+            if (have_r)
+                make_key(remote[i].devId + slot_offset_, remote[i].addr, mi, k, &kl);
+            printf("[SPDK_NVMe_KV][dbg]   [%d] local{addr=0x%llx len=%zu}"
+                   " remote{devId=%llu addr=0x%llx len=%zu} md=%s meta=%s key=%s\n",
+                   i,
+                   static_cast<unsigned long long>(local[i].addr),
+                   static_cast<size_t>(local[i].len),
+                   have_r ? static_cast<unsigned long long>(remote[i].devId) : 0ULL,
+                   have_r ? static_cast<unsigned long long>(remote[i].addr) : 0ULL,
+                   have_r ? static_cast<size_t>(remote[i].len) : 0UL,
+                   have_r ? (fmd ? "yes" : "NULL") : "n/a",
+                   have_r ? dbg_meta_brief(mi).c_str() : "n/a",
+                   have_r ? dbg_key_hex(k, kl).c_str() : "n/a");
+        }
+        if (n > dump_n)
+            printf("[SPDK_NVMe_KV][dbg]   ... %d more descriptor(s) suppressed\n",
+                   n - dump_n);
+
+        size_t lsum = 0, rsum = 0;
+        for (int i = 0; i < n;  ++i) lsum += local[i].len;
+        for (int i = 0; i < rn; ++i) rsum += remote[i].len;
+        printf("[SPDK_NVMe_KV][dbg]   totals: local=%zu B over %d desc, "
+               "remote=%zu B over %d desc%s\n",
+               lsum, n, rsum, rn,
+               lsum == rsum ? "" : "  <-- BYTE TOTAL MISMATCH");
+        fflush(stdout);
+    }
+
     if (inprocess_mode_) {
         // ── In-process: execute all copy ops directly on caller thread ──
         // No SPDK, no reactor, no hugepages. All ops complete before return.
@@ -1153,6 +1303,31 @@ nixl_status_t nixlSpdkKvEngine::queryMem(const nixl_reg_dlist_t         &descs,
         make_key(d.devId + slot_offset_, d.addr, d.metaInfo,
                  q->key, &q->key_len);
         work.push_back(std::move(q));
+    }
+
+    // Same dump as postXfer's, on the lookup path. Printed from the same
+    // derivation the probe actually uses, so a key here that differs from the
+    // key a store logged is a real divergence and not a transcription slip.
+    if (dbg_claim(g_dbg_query_calls)) {
+        printf("[SPDK_NVMe_KV][dbg] queryMem n=%d type=%d\n",
+               n, static_cast<int>(descs.getType()));
+        const int dump_n = std::min(n, 8);
+        for (int i = 0; i < dump_n; ++i) {
+            const nixlBlobDesc &d = descs[static_cast<size_t>(i)];
+            const auto &q = work[static_cast<size_t>(i)];
+            printf("[SPDK_NVMe_KV][dbg]   [%d] devId=%llu addr=0x%llx len=%zu "
+                   "meta=%s key=%s\n",
+                   i,
+                   static_cast<unsigned long long>(d.devId),
+                   static_cast<unsigned long long>(d.addr),
+                   static_cast<size_t>(d.len),
+                   dbg_meta_brief(d.metaInfo).c_str(),
+                   dbg_key_hex(q->key, q->key_len).c_str());
+        }
+        if (n > dump_n)
+            printf("[SPDK_NVMe_KV][dbg]   ... %d more descriptor(s) suppressed\n",
+                   n - dump_n);
+        fflush(stdout);
     }
 
     for (auto &q : work) {

@@ -110,6 +110,15 @@
 #   AIC_XNVME_DEV=<path>       BACKEND=xnvme device node (/dev/ng0n1)
 #   AIC_KV_POOL=<n>            NIXL OBJ pool size (2000000) — see the note at the
 #                              assignment below before changing it.
+#   NIXL_KV_DEBUG_XFER=<n>     Diagnostic. Dump the NIXL descriptor lists for the
+#                              first <n> postXfer()/queryMem() calls: per-side
+#                              descriptor counts, per-descriptor lengths, the
+#                              storage descriptor's metaInfo, and the derived
+#                              12-byte on-device key. Unset/0 = off. IN-PROCESS
+#                              MODE ONLY — the sidecar (MODE=mp) path would also
+#                              need the variable added to the compose service's
+#                              `environment:` list, and passing it here without
+#                              that would silently do nothing.
 #   AIC_SPDK_KV_SLOT_OFFSET=<n>  PD mode: per-deployment key-space offset. MUST
 #                              differ between producer and receiver — both share
 #                              one namespace, and identical offsets cause silent
@@ -1332,6 +1341,7 @@ EOF
         -e ROCR_VISIBLE_DEVICES="${GPU}" \
         -e LMCACHE_CONFIG_FILE=/etc/lmcache/config.yaml \
         -e PYTHONHASHSEED=123 \
+        -e NIXL_KV_DEBUG_XFER="${NIXL_KV_DEBUG_XFER:-}" \
         -e VLLM_ENABLE_V1_MULTIPROCESSING=1 \
         -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
         --entrypoint vllm \
