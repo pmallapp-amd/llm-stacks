@@ -11,7 +11,7 @@ storage plugins compiled in so KV cache can be offloaded to a key-addressed stor
 | `XNVME_KV` | `io_uring_cmd` | a **local** NVMe-KV device node (`/dev/ng0n1`) | **(1)** the end-goal hardware |
 | `SPDK_NVMe_KV` | NVMe-oF / TCP | an **independent** SPDK NVMe-KV target, on this host or another | (2) RAM-backed in practice |
 
-The SPDK target is a genuine independent server — `start-kv-target.sh` runs it — and is a first-class
+The SPDK target is a genuine independent server — `target.sh` runs it — and is a first-class
 backing store for LMCache, not a lesser variant. What makes it category (2) is only that the target
 we run is RAM-backed (`bdev_kvmalloc`), so a number measured against it characterises the software
 path, never a storage device.
@@ -56,11 +56,395 @@ not trust a number until a correctness check has passed.
 
 ---
 
+# Walkthrough — P+D disaggregated across three nodes
+
+This is the hand-held version of Steps 1–5 below: one continuous procedure, in the order you
+actually type it, with a checkpoint after every step. **Read this if you just want it running.**
+Read Steps 1–5 and *Design and known issues* when something breaks.
+
+## What you are building
+
+```
+                              ┌─────────────────┐
+   your prompt ──────────────►│    proxy.py     │
+                              │      :9000      │
+                              └────────┬────────┘
+                        1. prefill     │      2. decode
+                    ┌──────────────────┘      └──────────────────┐
+                    ▼                                            ▼
+          ┌───────────────────┐                        ┌───────────────────┐
+          │   PREFILL node    │                        │   DECODE node     │
+          │   vLLM :8301      │                        │   vLLM :8301      │
+          │   kv_producer     │                        │   kv_consumer     │
+          └─────────┬─────────┘                        └─────────▲─────────┘
+                    │  writes KV cache                           │ reads KV cache
+                    │                                            │
+                    └──────────────►┌───────────────────┐◄───────┘
+                                    │   TARGET node     │
+                                    │  SPDK NVMe-KV     │
+                                    │      :4420        │
+                                    └───────────────────┘
+```
+
+Three hosts. The **prefill** node reads your prompt and computes its KV cache, then writes that
+cache to the storage target. The **decode** node fetches the KV cache back — instead of recomputing
+it — and generates the answer. The **proxy** sends every request to prefill first, then to decode.
+
+The two vLLM nodes never talk to each other. All KV movement goes through the target. That is the
+whole point: it makes the storage tier the thing being measured.
+
+## Before you start
+
+| You need | How to check |
+|---|---|
+| Three hosts that can reach each other over TCP | `ping` between them; target port 4420 must be open |
+| An AMD GPU on both vLLM hosts | `ls /dev/kfd` returns a path |
+| `rocm-aic:latest` with both plugins on both vLLM hosts | Step 2 below |
+| Model weights cached on **both** vLLM hosts | `du -sh "$HF_HOME"/hub/models--*` |
+| Docker, plus root or passwordless `sudo` | `sudo -n true` |
+
+Put the three addresses in shell variables so the rest of this page pastes verbatim:
+
+```bash
+PREFILL=10.0.0.1      # computes prompts, writes KV
+DECODE=10.0.0.2       # generates tokens, reads KV
+TARGET=10.0.0.3       # runs the SPDK NVMe-KV store
+```
+
+A note on where models live: `deploy.sh` defaults `HF_HOME` to `~/.cache/huggingface`. On a cluster
+with an NFS home directory that is usually the wrong place — it is small and slow. Point `HF_HOME`
+at local disk (e.g. `/var/tmp/hf`) and make sure the weights are there on **both** vLLM hosts.
+Prefill and decode must serve byte-identical weights, or the KV cache one writes is meaningless to
+the other.
+
+## Step 1 — Free the GPUs
+
+Skip this if your hosts are idle. Otherwise, check what is running and how much GPU memory is
+already taken:
+
+```bash
+ssh $PREFILL 'docker ps; rocm-smi --showmemuse | grep VRAM%'
+ssh $DECODE  'docker ps; rocm-smi --showmemuse | grep VRAM%'
+```
+
+**Expect:** every GPU you intend to use reading `0`.
+
+Before stopping anyone else's container, save enough state to rebuild it, then stop it:
+
+```bash
+ssh $PREFILL 'mkdir -p ~/recovery && for c in $(docker ps --format "{{.Names}}"); do
+                 docker inspect "$c" > ~/recovery/"$c".json; done'
+ssh $PREFILL 'docker stop -t 60 <container> ...'
+```
+
+> **Check for a mapped NVMe device first.** A container with a real NVMe-KV device passed into it
+> must be treated as radioactive — see the safety box at the top of this file. Check before you
+> stop anything:
+>
+> ```bash
+> docker inspect -f '{{json .HostConfig.Devices}}' <container> | grep -o '/dev/ng[0-9a-z]*'
+> ```
+>
+> Empty output means no device is mapped and the container is safe to stop.
+
+## Step 2 — Confirm the image has both plugins
+
+On **both** vLLM hosts:
+
+```bash
+docker run --rm --entrypoint ls rocm-aic:latest \
+  /opt/nixl/lib/x86_64-linux-gnu/plugins/ | grep -E 'SPDK_NVMe_KV|XNVME_KV'
+```
+
+**Expect:** two lines — `libplugin_SPDK_NVMe_KV.so` and `libplugin_XNVME_KV.so`.
+
+**If it prints nothing:** the image was built without the plugins. Build it with
+`ROCM_ARCH=gfx942 bash build.sh` (`gfx942` = MI300X, `gfx90a` = MI210). That takes 60–90 minutes,
+so start it now and come back.
+
+## Step 3 — Vendor the rocm-aic checkout
+
+`deploy.sh` refuses to run without a vendored checkout next to it, even in in-process mode. This
+step only clones and patches — it does **not** rebuild the image:
+
+```bash
+ROCM_ARCH=gfx942 SKIP_BUILD=1 bash build.sh    # gfx942 = MI300X; gfx90a = MI210
+```
+
+**Expect:** four stages, ending in
+`SKIP_BUILD=1 — vendored, patched and staged. Not building.`
+
+`ROCM_ARCH` is required **even with `SKIP_BUILD=1`**, though nothing is compiled — `build.sh`
+validates it before it decides whether to build.
+
+If your home directory is shared across the cluster (NFS), do this **once** and every node sees it.
+Otherwise repeat it on both vLLM hosts.
+
+## Step 4 — Start the storage target
+
+On the target host:
+
+```bash
+SPDK_SRC=/root/spdk-clean LISTEN_ADDR=$TARGET HUGE_PAGES=256 bash target.sh
+```
+
+**Expect:**
+
+```bash
+ss -lntp | grep 4420        # LISTEN ... <TARGET>:4420
+```
+
+**`LISTEN_ADDR` must be the routable IP.** The default is `127.0.0.1`, and a target bound to
+loopback is invisible to the other two nodes — the deploy will fail later with a connection error
+that looks like a plugin bug.
+
+> `ps -C nvmf_tgt` finds nothing even when the target is perfectly healthy — SPDK renames the
+> process to `reactor_0`. Use `pgrep -af nvmf_tgt` instead. This has fooled people into declaring a
+> working target dead.
+
+## Step 5 — Deploy the prefill node
+
+```bash
+ssh $PREFILL
+cd ~/rocm-aic
+
+sudo HF_HOME=/var/tmp/hf HF_TOKEN=none \
+  MODE=inprocess PD_ROLE=producer \
+  MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0 MAX_MODEL_LEN=2048 \
+  TENSOR_PARALLEL_SIZE=1 GPU=0 \
+  AIC_SPDK_KV_SLOT_OFFSET=0 \
+  AIC_SPDK_KV_TRID="trtype:TCP adrfam:IPv4 traddr:$TARGET trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0" \
+  bash deploy.sh
+```
+
+**Expect:** a `deploy: rocm-aic inprocess / SPDK_NVMe_KV` banner, then a health check that passes
+within about two minutes. The container is named `aic-spdk-producer`.
+
+Three arguments people get wrong:
+
+- **`MAX_MODEL_LEN=2048`** — required for TinyLlama. The default is 32768, which exceeds
+  TinyLlama's `max_position_embeddings`, and vLLM refuses to start. Do **not** reach for
+  `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`: it silences the check instead of fixing it, and TinyLlama uses
+  RoPE, so positions past 2048 produce `nan` — a server that runs and is quietly wrong.
+- **`HF_TOKEN`** — always required. `HF_TOKEN=none` is the explicit way to say "public model,
+  already cached", so that fact is recorded rather than smuggled in as a fake token.
+- **`AIC_SPDK_KV_SLOT_OFFSET`** — see the next step.
+
+## Step 6 — Deploy the decode node
+
+Same command, three things changed: the role, the slot offset, and the host.
+
+```bash
+ssh $DECODE
+cd ~/rocm-aic
+
+sudo HF_HOME=/var/tmp/hf HF_TOKEN=none \
+  MODE=inprocess PD_ROLE=receiver \
+  MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0 MAX_MODEL_LEN=2048 \
+  TENSOR_PARALLEL_SIZE=1 GPU=0 \
+  AIC_SPDK_KV_SLOT_OFFSET=2000000 \
+  AIC_SPDK_KV_TRID="trtype:TCP adrfam:IPv4 traddr:$TARGET trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0" \
+  bash deploy.sh
+```
+
+> **`AIC_SPDK_KV_SLOT_OFFSET` must differ between the two roles.** Both instances share one
+> namespace on one target. Identical offsets mean they write to the same keys, silently corrupting
+> each other's cache — no error, just wrong answers. Producer `0` / receiver `2000000` matches the
+> default pool size of 2,000,000, so the two key ranges sit end to end without overlapping.
+
+Both roles must also use the same `MODEL` and the same `TENSOR_PARALLEL_SIZE`. The KV chunk layout
+depends on the TP degree, so a mismatch makes the stored cache unreadable to the other side.
+
+## Step 7 — Front the pair with the proxy
+
+Run this anywhere that can reach both vLLM nodes:
+
+```bash
+OPENAI_API_KEY=dummy python3 proxy.py \
+  --host 0.0.0.0 --port 9000 \
+  --prefiller-host $PREFILL --prefiller-port 8301 \
+  --decoder-host   $DECODE  --decoder-port  8301
+```
+
+`OPENAI_API_KEY` must be set to *something* — it is forwarded as a Bearer token to both upstreams.
+
+**Expect:** a real answer from the pair:
+
+```bash
+curl -s http://127.0.0.1:9000/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","prompt":"The capital of France is","max_tokens":16}'
+```
+
+> ### ⚠️ P/D cache reuse does not work with `SPDK_NVMe_KV` — verified 2026-09-07
+>
+> Everything below will run. The prefill node **stores** correctly, the decode node serves correct
+> answers, and `completed_nvme_io` moves. But the decode node will **never get a cache hit**:
+>
+> ```
+> LMCache INFO: Total tokens 1262, Inference Engine computed tokens: 0,
+>               LMCache hit tokens: 0, need to load: 0
+> ```
+>
+> The cause is in the key derivation, not in any setting you can change. LMCache's NIXL storage
+> backend names each object with a **per-process random suffix**
+> (`nixl_storage_backend.py`: `key = f"obj_{i}_{uuid.uuid4().hex[0:4]}"`), bound at
+> `registerMem()` time. `make_key()` hashes that name. Two processes therefore derive *different*
+> keys for the same logical slot, so the receiver cannot address anything the producer wrote.
+> `plugins/nvme-kv/spdk_nvme_kv_backend.h` says so outright: the metaInfo path
+> *"cannot support restart survival or cross-process sharing."*
+>
+> **`AIC_SPDK_KV_SLOT_OFFSET` is not the lever.** It is documented below as the thing that keeps the
+> two roles apart, but it is *superseded* on this path — `make_key()` derives from metaInfo and
+> ignores `devId` entirely when metaInfo is set, which LMCache OBJ mode always does. Setting both
+> roles to the same offset does not produce hits either; the `uuid4` still differs.
+>
+> So this topology currently measures **P/D routing overhead with a working STORE and a
+> never-hitting RETRIEVE**, not KV reuse. Making it real requires a content-derived key (e.g. from
+> LMCache's chunk hash) instead of a per-process UUID — a plugin change, not a config change.
+>
+> Single-node (`MODE=inprocess`, no `PD_ROLE`) is unaffected: one process, one UUID, so store and
+> retrieve agree and cache hits are real.
+
+## Step 8 — Prove the KV cache actually moved
+
+**Do not skip this.** An HTTP 200 proves nothing about the storage tier. This stack's signature
+failure is a silent zero-byte store that reports success — you get valid-looking answers, correct
+text, and no KV traffic whatsoever.
+
+On the **target** host, before and after a request:
+
+```bash
+python3 /root/spdk-clean/scripts/rpc.py nvmf_get_stats | grep completed_nvme_io
+```
+
+**Expect:** the number is strictly larger afterwards. If it did not move, no KV was stored,
+and any benchmark you run is measuring plain vLLM.
+
+> Use `nvmf_get_stats`, **not** `bdev_get_iostat`. The latter never moves for SPDK's KV command
+> set and will read as zero I/O even when everything is working correctly.
+
+Then confirm the decode side is really *reading* rather than quietly re-prefilling:
+
+```bash
+ssh $PREFILL 'docker logs aic-spdk-producer 2>&1 | grep -E "Created backend:|Stored"'
+ssh $DECODE  'docker logs aic-spdk-receiver 2>&1 | grep -E "Created backend:|Retrieved|need to load: [1-9]"'
+```
+
+If the decode side errors on a location name, set `LMCACHE_STORE_LOCATION` /
+`LMCACHE_RETRIEVE_LOCATIONS` to exactly what `Created backend:` printed, rather than guessing.
+
+Finally, the correctness check that gates every number: **the same prompt, twice, across a
+restart, must produce identical output.**
+
+## Step 9 — Benchmark
+
+Only now. Point any OpenAI-compatible load generator at the proxy on port 9000 — not at either
+vLLM node directly, or you bypass the disaggregation entirely.
+
+```bash
+PROFILE=throughput TRACK=rocm-aic-spdk BASE_URL=http://127.0.0.1:9000/v1 \
+MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0 bash bench/llama-benchy/run.sh
+```
+
+`deploy.sh` writes the server half of the provenance record, so the result's `.provenance.txt`
+should carry a populated `SERVER CONFIG:` line. It will read `degraded=unvalidated-first-run` until
+you clear `DEPLOY_DEGRADED=` on a deploy whose Step 8 genuinely passed. Leave it set until then.
+
+Deployment records are **not** in `/run/kv-cache-bench` when the deploy ran as non-root. Check all
+three locations before concluding one is missing — that mistake has been made twice:
+
+```bash
+ls /run/kv-cache-bench/ "${XDG_RUNTIME_DIR}/kv-cache-bench/" "/tmp/kv-cache-bench-$(id -u)/"
+```
+
+## When it goes wrong
+
+| Symptom | Cause |
+|---|---|
+| `ERR: <dir>/docker not found` | Step 3 not done on this host |
+| `ERR: HF_TOKEN not set` | Pass `HF_TOKEN=none` for a cached public model |
+| `ROCM_ARCH is required` from `build.sh` | Set it even with `SKIP_BUILD=1` — it is validated before the build decision |
+| `mkdir: cannot create directory ...: Permission denied` under `sudo` | NFS `root_squash`. See below |
+| `AssertionError: Invalid NIXL backend & device combination` | The image predates patch 0008. See below |
+| vLLM exits with a pydantic `ValidationError` on startup | `MAX_MODEL_LEN` exceeds the model's `max_position_embeddings` |
+| Connection refused reaching the target | `LISTEN_ADDR` was left at `127.0.0.1` in Step 4 |
+| Answers are fine, `completed_nvme_io` never moves | Silent zero-byte store — the failure this stack is known for |
+| Answers are subtly wrong across a restart | Both roles used the same `AIC_SPDK_KV_SLOT_OFFSET` |
+| `ps -C nvmf_tgt` shows nothing | Not a fault — the process is named `reactor_0` |
+
+### Do not run `deploy.sh` under `sudo` on an NFS home
+
+`sudo` is not the problem; NFS `root_squash` is. It maps root to `nobody`, so a `sudo`'d
+`deploy.sh` loses write access to its own directory and dies at:
+
+```
+mkdir: cannot create directory '<repo>/vendor/rocm-aic/pd-configs': Permission denied
+```
+
+Run it as your normal user. The only thing it needs root for is allocating hugepages, so do that
+once, up front:
+
+```bash
+sudo sh -c 'echo 512 > /proc/sys/vm/nr_hugepages'
+```
+
+`deploy.sh` skips the allocation when `nr_hugepages` is already ≥ 512.
+
+### `Invalid NIXL backend & device combination` — the image is missing patch 0008
+
+The symptom is nasty because **vLLM still serves and `/health` still returns 200**. Only LMCache's
+storage backend failed, so you get correct-looking answers with no KV tier at all:
+
+```
+AssertionError: Invalid NIXL backend & device combination
+LMCache ERROR: Failed during post_init
+```
+
+The image's `validate_nixl_backend()` accepts only `GDS`, `GDS_MT`, `OBJ`, `AIS_MT`. Patch 0008 is
+what adds `SPDK_NVMe_KV` and `XNVME_KV`. Check the image directly:
+
+```bash
+docker run --rm --entrypoint grep rocm-aic:latest -c SPDK_NVMe_KV \
+  /usr/local/lib/python3.12/dist-packages/lmcache/v1/storage_backend/nixl_storage_backend.py
+# 3 = patched, 0 = not patched
+```
+
+**The plugin `.so` files being present does NOT mean the LMCache patches are.** They are built by
+different parts of the Dockerfile, and an image can easily have one without the other. Always
+confirm both:
+
+```bash
+docker run --rm --entrypoint ls rocm-aic:latest /opt/nixl/lib/x86_64-linux-gnu/plugins/
+```
+
+### Both P/D nodes must run the *same* image
+
+Same tag is not the same image. Compare IDs, and the plugin the KV I/O actually goes through:
+
+```bash
+docker image inspect rocm-aic:latest --format '{{.Id}}'
+docker run --rm --entrypoint md5sum rocm-aic:latest \
+  /opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_SPDK_NVMe_KV.so
+```
+
+If they differ, build once and copy the image rather than building on each host:
+
+```bash
+docker save rocm-aic:latest | ssh <other-node> docker load
+```
+
+Two independently-built plugins sharing one KV namespace is not a configuration you can trust a
+benchmark from.
+
+---
+
 ## Step 1 — Build the image (~60–90 min)
 
 ```bash
-bash vendor.sh                       # clone ROCm/rocm-aic at the pinned SHA
 ROCM_ARCH=gfx90a bash build.sh       # gfx90a = MI210; gfx942 = MI300X
+                                     # build.sh vendors ROCm/rocm-aic at the pinned SHA itself
+ROCM_ARCH=gfx90a SKIP_BUILD=1 bash build.sh   # vendor + patch + stage only, no image build
+                                     # ROCM_ARCH is required even when not building
 ```
 
 `build.sh` vendors, applies `patches/`, stages the plugin sources into the build context, and runs
@@ -89,7 +473,7 @@ Run it wherever you like; the GPU host reaches it over TCP:4420.
 
 ```bash
 SPDK_SRC=/root/spdk-clean LISTEN_ADDR=<routable-ip> HUGE_PAGES=256 \
-  bash start-kv-target.sh
+  bash target.sh
 
 ss -lntp | grep 4420
 pgrep -af nvmf_tgt    # NB: `ps -C nvmf_tgt` finds nothing — the process comm is "reactor_0"
@@ -159,7 +543,7 @@ Read that before guessing flags. Note `MAX_MODEL_LEN=2048` for TinyLlama — com
 ### Front a P/D pair with the proxy
 
 ```bash
-OPENAI_API_KEY=dummy python3 disagg_proxy_server.py \
+OPENAI_API_KEY=dummy python3 proxy.py \
   --host 0.0.0.0 --port 9000 \
   --prefiller-host <prefill-ip> --prefiller-port 8301 \
   --decoder-host   <decode-ip>  --decoder-port  8301
@@ -209,7 +593,7 @@ PROFILE=throughput TRACK=rocm-aic-xnvme BASE_URL=http://127.0.0.1:8301/v1 \
 MODEL=<model> bash bench/llama-benchy/run.sh
 ```
 
-`deploy.sh` writes the server half of the provenance via `deployment.sh`, so the result's
+`deploy.sh` writes the server half of the provenance itself (the recorder is inlined), so the result's
 `.provenance.txt` should carry a populated `SERVER CONFIG:` line. It will show
 `degraded=unvalidated-first-run` until you clear `DEPLOY_DEGRADED=` on a correctness-checked deploy —
 leave it set until Step 4 genuinely passes.
@@ -225,23 +609,27 @@ ls /run/kv-cache-bench/ "${XDG_RUNTIME_DIR}/kv-cache-bench/" "/tmp/kv-cache-benc
 ## Layout
 
 ```
-README.md                     this file — procedure, then design and known issues
-deploy.sh                     all three modes, both backends
-build.sh  vendor.sh           vendor rocm-aic, patch, stage, make build
-start-kv-target.sh            the independent SPDK NVMe-KV target
-deployment.sh                 server-side provenance record; deploy.sh sources it
-disagg_proxy_server.py        prefill→decode router, verbatim from vLLM
-docker-compose.storage.yml    the two lmcache-* services + vllm overrides
-docker-compose.plugin-override.yml   run a locally-built .so over the image's
-patches/
-  dockerfile-0003-*.patch     git-apply'd to the vendored docker/Dockerfile
-  lmcache-15,16,17-*.patch    copied into the vendored tree, applied inside the build
-  spdk-host-1..4-*.diff       KV-command-set diffs, staged into the build
+README.md                     this file — walkthrough, procedure, design and known issues
+LICENSE
+deploy.sh                     all three modes, both backends. Inlines the provenance
+                              recorder and generates the compose overrides at run time
+build.sh                      vendor rocm-aic, patch, stage, make build
+                              (SKIP_BUILD=1 to vendor without building)
+target.sh                     the independent SPDK NVMe-KV target
+proxy.py                      prefill→decode router, verbatim from vLLM
+patches/                      one flat, git am-able series; destination encoded in the name
+  0001..0004-spdk-*.patch     KV-command-set diffs, staged into the build
+  0005-rocm-aic-*.patch       git-apply'd to the vendored docker/Dockerfile
+  0006..0008-lmcache-*.patch  copied into the vendored tree, applied inside the build
 plugins/
   nvme-kv/                    SPDK_NVMe_KV backend source
   xnvme-kv/                   XNVME_KV backend source
-vendor/rocm-aic/              created by vendor.sh; never committed
+vendor/rocm-aic/              created by build.sh; never committed
 ```
+
+`build.sh` **renames** the three `lmcache` patches to `15`/`16`/`17` when staging them. The
+Dockerfile applies `patches/lmcache/*` in *lexical* order alongside rocm-aic's own `01`–`14`, and
+`0006-` sorts before `01-` — which would silently reorder the series.
 
 `patches/` is flat, with the destination encoded as a filename prefix. `build.sh` **strips** the
 prefix when staging, so the vendored tree sees the filenames it expects — this matters for
@@ -334,7 +722,7 @@ ROCM_AIC_REF = bb386562ccce21c12b8b577c7abcead68bc4befd   (2026-08-14)
 Same-day pins baked into that commit's `docker/Dockerfile`: `ROCM_VERSION=7.14.0`
 (`rocm/dev-ubuntu-24.04:7.14.0-full`), `VLLM_REF=v0.26.0`, `NIXL_REF=v1.3.2`,
 `LMCACHE_REF=v0.5.3`, `HSA_SNOOP_REF=v1.0.0`. Same ROCm release our own `vllm-nixl:rocm` image
-already uses. Bump `ROCM_AIC_REF` deliberately (`vendor.sh`'s `ROCM_AIC_REF=` var), not casually —
+already uses. Bump `ROCM_AIC_REF` deliberately (`build.sh`'s `ROCM_AIC_REF=` var), not casually —
 every patch under `patches/` was hand-verified against this exact commit and may not apply cleanly
 against a newer one.
 
@@ -894,9 +1282,9 @@ Flattened to the repository root on this branch:
 DESIGN-AND-KNOWN-ISSUES.md   — this file
 README.md                    — the SPDK_NVMe_KV build-and-run procedure
 README-XNVME.md              — the XNVME_KV procedure (real device)
-vendor.sh                    — shallow-clone rocm-aic to the pinned commit (clone not committed)
-build.sh                     — vendor.sh, stage plugin source, apply patches, `make build`
-start-kv-target.sh           — RAM-backed SPDK NVMe-KV loopback target
+build.sh                     — clone rocm-aic to the pinned commit, stage plugins, patch, `make build`
+                               (SKIP_BUILD=1 vendors without building)
+target.sh                    — RAM-backed SPDK NVMe-KV loopback target
 patches/
   lmcache/
     15-add-spdk-xnvme-kv-l2-adapter-backends.patch   — the 4-list-edit LMCache patch (see above)
@@ -918,7 +1306,7 @@ deploy-xnvme.sh              — bring up rocm-aic-xnvme against the real DSC on
 
 ### Build/test order (de-risk cheapest first — do not skip ahead)
 
-1. `bash vendor.sh` — pin the commit, confirm the SHA.
+1. `SKIP_BUILD=1 bash build.sh` — pin the commit, confirm the SHA.
 2. `git apply --check` both patches against fresh checkouts before wiring them into the real build
    (LMCache v0.5.3 + rocm-aic's own 14 patches applied first, in order, for `15-*.patch`; a bare
    `docker/Dockerfile` for `0003-build-plugins.patch`) — this repo already got bitten once by a

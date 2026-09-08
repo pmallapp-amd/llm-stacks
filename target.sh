@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# start-kv-target.sh — launch spdk_tgt with a bdev_kvmalloc KV namespace.
+# target.sh — launch spdk_tgt with a bdev_kvmalloc KV namespace.
 # Uses the pre-built spdk_tgt from kv_spdk — no source changes.
 #
 # The bdev_kvmalloc device is an in-memory NVMe-KV store (no hardware needed).
@@ -32,17 +32,70 @@ SPDK_TGT="${SPDK_SRC}/build/bin/nvmf_tgt"
     exit 1
 }
 
-# max_io_size/io_unit_size: nvmf_tcp_create() rejects any max_io_size where
-# max_io_size/large_bufsize (iobuf default 132KB) exceeds SPDK_NVMF_MAX_SGL_ENTRIES
-# (16) — i.e. anything much above ~2MB fails outright ("Unsupported max_io_size
-# specified"). 1MB is comfortably under that cap and well above the largest
-# block size this repo's benchmarks actually exercise (<=32KB); it does NOT
-# limit bdev_kvmalloc's own max_value_size below, which governs the largest
-# single KV value the store will accept.
+# max_io_qpairs_per_ctrlr: NOTE the exact key. SPDK v26.05 reports this field
+# as "max_io_qpairs_per_ctrlr" and silently IGNORES the older spelling
+# "max_qpairs_per_ctrlr" — no error, the RPC succeeds, and the default 127
+# stays in force. Always confirm with:
+#     rpc.py nvmf_get_transports | grep max_io_qpairs_per_ctrlr
+#
+# SPDK's default is 127 io qpairs, and ONE SPDK_NVMe_KV plugin
+# instance opens all 128 on its single controller. That is fine for a
+# single-node deploy, but it makes P+D IMPOSSIBLE against a shared target:
+# whichever role connects first takes the entire budget, and the second one's
+# I/O queue is refused. The observable symptom is NOT an out-of-resources
+# message — it is
+#     nvme_qpair.c: *ERROR*: [...,qid:1,...,DISCONNECTED] CQ transport error -6
+#     nixl_agent.cpp: getXferStatus: backend 'SPDK_NVMe_KV' NIXL_ERR_BACKEND
+# on the client, while LMCache still logs "Stored N out of N tokens" and the
+# HTTP request returns 200. Zero bytes reach the device. Confirmed 2026-09-07
+# with nvmf_subsystem_get_controllers reporting a single controller holding
+# num_io_qpairs=128. 512 leaves room for both P/D roles plus headroom.
+#
+# max_io_size/io_unit_size/large_bufsize: these three are coupled.
+# nvmf_tcp_create() rejects any max_io_size where max_io_size/large_bufsize
+# exceeds SPDK_NVMF_MAX_SGL_ENTRIES (16). With iobuf's DEFAULT large_bufsize of
+# 132KB that caps max_io_size at ~2MB — which is why large_bufsize is raised to
+# 1MB in the iobuf block above, lifting the ceiling to 16 x 1MB = 16MB.
+#
+# 1MB was the previous value here, chosen on the assumption that the largest
+# block these benchmarks exercise is <=32KB. THAT ASSUMPTION IS WRONG for the
+# in-process LMCache path, which stores one NIXL object per KV *chunk*, not per
+# block. TinyLlama at chunk_size=256 sends
+#     22 layers x 2 x 256 tokens x 4 kv-heads x 64 head-dim x 2 bytes = 5.5MB
+# in a single write. The target rejected it with
+#     tcp.c:2713:nvmf_tcp_req_parse_sgl: *ERROR*:
+#         SGL length 0x580000 exceeds max io size 0x100000
+# then let the qpair sit until the 30s no-pdu timeout fired and dropped it. The
+# CLIENT sees only "CQ transport error -6" + NIXL_ERR_BACKEND, while LMCache
+# logs a successful "Stored N out of N tokens" — the silent zero-byte store this
+# README warns about. Diagnosed 2026-09-07; the target-side log is the only
+# place the real reason appears.
+#
+# SCALING WARNING: this value must exceed one chunk for YOUR model. It grows
+# with layers x kv-heads x head-dim, so a large model can blow past even 16MB
+# (Qwen2.5-72B at chunk_size=256 needs ~80MB) and would also exceed
+# bdev_kvmalloc's max_value_size below. Recompute both before changing model.
+#
+# max_io_size does NOT limit bdev_kvmalloc's own max_value_size, which
+# separately governs the largest single KV value the store will accept.
 SPDK_CONFIG_JSON=$(mktemp /tmp/spdk-kv-config.XXXXXX.json)
 cat > "${SPDK_CONFIG_JSON}" <<EOF
 {
   "subsystems": [
+    {
+      "subsystem": "iobuf",
+      "config": [
+        {
+          "method": "iobuf_set_options",
+          "params": {
+            "small_pool_count": 16384,
+            "large_pool_count": 1024,
+            "small_bufsize": 8192,
+            "large_bufsize": 1048576
+          }
+        }
+      ]
+    },
     {
       "subsystem": "bdev",
       "config": [
@@ -61,7 +114,8 @@ cat > "${SPDK_CONFIG_JSON}" <<EOF
       "config": [
         {
           "method": "nvmf_create_transport",
-          "params": { "trtype": "TCP", "max_io_size": 1048576, "io_unit_size": 1048576 }
+          "params": { "trtype": "TCP", "max_io_size": 16777216, "io_unit_size": 1048576,
+                      "max_io_qpairs_per_ctrlr": 512 }
         },
         {
           "method": "nvmf_create_subsystem",
@@ -117,5 +171,5 @@ LD_LIBRARY_PATH="${SPDK_SRC}/dpdk/build/lib:${LD_LIBRARY_PATH:-}" \
     "${SPDK_TGT}" \
     --json "${SPDK_CONFIG_JSON}" \
     --no-huge \
-    -s 1024 \
+    -s 4096 \
     -m 0x1

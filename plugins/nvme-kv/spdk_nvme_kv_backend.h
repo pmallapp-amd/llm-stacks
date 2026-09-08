@@ -230,6 +230,24 @@ public:
     nixl_status_t checkXfer(nixlBackendReqH *handle) const override;
     nixl_status_t releaseReqH(nixlBackendReqH *handle) const override;
 
+    // Existence probe for a batch of descriptors, via the NVMe KV Exist command.
+    //
+    // WHY THIS EXISTS: without it the base class returns NIXL_ERR_NOT_SUPPORTED,
+    // and LMCache's NixlDynamicStorageBackend — the ONLY LMCache storage backend
+    // whose keys are content-derived rather than carrying a per-process uuid4,
+    // and therefore the only one that can share a KV namespace across processes —
+    // logs "NIXL batched query failed: NIXL_ERR_NOT_SUPPORTED" and reports every
+    // lookup as a miss. That is what made P+D disaggregation impossible: the
+    // prefill node stored correctly, the decode node never issued a read.
+    // Observed 2026-09-07 as "LMCache hit tokens: 0" on every decode request.
+    //
+    // resp[i] is engaged (has_value()) when the key exists, std::nullopt when the
+    // device reports KV_KEY_DOES_NOT_EXIST. A per-descriptor transport failure is
+    // reported as nullopt as well — a false miss costs a recompute, whereas a
+    // false hit would hand LMCache a KV block that was never written.
+    nixl_status_t queryMem(const nixl_reg_dlist_t     &descs,
+                           std::vector<nixl_query_resp_t> &resp) const override;
+
     // SPDK NVMe state (TCP or PCIe mode).
     // One qpair per reactor thread — see NIXL_KV_NUM_QPAIRS. Each qpair is only
     // ever submitted-to/polled-by its own reactor thread (spdk_thrs_[i]); no
@@ -271,6 +289,15 @@ private:
     // Added to devId before make_key() hashes it into the on-wire key — see
     // getParams()'s "kv_slot_offset" doc comment in spdk_nvme_kv_plugin.cpp.
     uint64_t               slot_offset_ = 0;
+
+    // How long queryMem() waits for a batch of KV Exist probes before giving up
+    // and calling the stragglers misses. This sits directly in front of vLLM's
+    // scheduler on the decode path, so it must be bounded: an unanswered probe
+    // has to cost one recomputed chunk, never a stalled request. Deliberately
+    // well under LMCache's own lookup_timeout_ms (3000) so that this layer, not
+    // the Python one, is what gives up first and attributes the timeout
+    // correctly. Override with NIXL_KV_QUERY_TIMEOUT_MS.
+    uint64_t               query_timeout_ns_ = 2000ULL * 1000000ULL;
 
     // ---- -ENOMEM backpressure (see do_kv_io_async / drain_retry_queue) -----
     //

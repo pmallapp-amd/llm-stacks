@@ -69,7 +69,8 @@ endif
 shared_library('plugin_XNVME_KV',
     'xnvme_kv_backend.cpp',
     'xnvme_kv_plugin.cpp',
-    include_directories: [include_directories('src')],
+    # '.' not 'src': sources and headers sit flat beside this meson.build.
+    include_directories: [include_directories('.')],
     dependencies: [nixl_dep, xnvme_dep, thread_dep] + extra_deps,
     cpp_args: ['-fPIC', '-Wno-unused-function'] + extra_cpp_args,
     # absl symbols resolved at runtime from libnixl.so

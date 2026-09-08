@@ -29,6 +29,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>   // queryMem's per-probe work items
+#include <thread>   // queryMem's bounded wait
 
 // Populated by query_max_value_size() at construction; read by the plugin's
 // getParams(). See the declaration in the header for why this is static and
@@ -526,6 +528,15 @@ nixlSpdkKvEngine::nixlSpdkKvEngine(const nixlBackendInitParams *init_params)
                     static_cast<unsigned long>(slot_offset_));
         } else if (getInitParam("kv_slot_offset", offset_param) == NIXL_SUCCESS) {
             slot_offset_ = std::strtoull(offset_param.c_str(), nullptr, 10);
+        }
+    }
+
+    // queryMem()'s bounded wait — see query_timeout_ns_ in the header.
+    {
+        const char *qt_env = std::getenv("NIXL_KV_QUERY_TIMEOUT_MS");
+        if (qt_env && qt_env[0] != '\0') {
+            const unsigned long long ms = std::strtoull(qt_env, nullptr, 10);
+            if (ms > 0) query_timeout_ns_ = ms * 1000000ULL;
         }
     }
 
@@ -1042,4 +1053,151 @@ nixl_status_t nixlSpdkKvEngine::checkXfer(nixlBackendReqH *handle) const {
 nixl_status_t nixlSpdkKvEngine::releaseReqH(nixlBackendReqH *handle) const {
     delete handle;
     return NIXL_SUCCESS;
+}
+
+// ---- queryMem (NVMe KV Exist) -----------------------------------------------
+//
+// See the declaration in the header for why this method has to exist at all.
+//
+// THREADING. queryMem() is called on the caller's thread (LMCache's lookup
+// path), but a qpair may only ever be touched by the reactor thread that polls
+// it — the invariant the whole async path is built on. So this does NOT submit
+// directly. It hands one work item per descriptor to reactor 0 via
+// spdk_thread_send_msg(), exactly like postXfer(), and waits on an atomic per
+// item. Allocating a private qpair for queries instead would work, but it would
+// put a second submitter on the controller for no benefit: KV Exist is a
+// metadata-only command and the reactor drains it on its normal poll.
+
+namespace {
+
+// One in-flight KV Exist. state_ is the only cross-thread channel: written by
+// the reactor/completion thread, read by the caller thread in the wait loop.
+struct SpdkKvQueryEx {
+    enum : int { PENDING = 0, EXISTS = 1, MISSING = 2, FAILED = 3 };
+
+    struct spdk_nvme_ns     *ns    = nullptr;
+    struct spdk_nvme_qpair  *qpair = nullptr;
+    uint8_t                  key[SPDK_NVME_KV_KEY_MAX_LEN] = {};
+    uint8_t                  key_len = 0;
+    std::atomic<int>         state{PENDING};
+};
+
+// Completion. A missing key is NOT an error: bdev_kvmalloc's exist handler
+// answers SCT_GENERIC / SC_KV_KEY_DOES_NOT_EXIST for a key it has never seen
+// (patches/0002-spdk-bdev-kvmalloc.patch, kvmalloc_handle_exist), which is the
+// ordinary cache-miss answer and must be reported as such rather than as a
+// backend failure — otherwise a cold cache looks like a broken device.
+void kv_exist_cb(void *cb_arg, const struct spdk_nvme_cpl *cpl) {
+    auto *q = static_cast<SpdkKvQueryEx *>(cb_arg);
+    if (!spdk_nvme_cpl_is_error(cpl)) {
+        q->state.store(SpdkKvQueryEx::EXISTS, std::memory_order_release);
+        return;
+    }
+    if (cpl->status.sct == SPDK_NVME_SCT_GENERIC &&
+        cpl->status.sc  == SPDK_NVME_SC_KV_KEY_DOES_NOT_EXIST) {
+        q->state.store(SpdkKvQueryEx::MISSING, std::memory_order_release);
+        return;
+    }
+    q->state.store(SpdkKvQueryEx::FAILED, std::memory_order_release);
+}
+
+// Runs ON the reactor thread that owns q->qpair.
+//
+// -ENOMEM here means "submission queue momentarily full", the same benign
+// backpressure the write path handles with a retry queue. Draining completions
+// in-line is safe because we are already on the polling thread, and a bounded
+// loop is enough: unlike a KV store batch, a lookup batch is small and the
+// queue frees quickly. Bounding it matters — an unbounded spin would wedge the
+// reactor and stall every in-flight transfer, not just this query.
+void do_kv_exist_async(void *arg) {
+    auto *q = static_cast<SpdkKvQueryEx *>(arg);
+    for (int attempt = 0; attempt < 4096; ++attempt) {
+        int rc = spdk_nvme_kv_exist(q->ns, q->qpair, q->key, q->key_len,
+                                    kv_exist_cb, q);
+        if (rc == 0) return;                    // completion cb owns it now
+        if (!kv_rc_is_retryable(rc)) break;
+        spdk_nvme_qpair_process_completions(q->qpair, 0);
+    }
+    q->state.store(SpdkKvQueryEx::FAILED, std::memory_order_release);
+}
+
+} // namespace
+
+nixl_status_t nixlSpdkKvEngine::queryMem(const nixl_reg_dlist_t         &descs,
+                                         std::vector<nixl_query_resp_t> &resp) const {
+    const int n = descs.descCount();
+    // Default every slot to "absent". Any path that fails below therefore
+    // degrades to a miss (recompute), never to a fabricated hit.
+    resp.assign(static_cast<size_t>(n), std::nullopt);
+    if (n == 0) return NIXL_SUCCESS;
+
+    // In-process mode has no device and no KV command set — kvbuf_ is a plain
+    // mmap'd slot array with no notion of which slots were ever written. Answer
+    // NOT_SUPPORTED rather than guessing; LMCache then keeps its own index.
+    if (inprocess_mode_) return NIXL_ERR_NOT_SUPPORTED;
+
+    if (!kv_ns_ || qpairs_.empty() || !qpairs_[0] ||
+        spdk_thrs_.empty() || !spdk_thrs_[0]) {
+        return NIXL_ERR_BACKEND;
+    }
+
+    std::vector<std::unique_ptr<SpdkKvQueryEx>> work;
+    work.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const nixlBlobDesc &d = descs[i];
+        auto q   = std::make_unique<SpdkKvQueryEx>();
+        q->ns    = kv_ns_;
+        q->qpair = qpairs_[0];
+        // Identical derivation to the store/retrieve path — a query that hashed
+        // differently from the write would be worse than no query at all.
+        make_key(d.devId + slot_offset_, d.addr, d.metaInfo,
+                 q->key, &q->key_len);
+        work.push_back(std::move(q));
+    }
+
+    for (auto &q : work) {
+        if (spdk_thread_send_msg(spdk_thrs_[0], do_kv_exist_async, q.get()) != 0) {
+            // Ring full. Fail just this descriptor; see postXfer's note on why
+            // an unchecked send_msg is a hang rather than an error.
+            q->state.store(SpdkKvQueryEx::FAILED, std::memory_order_release);
+        }
+    }
+
+    // Bounded wait. A lookup must never be able to hang the serving path, so a
+    // stuck probe times out into a miss and vLLM recomputes the chunk.
+    const uint64_t deadline_ns = kv_now_ns() + query_timeout_ns_;
+    size_t settled = 0;
+    while (settled < work.size()) {
+        settled = 0;
+        for (auto &q : work) {
+            if (q->state.load(std::memory_order_acquire) != SpdkKvQueryEx::PENDING)
+                ++settled;
+        }
+        if (settled == work.size()) break;
+        if (kv_now_ns() > deadline_ns) {
+            fprintf(stderr,
+                    "[SPDK_NVMe_KV] queryMem: %zu/%zu probes unanswered after "
+                    "%llu ms — reporting them as misses\n",
+                    work.size() - settled, work.size(),
+                    static_cast<unsigned long long>(query_timeout_ns_ / 1000000ULL));
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    bool any_failed = false;
+    for (int i = 0; i < n; ++i) {
+        const int st = work[static_cast<size_t>(i)]->state.load(std::memory_order_acquire);
+        if (st == SpdkKvQueryEx::EXISTS) {
+            resp[static_cast<size_t>(i)] = nixl_b_params_t{};
+        } else if (st == SpdkKvQueryEx::FAILED) {
+            any_failed = true;
+        }
+        // MISSING and PENDING(timed out) both stay std::nullopt.
+    }
+
+    // A transport failure is reported so the caller can distinguish "the device
+    // says no" from "the device did not answer"; the resp vector is still valid
+    // and conservative either way.
+    return any_failed ? NIXL_ERR_BACKEND : NIXL_SUCCESS;
 }

@@ -73,10 +73,10 @@
 # prerequisite, safe to re-run against an already-healthy endpoint.
 #
 # Prerequisites:
-#   1. bash vendor.sh              clone rocm-aic to the pinned commit
+#   1. SKIP_BUILD=1 bash build.sh   clone rocm-aic to the pinned commit, patch, stage
 #   2. ROCM_ARCH=<arch> bash build.sh   apply patches/, `make build` the image
 #   3. BACKEND=spdk : a target reachable at AIC_SPDK_KV_TRID — start one with
-#                     LISTEN_ADDR=<routable-ip> bash start-kv-target.sh
+#                     LISTEN_ADDR=<routable-ip> bash target.sh
 #      BACKEND=xnvme: the device bound to the KERNEL nvme driver (not vfio-pci),
 #                     so AIC_XNVME_DEV exists. Re-check after every reboot.
 #
@@ -649,7 +649,7 @@ fi
 # ── Shared preflight ─────────────────────────────────────────────────────────
 [ -e /dev/kfd ] || { echo "ERR: /dev/kfd absent — run: modprobe amdgpu"; exit 1; }
 [ -d "${ROCM_AIC_DIR}/docker" ] || {
-    echo "ERR: ${ROCM_AIC_DIR}/docker not found — run: bash vendor.sh"; exit 1; }
+    echo "ERR: ${ROCM_AIC_DIR}/docker not found — run: SKIP_BUILD=1 bash build.sh"; exit 1; }
 [ -n "${HF_TOKEN:-}" ] || {
     echo "ERR: HF_TOKEN not set (HuggingFace access token required)."
     echo "     If the model is public and already cached on this host, pass"
@@ -742,8 +742,8 @@ write_compose_overrides() {
 #
 # ── HOW TO COMPOSE THIS FILE ─────────────────────────────────────────────────────
 # This file lives in THIS repo (the repository root), not inside the vendored
-# rocm-aic checkout (vendor.sh clones that to vendor/rocm-aic/,
-# not committed here — see vendor.sh's header). rocm-aic's own docker-compose.yml
+# rocm-aic checkout (build.sh clones that to vendor/rocm-aic/,
+# not committed here — see build.sh's header). rocm-aic's own docker-compose.yml
 # resolves relative build contexts and volume paths (`context: ..`, `../logs/...`,
 # `../monitoring/...`) relative to ITS OWN docker/ directory, so both files must be
 # composed with docker/ as the working directory, base file first:

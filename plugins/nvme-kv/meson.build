@@ -144,7 +144,10 @@ endif
 shared_library('plugin_SPDK_NVMe_KV',
     'spdk_nvme_kv_backend.cpp',
     'spdk_nvme_kv_plugin.cpp',
-    include_directories: [include_directories('src'), spdk_inc],
+    # '.' not 'src': the sources sit flat beside this meson.build, so the
+    # headers they include do too. A stale include_directories('src') is a
+    # hard meson error ("Include dir src does not exist"), not a warning.
+    include_directories: [include_directories('.'), spdk_inc],
     dependencies: [nixl_dep, spdk_dep, thread_dep, uring_dep, aio_dep, numa_dep] + extra_deps,
     cpp_args: ['-fPIC', '-Wno-unused-function'] + extra_cpp_args,
     # absl symbols resolved at runtime from libnixl.so

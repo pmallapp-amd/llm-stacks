@@ -95,7 +95,14 @@ cp -r "${PLUGINS_DIR}/xnvme-kv" "${PLUGIN_DEST}/xnvme-kv-plugin"
 d=0
 for patch in "${PATCHES_DIR}"/*-spdk-*.patch; do
     [ -e "${patch}" ] || continue
-    cp "${patch}" "${PLUGIN_DEST}/spdk-host-patches/$(basename "${patch}")"
+    # Stage with a .diff extension: the Dockerfile stage added by
+    # patches/0005-rocm-aic-dockerfile-build-plugins.patch globs
+    # /tmp/kv-plugins/spdk-host-patches/*.diff and hard-fails with
+    # "no patches found" if the glob comes back empty. Copying these through
+    # as *.patch silently produced that failure at build stage 27/33, after
+    # ~40 minutes of vLLM and NIXL compilation had already succeeded.
+    # git am reads the mailbox headers, not the extension, so renaming is safe.
+    cp "${patch}" "${PLUGIN_DEST}/spdk-host-patches/$(basename "${patch}" .patch).diff"
     d=$((d + 1))
 done
 [ "${d}" -eq 4 ] || { echo "ERR: expected 4 *-spdk-*.patch in ${PATCHES_DIR}, found ${d}" >&2; exit 1; }
