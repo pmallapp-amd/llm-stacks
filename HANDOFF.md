@@ -1,14 +1,19 @@
-# HANDOFF — 2026-09-08 (second pass)
+# HANDOFF — 2026-09-09 (third pass)
 
-The previous handoff's NEXT ACTION has been carried out. It answered the question it set out to
-answer, and the answer was "the hypothesis is wrong" — so the blocker has moved. This document
-replaces the earlier one; the measurement that produced it is reproducible from the instrumentation
-now in the tree.
+The second pass's NEXT ACTION has been carried out. `use_gpu_connector_v3: True` **does not fix
+the gather** — it is accepted, the V3 connector really is dispatched, and the destination is still
+2-plane. The root cause identified in the second pass stands unchanged; what has moved is that the
+cheap escape hatch is now closed and the fix must be a patch. The decode node's config mismatch has
+been repaired.
+
+The root-cause analysis below (second pass) is unchanged and still correct; the measurement that
+produced it is reproducible from the instrumentation now in the tree.
 
 **Hostnames are placeholders here**, per this repo's convention. Real IPs, credentials and BMC
 addresses are in `lab/lab-inventory.local.md` (gitignored, never committed). Read that first.
 
-Branch `rocm-aic`, **not pushed**. The plugin instrumentation described below is **uncommitted**.
+Branch `rocm-aic`, **not pushed**. The plugin instrumentation described below is committed
+(`784ad64`), as is the `deploy.sh` co-resident fix (`610067d`) and the root cause (`bdd5511`).
 
 ---
 
@@ -35,33 +40,101 @@ taken against it does not measure the KV path.
 | LMCache page mapping (store↔read) | ✅ correct — page md5s identical byte-for-byte across processes |
 | **GPU → staging gather (store side)** | ❌ **root cause — 2-plane destination for a 1-plane fused cache** |
 | Static backend read path | ⚠️ **never exercised** — cannot hit across a restart by construction |
+| `use_gpu_connector_v3: True` as a fix | ❌ **tried, does not work** — V3 dispatches, shape stays 2-plane (init-order) |
+| Decode node config mismatch | ✅ **repaired** — file now describes the live process; nothing restarted |
+| Data already on the target | ❌ **poisoned** — every chunk ever stored is half-empty; a correct reader still returns garbage |
 | P+D disaggregation | ❌ still blocked, but on the defect above, not on anything in this repo |
+
+---
+
+## `use_gpu_connector_v3` — TRIED, DOES NOT WORK
+
+The one-line config escape hatch is closed. It was applied to `aic-spdk-single` on the prefill node,
+tested, and reverted; the instance is byte-identical to its pre-trial state.
+
+**It is not rejected and it is not inert — V3 is genuinely dispatched, and the shape is still
+2-plane.** The device gate is not the problem: `_DEVICE_SCOPED_VLLM_BOOL_FEATURES`
+(`v1/gpu_connector/__init__.py:17-20`) restricts the flag to `{"cuda", "xpu"}`, and ROCm reports
+`torch_device_type == "cuda"` (HIP 7.2), so it passes. A temporary probe on the dispatch branch
+confirmed `VLLMPagedMemGPUConnectorV3` by name.
+
+The reason it cannot work is an **initialisation-order** one, and it is the part the previous
+handoff got wrong. `LMCacheMetadata.get_shapes()` does read `group.shape_desc.kv_size` — but only
+once `kv_layer_groups_manager` exists, and that is populated **lazily**, inside V3's
+`_initialize_kv_cache_pointers()` (`gpu_connectors.py:477-482`), which is reached only from
+`to_gpu`/`from_gpu` (`:545`, `:579`). Both consumers that actually decide the layout are bound
+*before* any of that, so both take the `None` fallback to `metadata.kv_shape` — the hardcoded 2
+from `integration/vllm/utils.py:278`:
+
+```
+Paged tensor memory allocator initialized, shapes: [torch.Size([2, 22, 256, 256])],
+    dtypes: [torch.bfloat16], align bytes: 5767168   (paged_tensor_memory_allocator.py:108)
+Initialized nixl object backend metadata: shape: torch.Size([2, 22, 256, 256]),
+    dtype: torch.bfloat16, fmt: MemoryFormat.KV_2LTD  (nixl_storage_backend.py:1552)
+```
+
+Both lines are from the **v3 run**. The `PagedTensorMemoryAllocator` is fixed-shape (`align_bytes`
+is the whole 5,767,168 B chunk), and the dynamic backend's read layout is frozen at init, so even a
+later-correct `get_shapes()` could not retroactively change either.
+
+`VLLMPagedMemGPUConnectorV3.get_shape()` is `raise NotImplementedError` (`:640-641`). That never
+fires here only because the sole caller is `store_layer` (`cache_engine.py:683`), which is the
+`use_layerwise` path. Anyone enabling `use_layerwise` **and** v3 will hit it immediately.
+
+### The measurement
+
+A needle-in-haystack prompt makes this objective rather than a judgement call — `aic_prompt.txt`
+ends by asking for a code word, so a correct read has exactly one right answer.
+
+| pass | tokens | accounting | answer |
+|---|---|---|---|
+| cold, no cache (control) | 1086 | `computed 0, hit 0, load 0` | ✅ `charlie golf` |
+| cold, needle changed (control) | 1088 | `computed 0, hit 0, load 0` | ✅ `victor tango` |
+| **after restart, from storage** | 1088 | `computed 0, hit 1024, **load 1024**` | ❌ `29.\n\n209.comaparticular, and a/heydatabase.` |
+
+`need to load: 1024` is the important number — a genuine cross-process read, not a prefix-cache hit
+and not a cold recompute. The data came back from the target and it was wrong.
+
+**Two traps worth recording**, both of which cost time here:
+
+- Appending `\nAnswer:` is required. Without it TinyLlama emits EOS immediately
+  (`completion_tokens: 1`, empty string) and an empty answer looks like corruption but is not.
+- Changing the *tail* of the prompt only rekeys the final chunk — chunk keys are prefix-derived. To
+  force a genuinely cold store you must change the **beginning** of the prompt.
+
+Reproduce with `/var/tmp/v3final.txt` on the prefill node (md5 `854435096cd096ac81b7f27546b151ba`,
+needle `victor tango`) and `/var/tmp/v3req.json`.
 
 ---
 
 ## NEXT ACTION
 
-**Try `use_gpu_connector_v3: True` in the LMCache config.** It is a one-line change to the YAML,
-costs one container restart, and is the only in-tree code path that already reads the format spec's
-`kv_size` instead of assuming 2. If it produces a correct gather, P+D is unblocked without
-patching LMCache at all.
+**Patch the shape at its origin — `integration/vllm/utils.py:278` — and carry it in `patches/`.**
+There is no config-only route left.
 
-`LMCacheMetadata.get_shapes()` (`v1/metadata.py:87-105`) reads `group.shape_desc.kv_size`
-"rather than `self.use_mla`… so heterogeneous groups are handled" — which is exactly the bug below.
-But that branch is only live under `use_gpu_connector_v3`, whose default is `False`
-(`v1/config.py:580-584`). This deployment sets neither it nor `use_layerwise`, so it lands on the
-legacy V2 connector.
+```python
+kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)
+```
 
-Verify with the same protocol that found the bug: store a ≥800-word prompt, restart the container,
-re-send it, require `need to load` non-zero, and check the output is coherent. If v3 is not viable,
-the fix is a patch to `VLLMPagedMemGPUConnectorV2.get_shape()` and
-`integration/vllm/utils.py:278` — carried in `patches/` like the rest.
+This runs at engine init, before the KV tensors exist, so it cannot *detect* the fused layout — it
+has to be told. For vLLM 0.26 on this stack the correct value is `kv_size = 1` with per-token width
+`num_kv_head * 2 * head_size = 512`, which is what `NL_X_NB_BS_NH_CS_Spec.kv_size()` already returns
+once tensors exist. Patch `VLLMPagedMemGPUConnectorV2.get_shape()` (`gpu_connectors.py:416-418`) to
+match, so the allocator, the backend metadata and the gather all agree on one plane.
 
-**Do not rebuild the image to test this.** Patch the Python or the config in place:
+Do it under V2 and leave `use_gpu_connector_v3` at its default — v3 buys nothing here and adds the
+`store_layer` landmine above.
+
+Verify with the protocol in the table above: the post-restart read must return `victor tango` with
+`need to load` non-zero. The gather being correct is necessary but not sufficient — **every chunk
+currently on the target was written half-empty and must be treated as poisoned**; clear it or use
+fresh keys, or a correct reader will still return garbage from old data.
+
+**Do not rebuild the image to test this.** Patch the Python in place:
 
 ```bash
 docker cp <file> aic-spdk-single:/usr/local/lib/python3.12/dist-packages/lmcache/v1/...
-docker restart aic-spdk-single
+docker restart aic-spdk-single      # ~80s to ready
 ```
 
 Seconds, not the ~90 minutes a full image build costs.
@@ -184,12 +257,33 @@ Two independent failure modes, both hit when deploying a second in-process insta
    live instance — and it did so *before* the removal, so even a failed deploy left the running
    container pointing at someone else's config.
 
-Failure mode 2 already bit: the decode node's mounted `config.yaml` reads `nixl_pool_size: 0`,
+Failure mode 2 already bit: the decode node's mounted `config.yaml` read `nixl_pool_size: 0`,
 while the process actually running there loaded `2000000` and logged
-`Created backend: NixlStorageBackend (NixlStaticStorageBackend)`. **The file on disk does not
-describe the running container.** That instance is still live and still mismatched — read the
-container's own startup log, not the config file, and expect it to adopt the *other* config if it
-is ever restarted.
+`Created backend: NixlStorageBackend (NixlStaticStorageBackend)`. The file on disk did not
+describe the running container, so a restart would silently have swapped the decode node onto the
+dynamic backend.
+
+**This has now been repaired (2026-09-09).** `nixl_pool_size` on
+`<SETUP3_DECODE_NODE>:~/rocm-aic/vendor/rocm-aic/pd-configs/lmcache-single-spdk.yaml` is back to
+`2000000`; the previous file is saved as
+`/var/tmp/kvdiag/lmcache-single-spdk.yaml.mismatched.<timestamp>`. Nothing was restarted — the
+container is still the same 26-hour-old process, still the untouched reference instance. The
+repaired file was verified by parsing it with LMCache's own loader in that container and comparing
+every key against the live process's startup config:
+
+```
+nixl_pool_size = 2000000   dynamic_storage = False   => NixlStaticStorageBackend
+```
+
+which matches `dynamic_storage = pool_size == 0` (`nixl_storage_backend.py:208`) and the backend the
+live process actually built. `2000000` is also `AIC_KV_POOL`'s default (`deploy.sh:663`), so a plain
+redeploy now reproduces the running state rather than diverging from it.
+
+One artefact worth knowing, because it is the physical signature of this failure: inside the
+container `cat /etc/lmcache/config.yaml` returns **`Stale file handle`**. The overwriting deploy
+replaced the file's *inode* on NFS, and the bind mount still points at the deleted one. The running
+process is unaffected (it read its config at startup), and `docker restart` re-resolves the path —
+but it means you cannot read the live container's config through the mount. Read the startup log.
 
 The fix keys the container name, the config file and the log directory off a new `INSTANCE`
 (default `${PD_ROLE:-single}`, so no existing name changes), moves the removal to *before* the
@@ -211,9 +305,9 @@ All five verified against live container state under `set -euo pipefail`.
 
 | Node (placeholder) | Role | State |
 |---|---|---|
-| `<SETUP3_PREFILL_NODE>` | diagnosis host | `aic-spdk-single` :8303 (dynamic, GPU 0), `rocm-aic:kv-dbg2`. The static control `aic-spdk-static` :8304 was torn down once it had served its purpose; GPU 1 is free. |
-| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — **untouched throughout** |
-| `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted |
+| `<SETUP3_PREFILL_NODE>` | diagnosis host | `aic-spdk-single` :8303 (dynamic, GPU 0), `rocm-aic:kv-dbg2`. Restored to its exact pre-v3-trial state: config byte-identical, container Python pristine, `use_gpu_connector_v3` back to `False`. The static control `aic-spdk-static` :8304 stays torn down; GPU 1 is free. |
+| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — process still **untouched** (not restarted). Its on-disk config was repaired to match it, see above. |
+| `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds poisoned data** — every chunk stored by any backend so far is half-empty and mis-strided. |
 
 Target-reported limits, from the plugin's own startup line:
 `device KV format 0: value_max=67108864 key_max=16, ctrlr max_xfer=16777216 -> effective=16777216`
