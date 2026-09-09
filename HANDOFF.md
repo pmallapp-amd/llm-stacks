@@ -32,7 +32,7 @@ Branch `rocm-aic`, **not pushed**. The remote GPU-node tree is a plain copy kept
 | **P+D on a real model** | ✅ **Qwen2.5-72B-Instruct, TP=4**, 4/4 needles, `need to load: 1152` |
 | P+D under concurrency | ❌ never measured |
 | P+D latency/throughput | ❌ **no number has ever been taken through the proxy** |
-| `patches/0009` upstreamed | ❌ still carried out-of-tree |
+| `patches/0009` upstreamed | ❌ **don't** — superseded by LMCache PR #4467, see OPEN-2 |
 
 ### What is deployed
 
@@ -86,12 +86,47 @@ Neither figure is a result; they are recorded only so nobody mistakes the warm o
 rather than the ~1.2k used to prove correctness. Note that 16k tokens is ~5 GB of KV per request
 against a RAM-backed target — check the target's capacity before sending it.
 
-### OPEN-2 — Upstream `patches/0009` to LMCache *(high)*
+### OPEN-2 — Validate LMCache PR #4467 on our MI300X *(high)*
 
-This is an **upstream defect, not a rocm-aic one**, and it silently corrupts every KV chunk on this
-path for any vLLM 0.26 fused-cache deployment — not just ours. We carry a fix; upstream does not
-have one. `VLLMPagedMemGPUConnectorV3.get_shape()` (`raise NotImplementedError`) should probably be
-part of that conversation too.
+**Do not submit `patches/0009` upstream. It is superseded, and the bug was already known.** This
+item said the opposite; that was wrong, and checking took ten minutes that were not spent.
+
+- **Issue [#4463]** — "Silent KV cache corruption on vLLM 0.26 fused/packed KV layout", filed
+  **2026-08-08** by `shadowpa0327`, a month before we rediscovered it. Open.
+- **PR [#4467]** — `thegoldenflow`, opened 2026-08-09. Open, unmerged. It is a **more thorough fix
+  than ours**: an explicit `MemObjKVLayout` contract (`SPLIT_KV_2LTD` / `FUSED_PACKED`) rather than
+  a derived plane count, and it fixes the fused kernels, V3's lazy-discovery first-store crash and
+  CacheBlend as well as V2, with `tests/v1/test_fused_kv_transfer.py` and
+  `tests/v1/test_metadata_shapes.py`. It already contains our V3 finding as its root cause #3.
+- The defect is still on `dev` today: `gpu_connectors.py:428` is still
+  `kv_size = 1 if self.use_mla else 2`, and V3's `get_shape()` still raises.
+
+**Our correction to carry forward: this is not ROCm-specific.** `Vivo50E` reproduced it on
+**A100 / `FLASH_ATTN` / vLLM 0.27** (Qwen2.5-Omni-3B), so it hits CUDA users identically, and
+vLLM-Omni's KV offload is blocked on it. Anything we write that implies this is our platform's
+problem is wrong.
+
+**What is actually blocking #4467 is the one thing we have.** Every CPU lane is green and the PR
+carries the `amd` label, but the author wrote on 2026-09-01:
+
+> "I don't have AMD hardware locally, so I'll rely on that lane for HIP/ROCm validation."
+
+The AMD lane never reported. The PR has been frozen at head `0eaaf282` and untouched for over a
+week, with the end-to-end results table in its own description still reading `pending` in every
+"after" cell, because **the development machine used for the fix has no GPU at all.**
+
+We have 8×MI300X, a working ROCm build, a two-node P/D pair and a needle harness that can tell a
+real KV movement from the illusion. Validating #4467 here is worth far more than re-reporting a
+known bug, and it is a harsher test than the one they are asking for: our path runs the fix through
+NIXL → SPDK NVMe-KV over TCP across two hosts, not just a local CPU tier.
+
+Suggested order: build an image with #4467 (head `0eaaf282`) **in place of** `patches/0009`, run the
+single-node store/restart/retrieve check and the 72B P/D needle test, and post the results table
+they left pending. **If it passes, delete `patches/0009` and the out-of-tree carry ends.** If it
+fails on ROCm, that is a finding they cannot get any other way.
+
+[#4463]: https://github.com/LMCache/LMCache/issues/4463
+[#4467]: https://github.com/LMCache/LMCache/pull/4467
 
 ### OPEN-3 — Upstream the probe fixes *(medium)*
 
@@ -233,6 +268,11 @@ runs inside the container as root. Consequences that cost time:
 ---
 
 ## The fix — `patches/0009-lmcache-fused-kv-plane-count.patch`
+
+> This is **our** fix, and it works, but it is not the one to upstream — LMCache PR #4467 fixes the
+> same defect more thoroughly and was opened a month earlier. Read this section for what the bug
+> *is*; see OPEN-2 for what to do about it. `patches/0009` should be deleted once #4467 is
+> validated here.
 
 **LMCache built a 2-plane split staging destination for vLLM 0.26's 1-plane fused KV cache.** The
 copy kernel derives its source stride from that destination shape, so it read at half the correct
