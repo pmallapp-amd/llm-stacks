@@ -13,6 +13,7 @@
 !/deploy.sh
 !/target.sh
 !/proxy.py
+!/needle_test.py
 !/patches/
 !/plugins/
 

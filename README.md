@@ -50,8 +50,11 @@ keeps that boundary explicit and refuses `PD_ROLE` with `MODE=mp` rather than si
 | KV correctness | **FIXED 2026-09-09.** Every chunk written before `patches/0009` was half-empty and mis-strided — LMCache built a 2-plane split staging destination for vLLM 0.26's 1-plane fused cache. Use `rocm-aic:kv-planefix` or newer; anything older stores corrupt KV. |
 | `BACKEND=spdk MODE=inprocess`, single node | **Verified 2026-09-09.** Store, restart, read back: needle recovered with `need to load: 1024`. Retrieval is 2.40x faster than recompute at c=1 (TinyLlama). |
 | **P+D disaggregated, two hosts** | **Verified end-to-end 2026-09-09** — 4/4 needles correct through the proxy with `need to load: 1024` on the receiver. **Requires `AIC_KV_POOL=0` on both roles**; the previously documented static default moves no KV at all while still returning correct answers. See Step 5. |
+| **P+D on a real model** | **Verified 2026-09-09** — `Qwen/Qwen2.5-72B-Instruct` at **TP=4**, 4/4 needles, `need to load: 1152` on the receiver. Needs **`AIC_CHUNK_SIZE=128`**: at the default 256 a chunk is 20 MiB against the device's 16 MiB single-value ceiling and the STORE kills the server with `NIXL_ERR_BACKEND`. Also needs `--disable-custom-all-reduce` — see "TP>1" below. |
+| Store size ceiling | **A chunk is one object, capped at the controller's max transfer size (16 MiB here).** Per rank: `layers * chunk_size * (kv_heads/TP) * head_size * 4` bytes. Every result before 2026-09-09 was TinyLlama at 5.5 MiB and never approached it, so `patches/0007`'s multipart split has **never actually carried a chunk**. |
+| P+D performance | **Never measured.** No latency or throughput number has been taken through the proxy, on any model. The proxy is sequential, so a single-request timing will look like a loss. |
 | Everything else | **STAGED, NEVER RUN.** Derived from reading `ROCm/rocm-aic @ bb386562`, our own plugin/LMCache sources and `patches/` — not from an execution. |
-| Model | `Qwen/Qwen2.5-72B-Instruct` needs 8×MI300X (TP=8) and will **not** fit a single-MI210 host. The only host with a real NVMe-KV function *is* a single MI210 — so `BACKEND=xnvme` is limited to small dense models. No `aiter`/`flash_attn` here, so **no MLA model** (DeepSeek-V2/V3, Kimi) runs at all. |
+| Model | `Qwen/Qwen2.5-72B-Instruct` is ~145 GB in bf16 — **~36 GB/rank at TP=4, which fits comfortably on four 192 GB MI300X and does not need all eight.** (An earlier revision said TP=8 and "all 8 GPUs per node"; that was circular — it assumed TP=8 and derived the GPU count from it.) It will **not** fit a single-MI210 host. The only host with a real NVMe-KV function *is* a single MI210 — so `BACKEND=xnvme` is limited to small dense models. No `aiter`/`flash_attn` here, so **no MLA model** (DeepSeek-V2/V3, Kimi) runs at all. |
 | Hostnames | Placeholders throughout (`<SETUP2_PD_NODE_IP>`, `<token>`), including in script defaults. Supply real values via the environment variables each script documents. |
 
 Treat a first invocation as bring-up, not a benchmark: watch it fail, fix the actual error, and do
@@ -280,8 +283,51 @@ sudo HF_HOME=/var/tmp/hf HF_TOKEN=none \
 > For P/D the two roles must address the **same** key space — that is the whole point of the
 > handoff — so leave the offset alone and let the content-derived names line up.
 
-Both roles must also use the same `MODEL` and the same `TENSOR_PARALLEL_SIZE`. The KV chunk layout
-depends on the TP degree, so a mismatch makes the stored cache unreadable to the other side.
+Both roles must also use the same `MODEL`, the same `TENSOR_PARALLEL_SIZE` and the same
+`AIC_CHUNK_SIZE`. All three are part of the cache key, so a mismatch is a **key miss**: the receiver
+derives keys the producer never wrote, reports `need to load: 0` and silently re-prefills. That is
+the same signature as the static-backend illusion above, so pin all three explicitly on both roles
+rather than diagnosing it as a storage bug.
+
+### Running a real model — the two flags it needs
+
+Verified 2026-09-09 with `Qwen/Qwen2.5-72B-Instruct` at TP=4 on GPUs 2-5 of each node, alongside the
+TinyLlama pair left running as a control:
+
+```bash
+# on BOTH nodes, changing only PD_ROLE and INSTANCE
+HF_HOME=/var/tmp/hf HF_TOKEN=none IMAGE_REF=rocm-aic:kv-planefix \
+  MODE=inprocess PD_ROLE=producer INSTANCE=producer72 PORT=8401 \
+  MODEL=Qwen/Qwen2.5-72B-Instruct MAX_MODEL_LEN=32768 \
+  TENSOR_PARALLEL_SIZE=4 GPU=2,3,4,5 \
+  AIC_KV_POOL=0 AIC_CHUNK_SIZE=128 \
+  VLLM_EXTRA_ARGS="--no-enable-prefix-caching --gpu-memory-utilization 0.6 --disable-custom-all-reduce" \
+  AIC_SPDK_KV_TRID="trtype:TCP adrfam:IPv4 traddr:$TARGET trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0" \
+  bash deploy.sh
+```
+
+- **`AIC_CHUNK_SIZE=128` is mandatory here.** One chunk is one stored object and the device caps a
+  single value at its max transfer size — 16 MiB, logged at startup as `effective=16777216`. Per
+  rank a chunk is `layers * chunk_size * (kv_heads/TP) * head_size * 2(K,V) * 2(bf16)`; for this
+  model at TP=4 and `chunk_size` 256 that is `80 * 256 * 2 * 128 * 4` = **20 MiB, which does not
+  fit**. The store fails with `nixlBackendError: NIXL_ERR_BACKEND` and **takes the vLLM server
+  down** — both roles come up healthy first, so it only appears on the first real request. `128`
+  halves it to 10 MiB. Raising TP also lowers it, so the ceiling constrains
+  `(model, TP, chunk_size)` jointly.
+- **`--disable-custom-all-reduce` is required for any TP>1 on this image.** Without it the server
+  **hangs at init** rather than crashing: all ranks load and allocate KV, then the EngineCore
+  repeats `No available shared memory broadcast block found in 60 seconds` until `wait_for_health`
+  times out, which reads as a slow model. With it, READY in 460 s.
+
+**Rehearse any TP>1 change with TinyLlama first** — `INSTANCE=tp4probe PORT=8304
+TENSOR_PARALLEL_SIZE=4 GPU=2,3,4,5` on weights already on disk reproduces the all-reduce hang in
+about three minutes. Hitting it first on a 145 GB model costs a 20-minute load per attempt and looks
+like a model problem.
+
+Staging the weights: download **inside the image** (`--entrypoint hf ... download <repo>`, no
+`--local-dir` — vLLM needs the `hub/models--*/{blobs,snapshots}` layout), and copy node-to-node with
+`rsync -aH --rsync-path="sudo rsync"`, since `/var/tmp/hf/hub` is root-owned by that download. `-H`
+matters: `-L` dereferences the `snapshots/`→`blobs/` symlinks and doubles the transfer.
 
 ## Step 7 — Front the pair with the proxy
 
@@ -407,6 +453,26 @@ still be correct**, so you cannot detect this from the output. If you see
 
 If the decode side errors on a location name, set `LMCACHE_STORE_LOCATION` /
 `LMCACHE_RETRIEVE_LOCATIONS` to exactly what `Created backend:` printed, rather than guessing.
+
+### `needle_test.py` — driving the correctness half
+
+`needle_test.py` (repo root) sends N long needle prompts through the proxy and reports whether each
+needle came back:
+
+```bash
+python3 needle_test.py --port 9001 --model Qwen/Qwen2.5-72B-Instruct \
+  --seed-base 71000 --count 4 --repeats 34
+```
+
+It builds prompts past `chunk_size` with a distinct needle per request, and prints the `Total tokens`
+to match against the log lines above.
+
+- **`--seed-base` must be fresh on every run.** The backend is persistent, so a repeat run measures
+  retrieval in its own STORE phase. It varies the **beginning** of the prompt, because chunk keys
+  are prefix-derived — varying `--repeats` alone only rekeys the final chunk.
+- **It deliberately does not report pass/fail on its own.** It ends by printing the receiver
+  log-scrape command, because correctness cannot distinguish a working pair from the illusion —
+  both answer correctly. The needle result is necessary, not sufficient.
 
 Finally, the correctness check that gates every number: **the same prompt, twice, across a
 restart, must produce identical output.**
@@ -604,10 +670,18 @@ MODE=inprocess HF_TOKEN=<token> MAX_MODEL_LEN=2048 TENSOR_PARALLEL_SIZE=1 GPU=0 
 # and the answers still come back correct, so nothing looks wrong. Verified
 # end-to-end 2026-09-09; do NOT vary AIC_SPDK_KV_SLOT_OFFSET here, it is inert
 # on the metaInfo key path and the roles must share one key space.
-MODE=inprocess PD_ROLE=producer AIC_KV_POOL=0 \
-  MODEL=Qwen/Qwen2.5-72B-Instruct TENSOR_PARALLEL_SIZE=8 HF_TOKEN=<token> bash deploy.sh
-MODE=inprocess PD_ROLE=receiver AIC_KV_POOL=0 \
-  MODEL=Qwen/Qwen2.5-72B-Instruct TENSOR_PARALLEL_SIZE=8 HF_TOKEN=<token> bash deploy.sh
+#
+# AIC_CHUNK_SIZE=128 and --disable-custom-all-reduce are BOTH required for this
+# model at TP=4 — see "Running a real model" in Step 6. INSTANCE/PORT keep the
+# pair clear of any TinyLlama deployment already on the host.
+MODE=inprocess PD_ROLE=producer INSTANCE=producer72 PORT=8401 AIC_KV_POOL=0 \
+  AIC_CHUNK_SIZE=128 TENSOR_PARALLEL_SIZE=4 GPU=2,3,4,5 \
+  VLLM_EXTRA_ARGS="--no-enable-prefix-caching --disable-custom-all-reduce" \
+  MODEL=Qwen/Qwen2.5-72B-Instruct HF_TOKEN=<token> bash deploy.sh
+MODE=inprocess PD_ROLE=receiver INSTANCE=receiver72 PORT=8401 AIC_KV_POOL=0 \
+  AIC_CHUNK_SIZE=128 TENSOR_PARALLEL_SIZE=4 GPU=2,3,4,5 \
+  VLLM_EXTRA_ARGS="--no-enable-prefix-caching --disable-custom-all-reduce" \
+  MODEL=Qwen/Qwen2.5-72B-Instruct HF_TOKEN=<token> bash deploy.sh
 ```
 
 ```bash
@@ -697,10 +771,14 @@ build.sh                      vendor rocm-aic, patch, stage, make build
                               (SKIP_BUILD=1 to vendor without building)
 target.sh                     the independent SPDK NVMe-KV target
 proxy.py                      prefill→decode router, verbatim from vLLM
+needle_test.py                needle prompts through the proxy; the correctness half of
+                              Step 8. Prints the receiver log-scrape rather than a
+                              pass/fail, because correctness alone cannot detect the
+                              no-KV-moved illusion
 patches/                      one flat, git am-able series; destination encoded in the name
   0001..0004-spdk-*.patch     KV-command-set diffs, staged into the build
   0005-rocm-aic-*.patch       git-apply'd to the vendored docker/Dockerfile
-  0006..0008-lmcache-*.patch  copied into the vendored tree, applied inside the build
+  0006..0009-lmcache-*.patch  copied into the vendored tree, applied inside the build
 plugins/
   nvme-kv/                    SPDK_NVMe_KV backend source
   xnvme-kv/                   XNVME_KV backend source

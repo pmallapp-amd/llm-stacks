@@ -1,8 +1,13 @@
 # HANDOFF — 2026-09-09
 
-**The stack works.** The KV corruption that blocked everything is fixed and shipped in an image;
-single-node store/retrieve is verified and measured; P+D disaggregation runs end to end across two
-hosts. None of that was true at the start of the day.
+**The stack works, and it now works on a model worth running.** The KV corruption that blocked
+everything is fixed and shipped in an image; single-node store/retrieve is verified and measured;
+P+D disaggregation runs end to end across two hosts — on **Qwen2.5-72B-Instruct at TP=4**, not just
+TinyLlama. None of that was true at the start of the day.
+
+Getting to a real model surfaced a ceiling that had been latent the whole time: **one chunk is one
+stored object, and the device caps a single value at 16 MiB.** Every result on this branch before
+today was taken at TinyLlama's 5.5 MiB and never approached it. See "The 16 MiB store ceiling".
 
 This document replaces the four earlier passes. Everything below has been executed, not inferred —
 where something is reasoning rather than measurement, it says so.
@@ -24,8 +29,9 @@ Branch `rocm-aic`, **not pushed**. The remote GPU-node tree is a plain copy kept
 | Single-node store → restart → retrieve | ✅ verified repeatedly (needle recovered, `need to load: 1024`) |
 | KV-path benchmark | ✅ first valid one taken: **2.40x** faster than recompute at c=1 |
 | **P+D across two hosts** | ✅ **verified end to end**, 4/4 needles through the proxy |
-| P+D on a real model | ❌ never run — everything here is TinyLlama-1.1B |
+| **P+D on a real model** | ✅ **Qwen2.5-72B-Instruct, TP=4**, 4/4 needles, `need to load: 1152` |
 | P+D under concurrency | ❌ never measured |
+| P+D latency/throughput | ❌ **no number has ever been taken through the proxy** |
 | `patches/0009` upstreamed | ❌ still carried out-of-tree |
 
 ### What is deployed
@@ -33,16 +39,28 @@ Branch `rocm-aic`, **not pushed**. The remote GPU-node tree is a plain copy kept
 All containers on `rocm-aic:kv-planefix`. Runtime config and logs are host-local under
 `AIC_RUNTIME_DIR` (`/var/tmp/aic-$(id -u)`); nothing mounts the NFS home any more.
 
-| node | container | port | GPU | backend |
-|---|---|---|---|---|
-| `<SETUP3_PREFILL_NODE>` | `aic-spdk-planefix` | 8303 | 0 | dynamic (single-node bench instance) |
-| `<SETUP3_PREFILL_NODE>` | `aic-spdk-producer` | 8301 | 1 | dynamic, `store_location` only |
-| `<SETUP3_PREFILL_NODE>` | `proxy.py` | 9000 | — | started via `/var/tmp/start_pd_proxy.sh` |
-| `<SETUP3_DECODE_NODE>` | `aic-spdk-receiver` | 8301 | 0 | dynamic, `retrieve_locations` only |
-| `<SETUP3_DECODE_NODE>` | `aic-spdk-single` | 8302 | 1 | **static** — cannot read back, see OPEN-6 |
-| `<SETUP3_TARGET_NODE>` | SPDK NVMe-KV target | 4420 | — | RAM-backed, holds pre-fix poison + post-fix data |
+| node | container | port | GPU | model | backend |
+|---|---|---|---|---|---|
+| `<SETUP3_PREFILL_NODE>` | `aic-spdk-planefix` | 8303 | 0 | TinyLlama | dynamic (single-node bench instance) |
+| `<SETUP3_PREFILL_NODE>` | `aic-spdk-producer` | 8301 | 1 | TinyLlama | dynamic, `store_location` only |
+| `<SETUP3_PREFILL_NODE>` | **`aic-spdk-producer72`** | **8401** | **2,3,4,5** | **Qwen2.5-72B** | dynamic, `store_location`, `chunk_size 128` |
+| `<SETUP3_PREFILL_NODE>` | `proxy.py` | 9000 | — | TinyLlama pair | `/var/tmp/start_pd_proxy.sh` |
+| `<SETUP3_PREFILL_NODE>` | **`proxy.py`** | **9001** | — | **72B pair** | PID in `/var/tmp/proxy9001.pid` |
+| `<SETUP3_DECODE_NODE>` | `aic-spdk-receiver` | 8301 | 0 | TinyLlama | dynamic, `retrieve_locations` only |
+| `<SETUP3_DECODE_NODE>` | `aic-spdk-single` | 8302 | 1 | TinyLlama | **static** — cannot read back, see OPEN-5 |
+| `<SETUP3_DECODE_NODE>` | **`aic-spdk-receiver72`** | **8401** | **2,3,4,5** | **Qwen2.5-72B** | dynamic, `retrieve_locations`, `chunk_size 128` |
+| `<SETUP3_TARGET_NODE>` | SPDK NVMe-KV target | 4420 | — | — | RAM-backed, holds pre-fix poison + post-fix data |
 
-The two single-node instances and the P+D pair coexist on different GPUs and ports.
+Four in-process instances now coexist per node on distinct GPUs, ports and `INSTANCE` names. Cards
+6 and 7 are free on both nodes.
+
+**The TinyLlama pair is deliberately still up as a live control.** It is worth far more than the two
+GPUs it costs: when the 72B receiver shows `need to load: 0`, the first question is "did the stack
+regress, or is this config wrong?", and without a known-good pair that cannot be answered without a
+teardown. It was re-verified 4/4 after every step of the 72B bring-up.
+
+Both 72B roles carry `DEPLOY_DEGRADED=enforce-eager,disable-custom-all-reduce,gpu-mem-util-0.6,tp4,chunk128`.
+`--enforce-eager` is hardcoded (`deploy.sh`) and will distort any latency number taken from them.
 
 ---
 
@@ -50,17 +68,7 @@ The two single-node instances and the P+D pair coexist on different GPUs and por
 
 Ordered by what I would do next.
 
-### OPEN-1 — Run P+D on a real model *(high)*
-
-P+D is proven **correct**, not proven **worthwhile**. TinyLlama-1.1B's prefill is so cheap that
-disaggregation cannot pay for itself — it is also why the single-node benchmark is only 2.40x.
-Nothing about the value of this architecture has been demonstrated.
-
-Both roles must use the same `MODEL` **and** the same `TENSOR_PARALLEL_SIZE`: the KV chunk layout
-depends on TP, so a mismatch makes the stored cache unreadable to the other side. `Qwen2.5-72B` at
-TP=8 needs all 8 GPUs per node, so the single-node instances must come down first.
-
-### OPEN-2 — Measure P+D, don't just run it *(high)*
+### OPEN-1 — Measure P+D, don't just run it *(high)*
 
 No latency or throughput number has been taken through the proxy. Note the proxy is **sequential** —
 it calls prefill with `max_tokens=1`, discards the response, then streams from decode — so
@@ -68,14 +76,24 @@ end-to-end latency is both legs. The win has to come from freeing the decode hos
 which only appears under **concurrent** load. A single-request measurement will look like a loss and
 that would be a misreading, not a result.
 
-### OPEN-3 — Upstream `patches/0009` to LMCache *(high)*
+The 72B pair is the right place to take this — it is the first deployment where prefill is expensive
+enough for the answer to mean anything. Two things to control for before quoting a number: both
+roles run `--enforce-eager` (hardcoded, inflates decode) and `--gpu-memory-utilization 0.6`, and the
+observed single-request latency through proxy 9001 was ~11 s warm against ~39 s on the first call.
+Neither figure is a result; they are recorded only so nobody mistakes the warm one for a win.
+
+`MAX_MODEL_LEN=32768` is available on the 72B pair, so the demonstration can use 8k–16k prompts
+rather than the ~1.2k used to prove correctness. Note that 16k tokens is ~5 GB of KV per request
+against a RAM-backed target — check the target's capacity before sending it.
+
+### OPEN-2 — Upstream `patches/0009` to LMCache *(high)*
 
 This is an **upstream defect, not a rocm-aic one**, and it silently corrupts every KV chunk on this
 path for any vLLM 0.26 fused-cache deployment — not just ours. We carry a fix; upstream does not
 have one. `VLLMPagedMemGPUConnectorV3.get_shape()` (`raise NotImplementedError`) should probably be
 part of that conversation too.
 
-### OPEN-4 — Upstream the probe fixes *(medium)*
+### OPEN-3 — Upstream the probe fixes *(medium)*
 
 `--seed-base` exists only in `/var/tmp/kvbench/kv_offload_bench_seeded.py` on the prefill node. I did
 not edit the shared `bench/` tree unasked. Until it lands, **every repeat run of
@@ -86,14 +104,14 @@ request 400s; `--sentence-repeats 34` fits.
 Its README's "Known status (2026-08-12): RETRIEVE never reaches the backend" should be revisited —
 that is very likely the prefix-cache masking described in "Benchmarking" below, not a backend bug.
 
-### OPEN-5 — Purge the pre-fix poison from the target *(medium)*
+### OPEN-4 — Purge the pre-fix poison from the target *(medium)*
 
 Every chunk written before `patches/0009` is half-empty and mis-strided. Keys are content-derived,
 so this is only reachable by replaying a pre-fix prompt — it does **not** corrupt new work — but it
 will mislead anyone who re-runs an old prompt. The RAM-backed target clears on restart. It is shared
 with the decode node, so restarting it is not a private action.
 
-### OPEN-6 — Decide what the static single-node instance is for *(medium)*
+### OPEN-5 — Decide what the static single-node instance is for *(medium)*
 
 `aic-spdk-single` :8302 is still deliberately on the static backend. Static **cannot serve a
 cross-process or cross-restart hit** — `NixlObjectPool` names slots `obj_{i}_{uuid4()}`
@@ -101,7 +119,7 @@ cross-process or cross-restart hit** — `NixlObjectPool` names slots `obj_{i}_{
 control and never was; keep it only if something needs a store-only instance, otherwise redeploy it
 with `AIC_KV_POOL=0` or remove it.
 
-### OPEN-7 — Housekeeping *(low)*
+### OPEN-6 — Housekeeping *(low)*
 
 - Delete the now-unused `vendor/rocm-aic/pd-configs/` and `logs/` trees on the NFS home. Nothing
   mounts them since both nodes moved to `AIC_RUNTIME_DIR`.
@@ -110,6 +128,107 @@ with `AIC_KV_POOL=0` or remove it.
 - Setup-3 BMC addresses were never captured; the `reg` entries carry `''`.
 - `use_layerwise` is a landmine: `VLLMPagedMemGPUConnectorV3.get_shape()` raises
   `NotImplementedError` and `store_layer` (`cache_engine.py:683`) is its only caller.
+
+---
+
+## P+D on a real model — Qwen2.5-72B-Instruct at TP=4
+
+Verified 2026-09-09. 4/4 needles correct through proxy 9001, and the discriminative check passes:
+
+```
+producer72:  Total tokens 1199, computed 0, LMCache hit tokens: 0,    need to load: 0      <- stores
+receiver72:  Total tokens 1199, computed 0, LMCache hit tokens: 1152, need to load: 1152   <- loads
+```
+
+`1152 = 9 chunks x 128`. `Total tokens` matches the requests sent, per the rule below about shared
+endpoints. Run it with `needle_test.py` (now in the tree):
+
+```bash
+python3 needle_test.py --port 9001 --model Qwen/Qwen2.5-72B-Instruct \
+  --seed-base <fresh> --count 4 --repeats 34
+```
+
+`--seed-base` must be fresh on every run: chunk keys are prefix-derived and the backend is
+persistent, so a repeat run measures retrieval in its own store phase.
+
+### The 16 MiB store ceiling — the thing that actually blocked this
+
+**One LMCache chunk is stored as ONE object, and the SPDK-KV device caps a single value at the
+controller's max transfer size.** Logged at every startup, and previously ignored:
+
+```
+[SPDK_NVMe_KV] device KV format 0: value_max=67108864 key_max=16,
+  ctrlr max_xfer=16777216 -> effective=16777216 (compiled-in default 524288)
+```
+
+Per rank, one chunk is `layers * chunk_size * (kv_heads/TP) * head_size * 2(K,V) * 2(bf16)`. The
+producer's own log prints every term:
+
+```
+num_layer: 80, chunk_size: 256, num_kv_head (per gpu): 2, head_size: 128
+  -> 80 * 256 * 2 * 128 * 4 = 20 MiB, against a 16 MiB ceiling
+```
+
+Over the ceiling the **store dies with `NIXL_ERR_BACKEND`** out of
+`mem_to_storage -> post_blocking -> check_xfer_state`, and it **takes the whole vLLM server down**
+rather than degrading. Both roles come up healthy first, so this only appears on the first real
+request.
+
+Three consequences worth carrying forward:
+
+- **Every result on this branch before today was taken below the ceiling.** TinyLlama at TP=1 is
+  22 layers and 4 kv heads — 5.5 MiB. It never came close.
+- **The multipart-split path that `patches/0007` exists for has therefore never carried a chunk**,
+  and it does not save us here. That patch is effectively unexercised.
+- **The ceiling is a joint constraint on `(model, TP, chunk_size)`, not a property of the model.**
+  Raising TP lowers per-rank chunk bytes by cutting `kv_heads/TP`, so TP=8 would also have fitted —
+  which is a genuine argument for TP=8 that nobody had made, and is *not* the GPU-count argument
+  given below.
+
+`AIC_CHUNK_SIZE` (new, `deploy.sh`) sets `chunk_size`; unset leaves LMCache's 256 and the generated
+config byte-identical to before the knob existed. `128` halves the Qwen chunk to 10 MiB and it fits.
+**It is part of the cache key, so both P/D roles must carry the same value** — a mismatch makes the
+receiver derive different keys and silently re-prefill, the same signature as the static-backend
+illusion.
+
+### `--disable-custom-all-reduce` is required for any TP>1 on this image
+
+Without it a TP=4 server **hangs at init**, it does not crash. All ranks load, allocate KV, reach
+`all_gather_into_tensor`, and then the EngineCore repeats:
+
+```
+No available shared memory broadcast block found in 60 seconds.
+```
+
+`wait_for_health` just times out, which reads as a slow model rather than a hang. Adding
+`--disable-custom-all-reduce` to `VLLM_EXTRA_ARGS` fixed it outright — READY in 460 s.
+
+This was found in **three minutes** by rehearsing TP=4 with TinyLlama on weights already on disk,
+before touching the 72B. Any TP>1 change should be rehearsed that way; hitting this first on a 145 GB
+model costs a 20-minute load per attempt and looks like a model problem.
+
+### Two corrections to the previous handoff
+
+- **"`Qwen2.5-72B` at TP=8 needs all 8 GPUs per node, so the single-node instances must come down
+  first" was wrong, and circular** — it assumed TP=8 and derived the GPU count from it. On 192 GB
+  MI300X parts the model is ~36 GB/rank at TP=4. It was run on the six idle GPUs and **the TinyLlama
+  pair stayed up throughout as a control.** Nothing had to come down.
+- **A TP mismatch between roles produces a key miss, not a misread.** The symptom is
+  `need to load: 0` — indistinguishable from the static-backend illusion, so pin TP explicitly on
+  both roles rather than diagnosing it as a storage bug.
+
+### Staging the model
+
+`HF_HOME=/var/tmp/hf` on both nodes, and `/var/tmp/hf/hub` is **root-owned** because the download
+runs inside the container as root. Consequences that cost time:
+
+- Download inside the image (`--entrypoint hf ... download <repo>`); the hosts have no
+  `huggingface_hub`. Do **not** use `--local-dir` — vLLM needs the `hub/models--*/{blobs,snapshots}`
+  layout or it silently re-downloads 145 GB inside the container.
+- Node-to-node copy needs `rsync -aH --rsync-path="sudo rsync"`; without the `sudo` rsync-path it
+  fails `mkdir: Permission denied` on the root-owned `hub/`. **`-H` matters** — `-L` would
+  dereference the `snapshots/`→`blobs/` symlinks and double the transfer to 290 GB.
+- 65 MB/s from HuggingFace, 550 MB/s node-to-node. Download once, then push.
 
 ---
 
@@ -191,6 +310,10 @@ Result: `kv-bench/results/<prefill-host>/2026-09-09-kv-spillover-probe/RESULT.md
 |---|---|---|---|
 | 1 | 152.6 ± 28.8 ms | **63.5 ± 3.2 ms** | **2.40x faster** |
 | 4 | 289.9 ± 32.2 ms | 274.3 ± 29.3 ms | 1.06x faster |
+
+**This is TinyLlama, single-node, at 5.5 MiB chunks — comfortably under the 16 MiB ceiling.** It says
+nothing about the 72B pair, whose chunks are twice the size and whose store path crosses a host. No
+equivalent number exists for a real model; that is OPEN-1.
 
 **Use `bench/kv-spillover-probe`, not `bench/llama-benchy`.** The throughput profile says so in its
 own caveat: llama-benchy draws fresh content per cell and never exercises store/retrieve.
@@ -278,6 +401,8 @@ series in the Dockerfile's lexical order against a scratch clone.
 ## Commits (this branch, not pushed)
 
 ```
+b3419ca  Add AIC_CHUNK_SIZE, and pin the 16 MiB store ceiling that blocks real models
+f289325  Make P/D default to the dynamic backend, and rewrite the handoff
 3296a4b  Run P+D end to end, and correct a recipe that moved no KV
 4f922ce  Take the first valid KV-path benchmark on the Austin cluster
 2fd74e1  Redeploy the decode node onto the fix and host-local runtime paths
