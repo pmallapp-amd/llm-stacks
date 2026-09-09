@@ -140,8 +140,18 @@
 #   IMAGE_REF=<tag>            (rocm-aic:latest)
 #   AIC_SPDK_KV_TRID=<trid>    BACKEND=spdk target
 #   AIC_XNVME_DEV=<path>       BACKEND=xnvme device node (/dev/ng0n1)
-#   AIC_KV_POOL=<n>            NIXL OBJ pool size (2000000) — see the note at the
-#                              assignment below before changing it.
+#   AIC_KV_POOL=<n>            NIXL OBJ pool size (2000000, but 0 when PD_ROLE is
+#                              set) — see the note at the assignment below before
+#                              changing it. 0 selects NixlDynamicStorageBackend
+#                              (content-derived object names, so a value stored by
+#                              one process is readable by another); non-zero
+#                              selects NixlStaticStorageBackend, whose names carry
+#                              a per-process uuid4 and therefore CANNOT be read
+#                              back by any other process or after a restart.
+#   AIC_ALLOW_STATIC_PD=1      Permit PD_ROLE with a non-zero AIC_KV_POOL. Refused
+#                              by default because it hands off no KV at all while
+#                              still returning correct answers — see the check at
+#                              the AIC_KV_POOL assignment.
 #   INSTANCE=<name>            In-process mode: this deployment's identity.
 #                              Defaults to PD_ROLE, else "single", so existing
 #                              names are unchanged. It determines the container
@@ -692,7 +702,44 @@ AIC_XNVME_DEV=${AIC_XNVME_DEV:-/dev/ng0n1}
 # CPU with zero forward progress after 10+ minutes. A tested ceiling, not a
 # capacity-matched value. Re-verify startup time if you raise it, or if your
 # model's l1_align_bytes differs from the 4096 B assumption.
-AIC_KV_POOL=${AIC_KV_POOL:-${AIC_SPDK_KV_POOL:-${AIC_XNVME_KV_POOL:-2000000}}}
+AIC_KV_POOL=${AIC_KV_POOL:-${AIC_SPDK_KV_POOL:-${AIC_XNVME_KV_POOL:-${PD_ROLE:+0}}}}
+AIC_KV_POOL=${AIC_KV_POOL:-2000000}
+
+# P/D REQUIRES the dynamic backend, so PD_ROLE defaults the pool to 0 above and
+# a non-zero pool is refused below.
+#
+# pool_size == 0 selects NixlDynamicStorageBackend, whose object names are
+# content-derived, so a receiver on another host derives the SAME key the
+# producer stored under. A non-zero pool selects NixlStaticStorageBackend, which
+# names objects obj_{i}_{uuid4()} — a fresh uuid per PROCESS
+# (nixl_storage_backend.py:383). The receiver then cannot derive the producer's
+# keys, every lookup misses, and it silently re-prefills the whole prompt.
+#
+# Measured 2026-09-09, deploying the then-documented static recipe verbatim:
+#   receiver: Total tokens 1089, computed 0, hit tokens: 0, need to load: 0
+# No KV crossed — and the answers were still CORRECT, so nothing about the
+# response, the health check or this script's own banner looked wrong. That is
+# why this is a hard refusal and not a warning: the failure is invisible
+# downstream, and a P/D pair that moves no KV is an expensive illusion.
+if [ -n "${PD_ROLE}" ] && [ "${AIC_KV_POOL}" != "0" ]; then
+    if [ "${AIC_ALLOW_STATIC_PD:-0}" = "1" ]; then
+        echo "  WARN: PD_ROLE=${PD_ROLE} with AIC_KV_POOL=${AIC_KV_POOL} (static backend)."
+        echo "        AIC_ALLOW_STATIC_PD=1 — proceeding. Expect the receiver to log"
+        echo "        'need to load: 0' and re-prefill; no KV will cross."
+    else
+        echo "ERR: PD_ROLE=${PD_ROLE} needs AIC_KV_POOL=0 (the dynamic backend)." >&2
+        echo "     AIC_KV_POOL=${AIC_KV_POOL} selects NixlStaticStorageBackend, whose" >&2
+        echo "     object names carry a per-process uuid4. The receiver cannot derive" >&2
+        echo "     the producer's keys, so NO KV is handed off and it silently" >&2
+        echo "     re-prefills — while still returning correct answers, which is why" >&2
+        echo "     this refuses instead of warning." >&2
+        echo "" >&2
+        echo "     Unset AIC_KV_POOL (P/D now defaults it to 0), or pass" >&2
+        echo "     AIC_ALLOW_STATIC_PD=1 if you are deliberately measuring the" >&2
+        echo "     no-handoff case." >&2
+        exit 1
+    fi
+fi
 
 if [ "${BACKEND}" = "spdk" ]; then
     STORAGE_TARGET="${AIC_SPDK_KV_TRID}"
