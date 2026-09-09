@@ -269,10 +269,16 @@ Verified on the real hosts, both directions:
 Re-verified end-to-end afterwards: needle `oscar mike` stored, container restarted, recovered with
 `need to load: 1024`.
 
-**Not yet migrated:** the decode node still mounts `lmcache-single-spdk.yaml` from the NFS path,
-because it was restarted, not redeployed. That file must stay until it is redeployed. With the
-prefill node moved to host-local paths there is no longer a live collision — the NFS file now has
-exactly one user.
+**Migration complete.** Both nodes have been redeployed onto `AIC_RUNTIME_DIR`. Verified directly:
+
+```
+$ for c in $(docker ps -q); do docker inspect -f '{{.Name}}: {{range .Mounts}}{{.Source}} {{end}}' $c; done | grep /home/
+  (nothing, on either node)
+```
+
+No container on either host mounts anything from the shared filesystem any more. The stale
+`vendor/rocm-aic/pd-configs/` and `logs/` trees on NFS now have zero users and can be deleted
+whenever convenient.
 
 ---
 
@@ -359,10 +365,27 @@ measurements. Clear it when convenient (the RAM-backed target drops everything o
 than treating it as a blocker — and note the target is shared with the decode node, so a restart is
 not a private action.
 
-**Redeploy the decode node** when you are ready to touch it. It is the last thing still running
-unpatched LMCache (so still writing corrupt chunks) and the last thing still mounting its config
-from NFS. A plain restart has been done and is clean; a redeploy on `rocm-aic:kv-planefix` moves it
-onto the fix and onto `AIC_RUNTIME_DIR` in one step.
+Both nodes now run the fix, so nothing in the lab is still writing corrupt chunks.
+
+**Moving the image between hosts — verify by CONTENT, not by image ID.** The README already warns
+"same tag ≠ same image"; the inverse also bites. `docker save | ssh docker load` produced a
+*different* image ID on the receiving host for byte-identical content:
+
+```
+prefill: sha256:ce7c3279…    decode: sha256:84eeb9b4…
+```
+
+Both contain the same files (`md5` of the two patched sources matches exactly, both plugins
+present). Compare file hashes inside the image, not IDs, or you will chase a difference that is not
+there. Note also that the decode node had its own unrelated `rocm-aic:latest` — always transfer and
+deploy by an explicit tag.
+
+The two nodes can `ssh` to each other directly, so the transfer does not need to be routed through
+a workstation:
+
+```bash
+docker save rocm-aic:kv-planefix | ssh <other-node> 'docker load'
+```
 
 Two things worth carrying forward regardless:
 
@@ -548,7 +571,7 @@ All five verified against live container state under `set -euo pipefail`.
 | Node (placeholder) | Role | State |
 |---|---|---|
 | `<SETUP3_PREFILL_NODE>` | patched host | **`aic-spdk-planefix` :8303, `rocm-aic:kv-planefix`, dynamic backend, GPU 0** — the fix baked in, deployed by `deploy.sh`, acceptance-tested. Uses its **own** config `lmcache-planefix-spdk.yaml`, so it no longer shares a file with the decode node. The old `aic-spdk-single` diagnosis container was removed (its `docker cp` patch is now in the image). `aic-spdk-static` :8304 stays torn down; GPU 1 free. |
-| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static. **Restarted 2026-09-09** after 28 h — came back on `nixl_pool_size: 2000000` / `NixlStaticStorageBackend`, i.e. exactly as before, which is the proof that the config repair held. Still mounts its config from the **NFS** path (restarted, not redeployed) and still runs **unpatched** LMCache, so it continues to write corrupt chunks — redeploy it on `rocm-aic:kv-planefix` before trusting anything it stores. |
+| `<SETUP3_DECODE_NODE>` | decode | **`aic-spdk-single` :8302, `rocm-aic:kv-planefix`, static, GPU 1 — redeployed 2026-09-09.** Now on the fix (`kv shape: (22, 1, 256, 4, 128)`) and on host-local `AIC_RUNTIME_DIR`. Config preserved as `nixl_pool_size: 2000000`, so it is still `NixlStaticStorageBackend` and still cannot read across a restart — that is structural, not something this patch changes. Before the redeploy it was restarted from its old image and came back identically (`2000000` / static), which is the proof the earlier config repair held. |
 | `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds a mix**: everything written before the fix is poisoned; the two verification runs are correct. Clear it before benchmarking. |
 
 Target-reported limits, from the plugin's own startup line:
