@@ -128,9 +128,32 @@ Built as `rocm-aic:pr4467` from the PR head with **`patches/0009` removed**, and
 | check | result |
 |---|---|
 | #4467's kernels compile under ROCm/HIP, gfx942 | ✅ `MemObjKVLayout`/`SPLIT_KV_2LTD`/`FUSED_PACKED` in the built `lmcache_native` .so |
-| TinyLlama TP=1, store → **container restart** → retrieve | ✅ needle recovered, `hit 1280, need to load: 1280` |
+| **#4467's own test suites, on an MI300X** | ✅ **221 passed, 0 failed** — `test_fused_kv_transfer.py` + `test_metadata_shapes.py` |
+| ⤷ of which, on the GPU rather than the CPU oracle | ✅ **97 GPU/HIP** vs 96 CPU `py` — the compiled kernels really ran |
+| **V2** TinyLlama TP=1, store → **container restart** → retrieve | ✅ needle recovered, `hit 1280, need to load: 1280` |
+| **V3** (`use_gpu_connector_v3: True`), same cycle | ✅ **no crash**, `VLLMPagedMemGPUConnectorV3` dispatched, `need to load: 1280` |
 | **Qwen2.5-72B, TP=4, two hosts, through the proxy** | ✅ **4/4 needles**, producer `need to load: 0`, receiver `need to load: 1152` |
 | TinyLlama control pair (still on `kv-planefix`) | ✅ 4/4 throughout, never disturbed |
+
+The V3 result is worth its own line. #4463 reports V3 as a **hard first-store crash**
+(`RuntimeError: The size of tensor a (1024) must match the size of tensor b (2048)`), and our own
+earlier note called `use_gpu_connector_v3` a landmine. Under #4467 it stores, survives a restart and
+reads back, on the fused format (`EngineKVFormat.NL_X_NB_BS_NH_CS`). Both in-process connectors are
+fixed, not just V2.
+
+Test suites were run from the PR's own tree mounted into the image:
+
+```bash
+docker run --rm --device /dev/kfd --device /dev/dri -e ROCR_VISIBLE_DEVICES=7 \
+  -v /var/tmp/lmc-tests-pr4467:/tests:ro --entrypoint bash rocm-aic:pr4467 \
+  -c 'cd /tests && python3 -m pytest v1/test_metadata_shapes.py v1/test_fused_kv_transfer.py -q'
+```
+
+The GPU/CPU split matters and is easy to get wrong: the suite parametrises on
+`_BACKENDS = ["py"] + (["cuda"] if _CUDA else [])`, so on a box without a visible GPU it still
+reports all-green while only ever exercising the CPU reference. Count `PASSED` lines containing
+`cuda` before believing it proves anything about the kernels. Here: `torch 2.13.0+rocm7.2`,
+`torch.cuda.is_available() == True`, device `AMD Instinct MI300X`.
 
 That is a strictly harsher test than the one being asked for upstream: it crosses two hosts through
 NIXL → SPDK NVMe-KV over TCP, not a local CPU tier, and it exercises TP=4 rather than TP=1.
@@ -160,19 +183,13 @@ env ROCM_ARCH=gfx942 IMAGE_TAG=pr4467 \
 
 ### What is left
 
-1. **Post the validation to #4467.** It is the one thing blocking a PR that fixes silent corruption
-   for every vLLM 0.26+ LMCache user, and we are positioned to give it.
+1. **A HUMAN posts the validation to #4467.** It is the one thing blocking a PR that fixes silent
+   corruption for every vLLM 0.26+ LMCache user, and we are positioned to give it.
 
-   **Blocked on credentials, not on the work.** `gh` here is authenticated with a fine-grained PAT
-   (`github_pat_11…`), which is scoped to repos we own and cannot comment on `LMCache/LMCache`:
-
-   ```
-   GraphQL: Resource not accessible by personal access token (addComment)
-   ```
-
-   Needs a classic PAT with `public_repo`, or `gh auth login --web` granting it — or just paste it
-   by hand, which is arguably better anyway, since it then carries a name and a judgement rather
-   than a token. Verified not posted: the thread still ends at `thegoldenflow 2026-09-01`.
+   **This is a human step by policy, not a blocked automated one.** Nothing in this repo's tooling
+   may write to an external repository — no comments, no issues, no PRs, no pushes. Do not "fix"
+   this by granting an agent a broader token. Paste the text below by hand, under a name, with a
+   judgement attached. Verified never posted: the thread ends at `thegoldenflow 2026-09-01`.
 
    <details>
    <summary>Ready-to-post text for <a href="https://github.com/LMCache/LMCache/pull/4467">#4467</a></summary>
@@ -184,20 +201,35 @@ env ROCM_ARCH=gfx942 IMAGE_TAG=pr4467 \
    > instead of proposing ours.
    >
    > Built LMCache at `0eaaf282` inside AMD's `rocm-aic` container (vLLM 0.26, ROCm 7.14,
-   > `TRITON_ATTN`), with our own fix removed.
+   > `torch 2.13.0+rocm7.2`, `TRITON_ATTN`), with our own fix removed. Engine format detected as
+   > `EngineKVFormat.NL_X_NB_BS_NH_CS`.
    >
-   > - **Builds clean under HIP for gfx942.** `MemObjKVLayout` / `SPLIT_KV_2LTD` / `FUSED_PACKED` are
-   >   present in the compiled `lmcache_native` extension. No HIP-specific changes were needed.
-   > - **TinyLlama-1.1B, TP=1, in-process V2 + an NVMe-KV storage backend.** Store → full container
-   >   restart → retrieve: needle recovered, `LMCache hit tokens: 1280, need to load: 1280`.
-   >   Pre-fix, this path produced corrupt output.
+   > **Your test suites, on the GPU:**
+   >
+   > ```
+   > tests/v1/test_metadata_shapes.py + tests/v1/test_fused_kv_transfer.py
+   > 221 passed, 0 failed  —  97 on the cuda/HIP backend, 96 on the py oracle
+   > ```
+   >
+   > Worth stating explicitly because the suite parametrises on
+   > `_BACKENDS = ["py"] + (["cuda"] if _CUDA else [])`: this ran with
+   > `torch.cuda.is_available() == True` on an `AMD Instinct MI300X`, so the 97 `cuda` cases
+   > exercised the compiled HIP kernels rather than silently degrading to the CPU reference.
+   >
+   > **End-to-end, in-process, against an NVMe-KV storage backend:**
+   >
+   > - **V2** — TinyLlama-1.1B, TP=1. Store → full container restart → retrieve: needle recovered,
+   >   `LMCache hit tokens: 1280, need to load: 1280`. Pre-fix this path produced corrupt output.
+   > - **V3** (`use_gpu_connector_v3: True`) — same cycle, no crash. `VLLMPagedMemGPUConnectorV3`
+   >   dispatched, `need to load: 1280`, needle recovered. This is the path #4463 reports as a hard
+   >   first-store `RuntimeError: The size of tensor a (1024) must match the size of tensor b (2048)`.
    > - **Qwen2.5-72B-Instruct, TP=4, two hosts, prefill/decode disaggregated.** 4/4 needle prompts
-   >   correct through the proxy; producer `need to load: 0`, receiver `hit tokens: 1152, need to
-   >   load: 1152`.
+   >   correct through the proxy; producer `need to load: 0`, receiver `hit tokens: 1152,
+   >   need to load: 1152`.
    >
-   > Note this is a harsher path than the CPU-tier repro: KV crosses two machines via NIXL to an
-   > NVMe-KV target over TCP, and it exercises TP=4, so the fused addressing is validated under
-   > tensor-parallel sharding as well as at TP=1.
+   > Note the end-to-end path is harsher than the CPU-tier repro: KV crosses two machines via NIXL
+   > to an NVMe-KV target over TCP, and TP=4 validates the fused addressing under tensor-parallel
+   > sharding as well as at TP=1.
    >
    > A caveat for reproducibility: we dropped three of rocm-aic's own LMCache patches that conflict
    > at this head (a GDS logging patch and two MP-path patches). None of them touches the in-process
