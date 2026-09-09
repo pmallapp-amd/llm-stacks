@@ -201,6 +201,62 @@ AIC_SPDK_KV_TRID="<trid>" bash deploy.sh
 
 ---
 
+## The first valid KV-path benchmark
+
+Full result and provenance: `kv-bench/results/<prefill-host>/2026-09-09-kv-spillover-probe/RESULT.md`
+on the prefill node. TTFT, cold compute vs read-back from the NVMe KV target, TinyLlama at ~1900
+tokens/prompt:
+
+| concurrency | store (cold) | retrieve (from target) | change |
+|---|---|---|---|
+| 1 | 152.6 ± 28.8 ms | **63.5 ± 3.2 ms** | **2.40x faster** |
+| 4 | 289.9 ± 32.2 ms | 274.3 ± 29.3 ms | 1.06x faster |
+
+**Use `bench/kv-spillover-probe`, not `bench/llama-benchy`.** The throughput profile says so in its
+own caveat — llama-benchy draws fresh content per cell and never exercises store/retrieve. Running
+it would have produced another number that says nothing about KV, which is exactly the mistake the
+previous pass recorded.
+
+### Two conditions, each of which silently voids the measurement
+
+Both were violated by earlier attempts in this session, and both produced plausible-looking numbers.
+
+1. **vLLM prefix caching must be off.** It defaults on, and the GPU KV cache here is **8,285,648
+   tokens** — so vLLM answers every repeat itself and LMCache is never consulted. The probe's EVICT
+   phase (~20k tokens) is 0.2% of that and cannot evict it, which is very likely why the probe's own
+   README records "RETRIEVE never reaches the backend" as an unexplained bug since 2026-08-12.
+   `deploy.sh` now takes `VLLM_EXTRA_ARGS="--no-enable-prefix-caching"`.
+
+2. **Every run needs fresh seeds.** The backend is persistent, so a repeat run with the same seeds
+   measures retrieval in its own STORE phase. **Varying `--sentence-repeats` does not achieve this**
+   — `sentence * N` is a strict prefix of `sentence * (N+1)` and chunk keys are prefix-derived, so
+   it only rekeys the final chunk. This is the same prefix-keying trap recorded for the needle test,
+   and it was walked into again here.
+
+Discarded because of these: a run showing store and retrieve as identical (152 vs 153 ms), and one
+showing a flattering 2887 vs 255 ms "11x" at c=4 that did not reproduce.
+
+**Always run the server-side cross-check.** The accepted run matched its prediction exactly:
+
+```
+cold (need to load == 0): 40   expected 40 = (8 store + 12 filler) x 2 levels
+warm (need to load  > 0): 16   expected 16 = 8 retrieve x 2 levels
+```
+
+### On the greedy-decode mismatches
+
+The probe reports 1/8 and 4/8 output mismatches store vs retrieve. They are **not** corruption:
+every output on both sides is fluent English sharing a 66–91 character prefix before diverging into
+an equally plausible continuation, the direction varies (both phases produce both variants), and
+mismatches rise with concurrency — the signature of batch composition, not a lossy path. The prompt
+is one sentence repeated 34 times, so the model sits on near-ties. Pre-fix corruption looked
+nothing like it (`29.\n\n209.comaparticular, and a/heydatabase.`).
+
+The discriminative check is the needle test on the same configuration: `november five` stored and
+recovered exactly, `need to load: 1024`, no restart needed.
+
+---
+
 ## ⚠️ The config file is NFS-shared across every node — one file, not one per node
 
 Found while repairing the decode node, and it re-frames the `deploy.sh` bug recorded further down.
@@ -344,18 +400,21 @@ needle `victor tango`) and `/var/tmp/v3req.json`.
 
 ## NEXT ACTION
 
-**Benchmark the dynamic backend — there is still no valid number for this stack.**
+**P+D is the only major thing left.** The KV path now has a valid measurement (below).
 
-The patch is built, deployed and verified, so the remaining work is measurement and then P+D.
+Disaggregation has still never been run end-to-end here. The defect that blocked it is gone, but
+expect it to have its own problems; do not read "gather fixed" as "P+D works".
 
-1. **Re-benchmark, on the dynamic backend.** The recorded static-backend benchmark measured
-   recomputation, not retrieval (see the correction below), so no baseline exists. `aic-spdk-planefix`
-   on :8303 demonstrably reads. Point a load generator at it, or bring up the proxy and use
-   `bench/llama-benchy/run.sh` per README Step 9. Note the deployment record landed in
-   `${XDG_RUNTIME_DIR}/kv-cache-bench/`, not `/run/kv-cache-bench/`, because the deploy ran
-   non-root.
-2. **Then P+D.** The defect that blocked it is gone, but disaggregation has still never been run
-   end-to-end here. Expect it to have its own problems; do not read "gather fixed" as "P+D works".
+Smaller follow-ups, in rough priority order:
+
+1. **Upstream the probe fixes.** `--seed-base` lives only in
+   `/var/tmp/kvbench/kv_offload_bench_seeded.py` on the prefill node. Without it every repeat run
+   of `bench/kv-spillover-probe` silently measures retrieval in its own STORE phase. Its stock
+   defaults also overflow TinyLlama's context by exactly one token.
+2. **Re-measure on a bigger model.** TinyLlama-1.1B has cheap prefill, so the 2.4x below is a floor,
+   not a headline.
+3. **`use_layerwise` is a landmine** — `VLLMPagedMemGPUConnectorV3.get_shape()` is
+   `raise NotImplementedError` and `store_layer` (`cache_engine.py:683`) is its only caller.
 
 **On purging the target — lower priority than the previous pass implied.** Chunk keys are
 content-derived, so pre-fix poisoned entries are only reachable by replaying a pre-fix *prompt*.

@@ -122,6 +122,21 @@
 #   AIC_ALLOW_SHARED_CONFIG=1  Permit AIC_RUNTIME_DIR on a shared filesystem.
 #                              Only correct when this host is genuinely the sole
 #                              user of that path.
+#   VLLM_EXTRA_ARGS=<args>     Extra flags appended to `vllm serve`, word-split.
+#                              Escape hatch for flags deploy.sh does not model.
+#
+#                              READ THIS BEFORE BENCHMARKING THE KV PATH:
+#                              vLLM's own prefix cache is ON by default and its
+#                              GPU KV cache here is ~8.3M tokens, so it serves
+#                              any repeated prompt itself and LMCache is never
+#                              consulted — a "KV offload benchmark" run against
+#                              such a server measures nothing about storage, and
+#                              no realistic amount of filler traffic can evict a
+#                              cache that size. Pass
+#                                VLLM_EXTRA_ARGS="--no-enable-prefix-caching"
+#                              so a repeat has to come from LMCache. Confirm it
+#                              took by grepping the log for a NON-ZERO
+#                              'need to load:' rather than trusting the flag.
 #   IMAGE_REF=<tag>            (rocm-aic:latest)
 #   AIC_SPDK_KV_TRID=<trid>    BACKEND=spdk target
 #   AIC_XNVME_DEV=<path>       BACKEND=xnvme device node (/dev/ng0n1)
@@ -1477,6 +1492,11 @@ EOF
 
     CONTEXT_ARGS=()
     [ -n "${MAX_MODEL_LEN}" ] && CONTEXT_ARGS+=(--max-model-len "${MAX_MODEL_LEN}")
+
+    # Word-split deliberately: these are shell-authored vLLM flags, not a path.
+    # shellcheck disable=SC2206
+    VLLM_EXTRA_ARGS_ARR=(${VLLM_EXTRA_ARGS:-})
+    [ ${#VLLM_EXTRA_ARGS_ARR[@]} -gt 0 ] && echo "  extra args: ${VLLM_EXTRA_ARGS_ARR[*]}"
     [ -n "${HF_OVERRIDES}" ] && CONTEXT_ARGS+=(--hf-overrides "${HF_OVERRIDES}")
 
     DEVICE_ARGS=(--device /dev/kfd --device /dev/dri)
@@ -1509,6 +1529,7 @@ EOF
         --dtype "${DTYPE}" \
         --enforce-eager \
         "${CONTEXT_ARGS[@]}" \
+        "${VLLM_EXTRA_ARGS_ARR[@]}" \
         --kv-transfer-config "{\"kv_connector\":\"LMCacheConnectorV1\",\"kv_role\":\"${KV_ROLE}\"}"
 
     echo ""
