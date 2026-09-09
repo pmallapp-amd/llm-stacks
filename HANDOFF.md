@@ -162,6 +162,55 @@ env ROCM_ARCH=gfx942 IMAGE_TAG=pr4467 \
 
 1. **Post the validation to #4467.** It is the one thing blocking a PR that fixes silent corruption
    for every vLLM 0.26+ LMCache user, and we are positioned to give it.
+
+   **Blocked on credentials, not on the work.** `gh` here is authenticated with a fine-grained PAT
+   (`github_pat_11…`), which is scoped to repos we own and cannot comment on `LMCache/LMCache`:
+
+   ```
+   GraphQL: Resource not accessible by personal access token (addComment)
+   ```
+
+   Needs a classic PAT with `public_repo`, or `gh auth login --web` granting it — or just paste it
+   by hand, which is arguably better anyway, since it then carries a name and a judgement rather
+   than a token. Verified not posted: the thread still ends at `thegoldenflow 2026-09-01`.
+
+   <details>
+   <summary>Ready-to-post text for <a href="https://github.com/LMCache/LMCache/pull/4467">#4467</a></summary>
+
+   > **Validated on AMD MI300X (gfx942) — the fix works.**
+   >
+   > Picking up the AMD-lane gap noted above: we hit this bug independently on ROCm and wrote our own
+   > narrower fix before finding #4463/#4467. Yours is the better approach, so we tested yours
+   > instead of proposing ours.
+   >
+   > Built LMCache at `0eaaf282` inside AMD's `rocm-aic` container (vLLM 0.26, ROCm 7.14,
+   > `TRITON_ATTN`), with our own fix removed.
+   >
+   > - **Builds clean under HIP for gfx942.** `MemObjKVLayout` / `SPLIT_KV_2LTD` / `FUSED_PACKED` are
+   >   present in the compiled `lmcache_native` extension. No HIP-specific changes were needed.
+   > - **TinyLlama-1.1B, TP=1, in-process V2 + an NVMe-KV storage backend.** Store → full container
+   >   restart → retrieve: needle recovered, `LMCache hit tokens: 1280, need to load: 1280`.
+   >   Pre-fix, this path produced corrupt output.
+   > - **Qwen2.5-72B-Instruct, TP=4, two hosts, prefill/decode disaggregated.** 4/4 needle prompts
+   >   correct through the proxy; producer `need to load: 0`, receiver `hit tokens: 1152, need to
+   >   load: 1152`.
+   >
+   > Note this is a harsher path than the CPU-tier repro: KV crosses two machines via NIXL to an
+   > NVMe-KV target over TCP, and it exercises TP=4, so the fused addressing is validated under
+   > tensor-parallel sharding as well as at TP=1.
+   >
+   > A caveat for reproducibility: we dropped three of rocm-aic's own LMCache patches that conflict
+   > at this head (a GDS logging patch and two MP-path patches). None of them touches the in-process
+   > fused path under test.
+   >
+   > Happy to re-run after the rebase onto `dev`, or to run `repro_lmcache_fused_kv.py` from #4463
+   > directly if a 1:1 result for the table in the description would be more useful.
+
+   </details>
+
+   Deliberately does **not** claim we ran their `repro_lmcache_fused_kv.py` — we ran our own needle
+   harness, so the before/after table in the PR description cannot be filled 1:1 without running
+   their script separately.
 2. **Do not pin production to the fork branch.** `patches/0009` stays the shipping fix for now: it
    works against our pinned `LMCACHE_REF=v0.5.3`, whereas #4467 exists only on a third-party branch
    that can be force-pushed or deleted, and taking it means moving LMCache forward 143 commits and
