@@ -52,6 +52,7 @@ keeps that boundary explicit and refuses `PD_ROLE` with `MODE=mp` rather than si
 | **P+D disaggregated, two hosts** | **Verified end-to-end 2026-09-09** — 4/4 needles correct through the proxy with `need to load: 1024` on the receiver. **Requires `AIC_KV_POOL=0` on both roles**; the previously documented static default moves no KV at all while still returning correct answers. See Step 5. |
 | **P+D on a real model** | **Verified 2026-09-09** — `Qwen/Qwen2.5-72B-Instruct` at **TP=4**, 4/4 needles, `need to load: 1152` on the receiver. Needs **`AIC_CHUNK_SIZE=128`**: at the default 256 a chunk is 20 MiB against the device's 16 MiB single-value ceiling and the STORE kills the server with `NIXL_ERR_BACKEND`. Also needs `--disable-custom-all-reduce` — see "TP>1" below. |
 | Store size ceiling | **A chunk is one object, capped at the controller's max transfer size (16 MiB here).** Per rank: `layers * chunk_size * (kv_heads/TP) * head_size * 4` bytes. Every result before 2026-09-09 was TinyLlama at 5.5 MiB and never approached it, so `patches/0007`'s multipart split has **never actually carried a chunk**. |
+| `patches/0009` vs upstream | **Superseded.** The defect is upstream ([LMCache #4463]), and [LMCache #4467] fixes it more thoroughly. #4467 was **validated on MI300X 2026-09-09** — built with `patches/0009` removed, it passes both single-node store/restart/retrieve and 72B TP=4 two-host P/D. `patches/0009` ships only until #4467 merges; it is not for upstreaming. See HANDOFF OPEN-2. |
 | P+D performance | **Never measured.** No latency or throughput number has been taken through the proxy, on any model. The proxy is sequential, so a single-request timing will look like a loss. |
 | Everything else | **STAGED, NEVER RUN.** Derived from reading `ROCm/rocm-aic @ bb386562`, our own plugin/LMCache sources and `patches/` — not from an execution. |
 | Model | `Qwen/Qwen2.5-72B-Instruct` is ~145 GB in bf16 — **~36 GB/rank at TP=4, which fits comfortably on four 192 GB MI300X and does not need all eight.** (An earlier revision said TP=8 and "all 8 GPUs per node"; that was circular — it assumed TP=8 and derived the GPU count from it.) It will **not** fit a single-MI210 host. The only host with a real NVMe-KV function *is* a single MI210 — so `BACKEND=xnvme` is limited to small dense models. No `aiter`/`flash_attn` here, so **no MLA model** (DeepSeek-V2/V3, Kimi) runs at all. |
@@ -1486,3 +1487,6 @@ deploy-xnvme.sh              — bring up rocm-aic-xnvme against the real DSC on
 ### Register in `bench/tracks.registry`
 
 `rocm-aic-spdk` and `rocm-aic-xnvme` — see that file for the exact entries.
+
+[LMCache #4463]: https://github.com/LMCache/LMCache/issues/4463
+[LMCache #4467]: https://github.com/LMCache/LMCache/pull/4467

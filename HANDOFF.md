@@ -33,6 +33,7 @@ Branch `rocm-aic`, **not pushed**. The remote GPU-node tree is a plain copy kept
 | P+D under concurrency | ❌ never measured |
 | P+D latency/throughput | ❌ **no number has ever been taken through the proxy** |
 | `patches/0009` upstreamed | ❌ **don't** — superseded by LMCache PR #4467, see OPEN-2 |
+| LMCache PR #4467 on MI300X | ✅ **validated, replaces `patches/0009`** — 72B TP=4 P/D, 4/4, `need to load: 1152` |
 
 ### What is deployed
 
@@ -120,10 +121,52 @@ real KV movement from the illusion. Validating #4467 here is worth far more than
 known bug, and it is a harsher test than the one they are asking for: our path runs the fix through
 NIXL → SPDK NVMe-KV over TCP across two hosts, not just a local CPU tier.
 
-Suggested order: build an image with #4467 (head `0eaaf282`) **in place of** `patches/0009`, run the
-single-node store/restart/retrieve check and the 72B P/D needle test, and post the results table
-they left pending. **If it passes, delete `patches/0009` and the out-of-tree carry ends.** If it
-fails on ROCm, that is a finding they cannot get any other way.
+### Validation result — #4467 PASSES on MI300X (2026-09-09)
+
+Built as `rocm-aic:pr4467` from the PR head with **`patches/0009` removed**, and validated twice:
+
+| check | result |
+|---|---|
+| #4467's kernels compile under ROCm/HIP, gfx942 | ✅ `MemObjKVLayout`/`SPLIT_KV_2LTD`/`FUSED_PACKED` in the built `lmcache_native` .so |
+| TinyLlama TP=1, store → **container restart** → retrieve | ✅ needle recovered, `hit 1280, need to load: 1280` |
+| **Qwen2.5-72B, TP=4, two hosts, through the proxy** | ✅ **4/4 needles**, producer `need to load: 0`, receiver `need to load: 1152` |
+| TinyLlama control pair (still on `kv-planefix`) | ✅ 4/4 throughout, never disturbed |
+
+That is a strictly harsher test than the one being asked for upstream: it crosses two hosts through
+NIXL → SPDK NVMe-KV over TCP, not a local CPU tier, and it exercises TP=4 rather than TP=1.
+
+Note their fix and ours take **different approaches**, and theirs is the better one. Ours changed
+the LMCache side to match the engine (`kv shape (22, 1, 256, 4, 128)`). Theirs keeps the LMCache
+side split (`(22, 2, 256, 4, 64)`) and fixes the *kernel addressing*, so `kv_size = 1 if use_mla
+else 2` is still in `get_shape()` on purpose. `AIC_CHUNK_SIZE` is unaffected — total chunk bytes are
+identical, so Qwen at TP=4 still needs 128.
+
+**Reproducing the build** (the three dropped patches are rocm-aic's own, and none is on our code
+path — `03` is GDS logging, `10`/`11` are MP-path; we run in-process with SPDK-KV):
+
+```bash
+ROCM_ARCH=gfx942 SKIP_BUILD=1 bash build.sh
+cd vendor/rocm-aic
+rm -f patches/lmcache/{03-*,10-*,11-*,18-fused-kv-plane-count}.patch   # 18 = our 0009
+# add `LMCACHE_GIT_URL:` under `args:` in docker/docker-compose.yml
+env ROCM_ARCH=gfx942 IMAGE_TAG=pr4467 \
+    LMCACHE_GIT_URL=https://github.com/thegoldenflow/LMCache.git \
+    LMCACHE_REF=fix/4463-fused-cs-inprocess \
+    make build
+```
+
+`IMAGE_TAG` must be set: the Makefile derives the tag from `LMCACHE_REF`, and a branch name with a
+`/` in it produces an invalid Docker tag and fails the build immediately.
+
+### What is left
+
+1. **Post the validation to #4467.** It is the one thing blocking a PR that fixes silent corruption
+   for every vLLM 0.26+ LMCache user, and we are positioned to give it.
+2. **Do not pin production to the fork branch.** `patches/0009` stays the shipping fix for now: it
+   works against our pinned `LMCACHE_REF=v0.5.3`, whereas #4467 exists only on a third-party branch
+   that can be force-pushed or deleted, and taking it means moving LMCache forward 143 commits and
+   dropping three rocm-aic patches. **Delete `patches/0009` and bump the pin when #4467 merges** —
+   that is the exit criterion, and it is now a documented, validated switch rather than a hope.
 
 [#4463]: https://github.com/LMCache/LMCache/issues/4463
 [#4467]: https://github.com/LMCache/LMCache/pull/4467
@@ -270,9 +313,10 @@ runs inside the container as root. Consequences that cost time:
 ## The fix — `patches/0009-lmcache-fused-kv-plane-count.patch`
 
 > This is **our** fix, and it works, but it is not the one to upstream — LMCache PR #4467 fixes the
-> same defect more thoroughly and was opened a month earlier. Read this section for what the bug
-> *is*; see OPEN-2 for what to do about it. `patches/0009` should be deleted once #4467 is
-> validated here.
+> same defect more thoroughly and was opened a month earlier. **#4467 has now been validated on this
+> hardware and fully replaces this patch** (see OPEN-2). It stays only because #4467 is unmerged and
+> lives on a third-party branch; **delete it when #4467 lands.** Read this section for what the bug
+> *is*, not for what to ship.
 
 **LMCache built a 2-plane split staging destination for vLLM 0.26's 1-plane fused KV cache.** The
 copy kernel derives its source stride from that destination shape, so it read at half the correct
