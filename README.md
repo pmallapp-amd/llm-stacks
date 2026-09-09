@@ -47,6 +47,9 @@ keeps that boundary explicit and refuses `PD_ROLE` with `MODE=mp` rather than si
 | | |
 |---|---|
 | `BACKEND=spdk MODE=mp` | **Built and deployed** (2026-08-19). STORE was confirmed to silently fail past a size ceiling; fixed and validated 2026-08-25. |
+| KV correctness | **FIXED 2026-09-09.** Every chunk written before `patches/0009` was half-empty and mis-strided — LMCache built a 2-plane split staging destination for vLLM 0.26's 1-plane fused cache. Use `rocm-aic:kv-planefix` or newer; anything older stores corrupt KV. |
+| `BACKEND=spdk MODE=inprocess`, single node | **Verified 2026-09-09.** Store, restart, read back: needle recovered with `need to load: 1024`. Retrieval is 2.40x faster than recompute at c=1 (TinyLlama). |
+| **P+D disaggregated, two hosts** | **Verified end-to-end 2026-09-09** — 4/4 needles correct through the proxy with `need to load: 1024` on the receiver. **Requires `AIC_KV_POOL=0` on both roles**; the previously documented static default moves no KV at all while still returning correct answers. See Step 5. |
 | Everything else | **STAGED, NEVER RUN.** Derived from reading `ROCm/rocm-aic @ bb386562`, our own plugin/LMCache sources and `patches/` — not from an execution. |
 | Model | `Qwen/Qwen2.5-72B-Instruct` needs 8×MI300X (TP=8) and will **not** fit a single-MI210 host. The only host with a real NVMe-KV function *is* a single MI210 — so `BACKEND=xnvme` is limited to small dense models. No `aiter`/`flash_attn` here, so **no MLA model** (DeepSeek-V2/V3, Kimi) runs at all. |
 | Hostnames | Placeholders throughout (`<SETUP2_PD_NODE_IP>`, `<token>`), including in script defaults. Supply real values via the environment variables each script documents. |
@@ -212,13 +215,33 @@ sudo HF_HOME=/var/tmp/hf HF_TOKEN=none \
   MODE=inprocess PD_ROLE=producer \
   MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0 MAX_MODEL_LEN=2048 \
   TENSOR_PARALLEL_SIZE=1 GPU=0 \
-  AIC_SPDK_KV_SLOT_OFFSET=0 \
+  AIC_KV_POOL=0 \
   AIC_SPDK_KV_TRID="trtype:TCP adrfam:IPv4 traddr:$TARGET trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0" \
   bash deploy.sh
 ```
 
 **Expect:** a `deploy: rocm-aic inprocess / SPDK_NVMe_KV` banner, then a health check that passes
 within about two minutes. The container is named `aic-spdk-producer`.
+
+> ### `AIC_KV_POOL=0` is mandatory for P/D, and this page used to say otherwise
+>
+> Verified end-to-end 2026-09-09. `AIC_KV_POOL=0` selects `NixlDynamicStorageBackend`, whose
+> object names are **content-derived**, so the receiver on another host derives the *same* key for
+> the same tokens and the handoff works.
+>
+> The default (`2000000`) selects `NixlStaticStorageBackend`, whose names carry a **per-process
+> `uuid4`** (`nixl_storage_backend.py:383`). The receiver therefore cannot derive the producer's
+> keys, and **no KV is transferred at all**. This was measured, not inferred: with the static
+> backend the receiver reports
+>
+> ```
+> Total tokens 1089, Inference Engine computed tokens: 0, LMCache hit tokens: 0, need to load: 0
+> ```
+>
+> — it silently re-prefills the whole prompt. **The answer still comes back correct**, which is
+> exactly what makes this dangerous: the deployment looks healthy and disaggregation is doing
+> nothing. Earlier revisions of this walkthrough prescribed the static default, so a P/D pair built
+> from them was never actually moving KV.
 
 Three arguments people get wrong:
 
@@ -242,15 +265,20 @@ sudo HF_HOME=/var/tmp/hf HF_TOKEN=none \
   MODE=inprocess PD_ROLE=receiver \
   MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0 MAX_MODEL_LEN=2048 \
   TENSOR_PARALLEL_SIZE=1 GPU=0 \
-  AIC_SPDK_KV_SLOT_OFFSET=2000000 \
+  AIC_KV_POOL=0 \
   AIC_SPDK_KV_TRID="trtype:TCP adrfam:IPv4 traddr:$TARGET trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0" \
   bash deploy.sh
 ```
 
-> **`AIC_SPDK_KV_SLOT_OFFSET` must differ between the two roles.** Both instances share one
-> namespace on one target. Identical offsets mean they write to the same keys, silently corrupting
-> each other's cache — no error, just wrong answers. Producer `0` / receiver `2000000` matches the
-> default pool size of 2,000,000, so the two key ranges sit end to end without overlapping.
+> **Do not set `AIC_SPDK_KV_SLOT_OFFSET` differently between the roles for this path.** Earlier
+> revisions told you to (producer `0` / receiver `2000000`). That advice is inherited from the
+> `devId` key derivation, and it is **inert here**: `make_key()` derives the key from the caller's
+> `metaInfo` and ignores `devId` entirely whenever `metaInfo` is set, which LMCache always does in
+> OBJ mode (`plugins/nvme-kv/spdk_nvme_kv_backend.h`, `make_key`). The offset still matters for
+> `metaInfo`-less callers such as `kv_io.py` and `nixlbench`.
+>
+> For P/D the two roles must address the **same** key space — that is the whole point of the
+> handoff — so leave the offset alone and let the content-derived names line up.
 
 Both roles must also use the same `MODEL` and the same `TENSOR_PARALLEL_SIZE`. The KV chunk layout
 depends on the TP degree, so a mismatch makes the stored cache unreadable to the other side.
@@ -359,9 +387,23 @@ and any benchmark you run is measuring plain vLLM.
 Then confirm the decode side is really *reading* rather than quietly re-prefilling:
 
 ```bash
-ssh $PREFILL 'docker logs aic-spdk-producer 2>&1 | grep -E "Created backend:|Stored"'
-ssh $DECODE  'docker logs aic-spdk-receiver 2>&1 | grep -E "Created backend:|Retrieved|need to load: [1-9]"'
+ssh $PREFILL 'docker logs aic-spdk-producer 2>&1 | grep -E "Created backend:|need to load"'
+ssh $DECODE  'docker logs aic-spdk-receiver 2>&1 | grep -E "Created backend:|need to load"'
 ```
+
+**This is the check that decides whether you have disaggregation or an expensive illusion.** A
+working pair looks like this — the producer stores, the receiver loads:
+
+```
+producer: Created backend: NixlStorageBackend (NixlDynamicStorageBackend)
+producer: Total tokens 1091, ... LMCache hit tokens: 0,    need to load: 0
+receiver: Created backend: NixlStorageBackend (NixlDynamicStorageBackend)
+receiver: Total tokens 1091, ... LMCache hit tokens: 1024, need to load: 1024
+```
+
+`need to load: 0` on the **receiver** means no KV crossed — it re-prefilled. **The answer will
+still be correct**, so you cannot detect this from the output. If you see
+`NixlStaticStorageBackend` on either side, that is the cause; see Step 5.
 
 If the decode side errors on a location name, set `LMCACHE_STORE_LOCATION` /
 `LMCACHE_RETRIEVE_LOCATIONS` to exactly what `Created backend:` printed, rather than guessing.
@@ -555,11 +597,16 @@ MODE=inprocess HF_TOKEN=<token> MAX_MODEL_LEN=2048 TENSOR_PARALLEL_SIZE=1 GPU=0 
 
 ```bash
 # P+D disaggregated — one host per role, both against the SAME target.
-# AIC_SPDK_KV_SLOT_OFFSET MUST differ between the roles: they share one
-# namespace, and identical offsets cause silent cross-instance key collision.
-MODE=inprocess PD_ROLE=producer AIC_SPDK_KV_SLOT_OFFSET=0 \
+# AIC_KV_POOL=0 on BOTH roles is mandatory: it selects the dynamic backend,
+# whose object names are content-derived, so the receiver derives the same key
+# the producer stored under. The default static backend names carry a
+# per-process uuid4, so the receiver silently re-prefills and NO KV moves —
+# and the answers still come back correct, so nothing looks wrong. Verified
+# end-to-end 2026-09-09; do NOT vary AIC_SPDK_KV_SLOT_OFFSET here, it is inert
+# on the metaInfo key path and the roles must share one key space.
+MODE=inprocess PD_ROLE=producer AIC_KV_POOL=0 \
   MODEL=Qwen/Qwen2.5-72B-Instruct TENSOR_PARALLEL_SIZE=8 HF_TOKEN=<token> bash deploy.sh
-MODE=inprocess PD_ROLE=receiver AIC_SPDK_KV_SLOT_OFFSET=2000000 \
+MODE=inprocess PD_ROLE=receiver AIC_KV_POOL=0 \
   MODEL=Qwen/Qwen2.5-72B-Instruct TENSOR_PARALLEL_SIZE=8 HF_TOKEN=<token> bash deploy.sh
 ```
 

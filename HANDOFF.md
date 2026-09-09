@@ -201,6 +201,57 @@ AIC_SPDK_KV_TRID="<trid>" bash deploy.sh
 
 ---
 
+## P+D disaggregation — WORKS, and the documented recipe did not
+
+Run end to end 2026-09-09 across two physical hosts, KV handed off through the shared SPDK NVMe-KV
+target. Producer on `<SETUP3_PREFILL_NODE>` GPU 1 :8301, receiver on `<SETUP3_DECODE_NODE>` GPU 0
+:8301, `proxy.py` on :9000, all on `rocm-aic:kv-planefix`.
+
+Four distinct needles through the proxy, 4/4 correct, and the split is exactly what disaggregation
+should look like:
+
+```
+producer:  Total tokens 1091, computed 0, LMCache hit tokens: 0,    need to load: 0      <- stores
+receiver:  Total tokens 1091, computed 0, LMCache hit tokens: 1024, need to load: 1024   <- loads
+```
+
+Zero errors, zero plane-count-guard fires.
+
+### The documented procedure produced a P/D pair that moved no KV
+
+This is the part worth carrying forward. README Steps 5-6 prescribed the **static** backend (the
+`AIC_KV_POOL` default of 2000000) with *differing* `AIC_SPDK_KV_SLOT_OFFSET` per role. That was
+deployed exactly as written and measured:
+
+```
+receiver: Total tokens 1089, computed 0, LMCache hit tokens: 0, need to load: 0
+```
+
+**No KV transferred. The receiver silently re-prefilled the entire prompt — and still returned the
+correct needle.** Nothing in the response, the health check, or the deploy banner indicates
+anything is wrong. A P/D pair built from the old instructions was an expensive illusion.
+
+Two independent reasons, both now in the README:
+
+- `NixlStaticStorageBackend` names objects `obj_{i}_{uuid4()}` (`nixl_storage_backend.py:383`) — a
+  fresh uuid per process. The receiver cannot derive the producer's keys, so the lookup always
+  misses. Only `AIC_KV_POOL=0` (`NixlDynamicStorageBackend`) gives content-derived names, which is
+  what makes a cross-host handoff possible at all.
+- The slot-offset advice is **inert on this path**: `make_key()` derives the key from `metaInfo`
+  and ignores `devId` whenever `metaInfo` is set, which LMCache always does in OBJ mode. It still
+  applies to `metaInfo`-less callers (`kv_io.py`, `nixlbench`). Worse, taken literally it points
+  the two roles at *different* key spaces, which is the opposite of what a handoff needs.
+
+The correct configuration is `AIC_KV_POOL=0` on **both** roles, offsets left alone.
+
+### The check that distinguishes the two
+
+`need to load` on the **receiver**, nothing else. Output correctness cannot tell them apart — both
+configurations answer correctly. This is the same class of trap as the static-backend benchmark
+that measured recomputation, and it caught this project twice.
+
+---
+
 ## The first valid KV-path benchmark
 
 Full result and provenance: `kv-bench/results/<prefill-host>/2026-09-09-kv-spillover-probe/RESULT.md`
@@ -400,10 +451,16 @@ needle `victor tango`) and `/var/tmp/v3req.json`.
 
 ## NEXT ACTION
 
-**P+D is the only major thing left.** The KV path now has a valid measurement (below).
+**P+D now works end to end** (below). What is left is scale and upstreaming.
 
-Disaggregation has still never been run end-to-end here. The defect that blocked it is gone, but
-expect it to have its own problems; do not read "gather fixed" as "P+D works".
+1. **Run P+D on a real model.** Everything so far is TinyLlama-1.1B, whose prefill is cheap enough
+   that disaggregation cannot pay for itself. The pair is proven correct; it has not been shown to
+   be *worth it*. Both roles must keep the same `MODEL` and `TENSOR_PARALLEL_SIZE` — the chunk
+   layout depends on TP, so a mismatch makes the stored cache unreadable to the other side.
+2. **Measure P+D, don't just run it.** No latency/throughput number has been taken through the
+   proxy. Note the proxy is sequential — prefill (`max_tokens=1`, discarded) then decode — so
+   end-to-end latency is both legs; the win has to come from freeing the decode host from prefill,
+   which needs a concurrent workload to show up at all.
 
 Smaller follow-ups, in rough priority order:
 
@@ -631,7 +688,23 @@ All five verified against live container state under `set -euo pipefail`.
 |---|---|---|
 | `<SETUP3_PREFILL_NODE>` | patched host | **`aic-spdk-planefix` :8303, `rocm-aic:kv-planefix`, dynamic backend, GPU 0** — the fix baked in, deployed by `deploy.sh`, acceptance-tested. Uses its **own** config `lmcache-planefix-spdk.yaml`, so it no longer shares a file with the decode node. The old `aic-spdk-single` diagnosis container was removed (its `docker cp` patch is now in the image). `aic-spdk-static` :8304 stays torn down; GPU 1 free. |
 | `<SETUP3_DECODE_NODE>` | decode | **`aic-spdk-single` :8302, `rocm-aic:kv-planefix`, static, GPU 1 — redeployed 2026-09-09.** Now on the fix (`kv shape: (22, 1, 256, 4, 128)`) and on host-local `AIC_RUNTIME_DIR`. Config preserved as `nixl_pool_size: 2000000`, so it is still `NixlStaticStorageBackend` and still cannot read across a restart — that is structural, not something this patch changes. Before the redeploy it was restarted from its old image and came back identically (`2000000` / static), which is the proof the earlier config repair held. |
-| `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds a mix**: everything written before the fix is poisoned; the two verification runs are correct. Clear it before benchmarking. |
+| `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds a mix**: everything written before the fix is poisoned; everything after is correct. Clear it when convenient. |
+
+Also running, the P+D pair (both `rocm-aic:kv-planefix`, both `AIC_KV_POOL=0`,
+`--no-enable-prefix-caching`):
+
+| | |
+|---|---|
+| `aic-spdk-producer` | `<SETUP3_PREFILL_NODE>` :8301, GPU 1, `store_location` only |
+| `aic-spdk-receiver` | `<SETUP3_DECODE_NODE>` :8301, GPU 0, `retrieve_locations` only |
+| `proxy.py` | `<SETUP3_PREFILL_NODE>` :9000, started from `/var/tmp/start_pd_proxy.sh` |
+
+The two single-node instances (`aic-spdk-planefix` :8303, `aic-spdk-single` :8302) are untouched and
+still running alongside them, on different GPUs and ports.
+
+**When restarting the proxy, do not `pkill -f "proxy.py --host"`** — that pattern matches your own
+SSH command string and kills the shell you are typing in. It happened here. Match `"[p]roxy"` or
+use the wrapper script.
 
 Target-reported limits, from the plugin's own startup line:
 `device KV format 0: value_max=67108864 key_max=16, ctrlr max_xfer=16777216 -> effective=16777216`
