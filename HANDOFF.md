@@ -141,6 +141,32 @@ earlier note called `use_gpu_connector_v3` a landmine. Under #4467 it stores, su
 reads back, on the fused format (`EngineKVFormat.NL_X_NB_BS_NH_CS`). Both in-process connectors are
 fixed, not just V2.
 
+### #4463's own repro script, before and after, on the same GPU
+
+The upstream table could not be filled from our needle harness, so we ran **their**
+`repro_lmcache_fused_kv.py` (Qwen3-8B, `chunk_size 256`, `local_cpu`, prefix caching off) on one
+MI300X, varying only the image:
+
+| image | fix present | mode | offload verified | MATCH | exit |
+|---|---|---|---|---|---|
+| `kv-query-final` | **none** | `lmcache` | LMCache loaded 528.5 MB in 14 chunks | ❌ **False** | 1 |
+| `pr4467` | **#4467** | `lmcache` | LMCache loaded 528.5 MB in 14 chunks | ✅ **True** | 0 |
+| `kv-planefix` | ours (`0009`) | `lmcache` | LMCache loaded 528.5 MB in 14 chunks | ✅ True | 0 |
+| `pr4467` | #4467 | `vllm-offload` | vLLM loaded 14 chunks from its CPU tier | ✅ True | 0 |
+| `pr4467` | #4467 | `baseline` | n/a — no offload tier | ✅ True | 0 |
+
+Two things make this worth more than a bare pass:
+
+- **The bug reproduces on ROCm identically to the CUDA report.** `528.5 MB in 14 chunks` is
+  byte-for-byte the figure in #4463. This was never a platform-specific defect.
+- **The offload volume is unchanged across all three images.** Same MB, same chunk count, only
+  `MATCH` flips. The fix corrects the data; it does not quietly stop offloading — which is the
+  failure mode that would otherwise make a green run meaningless. The script asserts a transfer
+  happened for exactly this reason.
+
+`lmcache-mp` was **not run** — it needs a separate MP server process, and #4463 already establishes
+the MP connector is unaffected.
+
 Test suites were run from the PR's own tree mounted into the image:
 
 ```bash
@@ -216,6 +242,24 @@ env ROCM_ARCH=gfx942 IMAGE_TAG=pr4467 \
    > `torch.cuda.is_available() == True` on an `AMD Instinct MI300X`, so the 97 `cuda` cases
    > exercised the compiled HIP kernels rather than silently degrading to the CPU reference.
    >
+   > **Your `repro_lmcache_fused_kv.py` from #4463, before and after on the same GPU** — varying
+   > only the image, so the `after` column of the table in the description:
+   >
+   > | build | mode | offload verified | MATCH | exit |
+   > |---|---|---|---|---|
+   > | no fix | `lmcache` | LMCache loaded 528.5 MB in 14 chunks | **False** | 1 |
+   > | **#4467** | `lmcache` | LMCache loaded 528.5 MB in 14 chunks | **True** | 0 |
+   > | #4467 | `vllm-offload` | vLLM loaded 14 chunks from its CPU tier | True | 0 |
+   > | #4467 | `baseline` | n/a | True | 0 |
+   >
+   > Two things worth noting. The bug reproduces on ROCm with **exactly** the numbers reported on
+   > CUDA — `528.5 MB in 14 chunks` — so this was never platform-specific. And the offload volume is
+   > identical before and after, with only `MATCH` flipping, so the fix corrects the data rather
+   > than quietly suppressing the offload.
+   >
+   > `lmcache-mp` not run (needs the separate MP server, and the issue already establishes MP is
+   > unaffected).
+   >
    > **End-to-end, in-process, against an NVMe-KV storage backend:**
    >
    > - **V2** — TinyLlama-1.1B, TP=1. Store → full container restart → retrieve: needle recovered,
@@ -235,8 +279,7 @@ env ROCM_ARCH=gfx942 IMAGE_TAG=pr4467 \
    > at this head (a GDS logging patch and two MP-path patches). None of them touches the in-process
    > fused path under test.
    >
-   > Happy to re-run after the rebase onto `dev`, or to run `repro_lmcache_fused_kv.py` from #4463
-   > directly if a 1:1 result for the table in the description would be more useful.
+   > Happy to re-run any of this after the rebase onto `dev`.
 
    </details>
 
