@@ -1,13 +1,17 @@
-# HANDOFF — 2026-09-09 (third pass)
+# HANDOFF — 2026-09-09 (fourth pass)
 
-The second pass's NEXT ACTION has been carried out. `use_gpu_connector_v3: True` **does not fix
-the gather** — it is accepted, the V3 connector really is dispatched, and the destination is still
-2-plane. The root cause identified in the second pass stands unchanged; what has moved is that the
-cheap escape hatch is now closed and the fix must be a patch. The decode node's config mismatch has
-been repaired.
+**The KV corruption is fixed.** A ≥800-word prompt is stored, the container restarted, and the
+prompt's needle recovered correctly from the NVMe KV target with `need to load` non-zero — twice,
+with different needles. As far as this repo's records go that is the **first correct cross-process
+KV read this stack has ever performed**; every chunk before it was half-empty.
 
-The root-cause analysis below (second pass) is unchanged and still correct; the measurement that
-produced it is reproducible from the instrumentation now in the tree.
+The fix is `patches/0009-lmcache-fused-kv-plane-count.patch`. `use_gpu_connector_v3: True` was
+tried first, per the previous NEXT ACTION, and does not work — that finding is kept below because
+it rules out the cheap option.
+
+Two corrections to earlier passes are recorded below and both matter more than they look:
+the shape's real origin is **not** `integration/vllm/utils.py:278`, and the deploy.sh config
+clobbering is **not** a co-residency problem — it is an **NFS-shared config file**.
 
 **Hostnames are placeholders here**, per this repo's convention. Real IPs, credentials and BMC
 addresses are in `lab/lab-inventory.local.md` (gitignored, never committed). Read that first.
@@ -38,12 +42,148 @@ taken against it does not measure the KV path.
 | NVMe KV target (store + retrieve) | ✅ correct — full length, exact `cdw0`, no truncation |
 | NIXL plugin descriptors / keys | ✅ correct — counts, lengths, and derived keys all match |
 | LMCache page mapping (store↔read) | ✅ correct — page md5s identical byte-for-byte across processes |
-| **GPU → staging gather (store side)** | ❌ **root cause — 2-plane destination for a 1-plane fused cache** |
-| Static backend read path | ⚠️ **never exercised** — cannot hit across a restart by construction |
-| `use_gpu_connector_v3: True` as a fix | ❌ **tried, does not work** — V3 dispatches, shape stays 2-plane (init-order) |
-| Decode node config mismatch | ✅ **repaired** — file now describes the live process; nothing restarted |
-| Data already on the target | ❌ **poisoned** — every chunk ever stored is half-empty; a correct reader still returns garbage |
-| P+D disaggregation | ❌ still blocked, but on the defect above, not on anything in this repo |
+| **GPU → staging gather (store side)** | ✅ **FIXED** by `patches/0009-…` — destination is now 1-plane `[1, 22, 256, 512]` |
+| **End-to-end cross-process KV read** | ✅ **verified twice** — needle recovered, `need to load: 1024` |
+| Static backend read path | ⚠️ **still never exercised** — cannot hit across a restart by construction |
+| `use_gpu_connector_v3: True` as a fix | ❌ tried, does not work — V3 dispatches, shape stays 2-plane (init-order) |
+| Decode node config mismatch | ✅ repaired — but see the NFS finding; it is one shared file |
+| Data written **before** the fix | ❌ **poisoned** — half-empty; a correct reader returns garbage from it |
+| P+D disaggregation | ⚠️ unblocked in principle — the defect that blocked it is gone, but P+D itself is untested |
+
+---
+
+## The fix — `patches/0009-lmcache-fused-kv-plane-count.patch`
+
+### Correction: the shape's origin is not where the last handoff said
+
+The previous pass named `integration/vllm/utils.py:278`. That line is real, but it lives in
+`create_lmcache_metadata()`, whose **only** caller is `vllm_ec_adapter.py:103` — the EC adapter,
+which this deployment does not use. Patching it changes nothing here; a probe inserted there never
+fired.
+
+The live path is `VllmServiceFactory.get_or_create_metadata()`,
+**`integration/vllm/vllm_service_factory.py:103-109`**, which builds the same hardcoded tuple. Its
+effect is visible in the server's own startup line:
+
+```
+num_layer: 22, chunk_size: 256, num_kv_head (per gpu): 4, head_size: 64,
+hidden_dim (D) for KV (per gpu): 256, use mla: False, kv shape: (22, 2, 256, 4, 64)
+```
+
+`kv_shape` feeds `LMCacheMetadata`, and from there **both** consumers that decide the layout: the
+staging allocator and the dynamic backend's read layout. Fixing it in one place fixes all of them,
+which is why this is the right seam.
+
+### What the patch does
+
+`kv_shape` is built before any KV tensor exists, so the runtime format detector cannot be consulted
+— that constraint is real and is what defeated v3. But vLLM's **attention backend** can answer at
+init, and authoritatively: `get_kv_cache_shape()` returns exactly the tensor it will go on to
+allocate. So the patch asks it:
+
+```
+rocm-aic: attention backend TRITON_ATTN reports kv_cache_shape=(8, 4, 16, 128)
+  -> kv_plane_count=1, per_head_width=128 (the unpatched assumption would have been (2, 64))
+```
+
+- rank 4 → fused, K and V packed in the trailing axis (`2 * head_size` = 128) → `kv_size=1`
+- rank 5 with a leading 2 → split → `kv_size=2`, unchanged behaviour
+- rank 3 → MLA → `kv_size=1`
+- anything else, or any failure to reach the backend → falls back to the old assumption with a
+  warning, so a future vLLM that moves this API degrades instead of failing to boot
+
+The query runs inside `set_current_vllm_config(...)`. Without it `get_attn_backend` raises in the
+**scheduler** role (measured) and only succeeds in the worker — which would have left the two halves
+of one deployment silently disagreeing about the layout. That is the same class of bug as the one
+being fixed, so it is worth not reintroducing.
+
+`kv_size` is then carried through `metadata.kv_shape[1]` into
+`VLLMPagedMemGPUConnectorV2.__init__`, and `get_shape()` uses it instead of recomputing
+`1 if use_mla else 2`. `hidden_dim_size` comes from `kv_shape[4]`, which is now the true per-head
+width, so both fused and split stay correct.
+
+Finally, `_initialize_pointers()` **cross-checks** the assumption against the real tensors the
+first moment they exist, and raises if they disagree:
+
+```python
+detected_kv_size = get_kv_size(kv_caches, self.engine_kv_format)
+if detected_kv_size != self.kv_size:
+    raise RuntimeError(...)
+```
+
+This matters because a mismatch is otherwise undetectable — the byte totals are equal either way,
+nothing downstream complains, and the only symptom is silently corrupt KV. On this stack the check
+**passes**, which is independent confirmation from the runtime detector that `kv_size=1` is right.
+
+### Verification
+
+All three consumers now agree, where before only the allocator was visible and it read `2`:
+
+```
+rocm-aic: attention backend TRITON_ATTN ... -> kv_plane_count=1, per_head_width=128
+kv shape: (22, 1, 256, 4, 128)
+Paged tensor memory allocator initialized, shapes: [torch.Size([1, 22, 256, 512])] ... align bytes: 5767168
+Initialized nixl object backend metadata: shape: torch.Size([1, 22, 256, 512]) ... fmt: MemoryFormat.KV_2LTD
+```
+
+`align bytes` is unchanged at 5,767,168 — the same total, re-shaped, which is exactly why this was
+invisible for so long.
+
+End-to-end, on the dynamic backend, with **fresh keys** (the target's older data is poisoned):
+
+| run | needle | cold store | after restart | accounting on the read |
+|---|---|---|---|---|
+| 1 | `sierra papa` | ✅ correct | ✅ **`sierra papa`** | `computed 0, hit 1024, need to load: 1024` |
+| 2 | `quebec romeo` | ✅ correct | ✅ **`quebec romeo`** | `need to load: 1024` |
+
+`need to load: 1024` is the number that matters — a genuine cross-process read, not a prefix-cache
+hit and not a cold recompute. Reproduce with `/var/tmp/fix_test.txt` and `/var/tmp/fix2.txt` on the
+prefill node.
+
+The patch is applied **in the running container only** (`docker cp`), not baked into any image. It
+survives `docker restart` but **not** a container recreate — a `deploy.sh` run reverts it until the
+image is rebuilt.
+
+---
+
+## ⚠️ The config file is NFS-shared across every node — one file, not one per node
+
+Found while repairing the decode node, and it re-frames the `deploy.sh` bug recorded further down.
+
+The lab home directory is an NFS mount (`<NFS_SERVER>:<LAB_HOME>`) shared by all Setup-3 hosts. The config
+path is inside it, and `deploy.sh` derives it as
+`CONFIG_FILE="${CONFIG_DIR}/lmcache-${INSTANCE}-${BACKEND}.yaml"` (`deploy.sh:1278`) with
+`INSTANCE` defaulting to `${PD_ROLE:-single}`. Both the prefill and decode nodes therefore resolve
+to the **same file, same inode**:
+
+```
+prefill: inode=2592618328   decode: inode=2592618328   (identical md5)
+```
+
+So this was never a co-residency problem. **Any deploy on any node clobbers the mounted config of
+every other node using the same `INSTANCE`** — which is precisely how the decode node ended up
+describing `nixl_pool_size: 0` while running `2000000`, and why its bind mount reads
+`Stale file handle` (the inode was replaced underneath it).
+
+The `INSTANCE` fix in `610067d` is still correct and still worth having, but it only separates
+deployments that are given *different* `INSTANCE` values. Two nodes both defaulting to `single`
+still collide, silently, across hosts.
+
+**This bit during this session**: repairing the decode node's `nixl_pool_size` to `2000000` also
+flipped the prefill node to the static backend on its next restart. It had to be temporarily set
+back to `0` to finish testing, then restored.
+
+**Current state — deliberately chosen, and a trap if you forget it.** The shared file reads
+`nixl_pool_size: 2000000`, which is correct for the decode node (the long-lived reference instance,
+still untouched at 27 h). The **prefill** container is running the *dynamic* backend from the
+config it loaded when the file still said `0`. Its file therefore no longer describes it, and a
+restart will bring it up **static**. That is tolerable only because the prefill node is the scratch
+diagnosis host and it is written down here.
+
+**Recommended durable fix (not done — needs a decision):** a bind-mounted runtime config must not
+live on a shared filesystem. Either point `CONFIG_DIR` at a host-local path such as
+`/var/tmp/aic/pd-configs`, or fold `$(hostname -s)` into the filename. The first is cleaner; both
+are a change to `deploy.sh` beyond the scope of this pass, so it is flagged rather than applied.
 
 ---
 
@@ -109,35 +249,44 @@ needle `victor tango`) and `/var/tmp/v3req.json`.
 
 ## NEXT ACTION
 
-**Patch the shape at its origin — `integration/vllm/utils.py:278` — and carry it in `patches/`.**
-There is no config-only route left.
+**Rebuild the image with `patches/0009-…` in it, then re-run the benchmark — the existing numbers
+do not measure the KV path.**
 
-```python
-kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)
-```
+In order:
 
-This runs at engine init, before the KV tensors exist, so it cannot *detect* the fused layout — it
-has to be told. For vLLM 0.26 on this stack the correct value is `kv_size = 1` with per-token width
-`num_kv_head * 2 * head_size = 512`, which is what `NL_X_NB_BS_NH_CS_Spec.kv_size()` already returns
-once tensors exist. Patch `VLLMPagedMemGPUConnectorV2.get_shape()` (`gpu_connectors.py:416-418`) to
-match, so the allocator, the backend metadata and the gather all agree on one plane.
+1. **Bake the patch in.** It currently exists only as `docker cp` into one running container and
+   dies on the next container recreate. `ROCM_ARCH=<arch> bash build.sh` picks it up automatically
+   (`build.sh` globs `*-lmcache-*.patch`; this one stages as `patches/lmcache/18-…`). ~90 minutes.
+2. **Purge the target.** Every chunk written before this fix is half-empty, and a now-correct
+   reader will happily return that garbage. The RAM-backed `bdev_kvmalloc` target clears on
+   restart. Until it is cleared, only ever test with fresh keys — and remember keys are
+   **prefix**-derived, so the change must be at the *start* of the prompt.
+3. **Re-benchmark.** The recorded static-backend benchmark measured recomputation, not retrieval
+   (see the correction below), so there is no valid baseline yet. Take one on the dynamic backend,
+   where reads demonstrably happen.
+4. **Then P+D.** The defect that blocked it is gone, but disaggregation itself has still never been
+   run end-to-end on this stack. Expect to find its own problems; do not read "gather fixed" as
+   "P+D works".
 
-Do it under V2 and leave `use_gpu_connector_v3` at its default — v3 buys nothing here and adds the
-`store_layer` landmine above.
+Decide separately on the **NFS config-sharing** issue above — it will keep producing
+config-vs-live mismatches until a deploy writes somewhere host-local.
 
-Verify with the protocol in the table above: the post-restart read must return `victor tango` with
-`need to load` non-zero. The gather being correct is necessary but not sufficient — **every chunk
-currently on the target was written half-empty and must be treated as poisoned**; clear it or use
-fresh keys, or a correct reader will still return garbage from old data.
+Two things worth carrying forward regardless:
 
-**Do not rebuild the image to test this.** Patch the Python in place:
+- **`use_layerwise` is now a landmine.** `VLLMPagedMemGPUConnectorV3.get_shape()` is
+  `raise NotImplementedError` and `store_layer` (`cache_engine.py:683`) is its only caller. Enabling
+  layerwise with v3 will hit it immediately.
+- **The static backend still cannot read across a restart** — unchanged by this patch, and
+  structural (fresh `uuid4` per process in its key derivation). It is still not a control.
+
+**Do not rebuild the image just to iterate.** Patch Python in place while experimenting:
 
 ```bash
-docker cp <file> aic-spdk-single:/usr/local/lib/python3.12/dist-packages/lmcache/v1/...
-docker restart aic-spdk-single      # ~80s to ready
+docker cp <file> aic-spdk-single:/usr/local/lib/python3.12/dist-packages/lmcache/...
+docker restart aic-spdk-single      # ~80-90s to ready
 ```
 
-Seconds, not the ~90 minutes a full image build costs.
+Seconds, not the ~90 minutes a full image build costs. Rebuild only to make it durable.
 
 ---
 
@@ -305,9 +454,9 @@ All five verified against live container state under `set -euo pipefail`.
 
 | Node (placeholder) | Role | State |
 |---|---|---|
-| `<SETUP3_PREFILL_NODE>` | diagnosis host | `aic-spdk-single` :8303 (dynamic, GPU 0), `rocm-aic:kv-dbg2`. Restored to its exact pre-v3-trial state: config byte-identical, container Python pristine, `use_gpu_connector_v3` back to `False`. The static control `aic-spdk-static` :8304 stays torn down; GPU 1 is free. |
-| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — process still **untouched** (not restarted). Its on-disk config was repaired to match it, see above. |
-| `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds poisoned data** — every chunk stored by any backend so far is half-empty and mis-strided. |
+| `<SETUP3_PREFILL_NODE>` | diagnosis host | `aic-spdk-single` :8303, `rocm-aic:kv-dbg2`, **running the 0009 patch via `docker cp`** (survives restart, lost on recreate). Currently on the **dynamic** backend from an in-memory config; the shared file now says `2000000`, so a restart brings it up **static** — see the NFS section. `use_gpu_connector_v3` is back to `False` and the v3 probe was reverted. `aic-spdk-static` :8304 stays torn down; GPU 1 free. |
+| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — process still **untouched** (27 h, never restarted). Config repaired to match it. Runs **unpatched** LMCache. |
+| `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds a mix**: everything written before the fix is poisoned; the two verification runs are correct. Clear it before benchmarking. |
 
 Target-reported limits, from the plugin's own startup line:
 `device KV format 0: value_max=67108864 key_max=16, ctrlr max_xfer=16777216 -> effective=16777216`
