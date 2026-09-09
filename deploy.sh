@@ -152,6 +152,15 @@
 #                              by default because it hands off no KV at all while
 #                              still returning correct answers — see the check at
 #                              the AIC_KV_POOL assignment.
+#   AIC_CHUNK_SIZE=<n>         LMCache chunk_size (unset -> LMCache's 256). One
+#                              chunk is one stored object and the SPDK-KV device
+#                              caps a single value at 16 MiB, so this bounds
+#                              which (model, TP) pairs can store at all:
+#                                layers * n * (kv_heads/TP) * head_size * 4 bytes
+#                              Qwen2.5-72B at TP=4 needs n=128 (20 MiB -> 10 MiB);
+#                              at 256 the STORE dies with NIXL_ERR_BACKEND and
+#                              takes vLLM with it. Must MATCH across P/D roles —
+#                              it is part of the key. See the assignment below.
 #   INSTANCE=<name>            In-process mode: this deployment's identity.
 #                              Defaults to PD_ROLE, else "single", so existing
 #                              names are unchanged. It determines the container
@@ -1340,6 +1349,25 @@ else
     HF_OVERRIDES=${HF_OVERRIDES:-}
     AIC_SPDK_KV_SLOT_OFFSET=${AIC_SPDK_KV_SLOT_OFFSET:-0}
     AIC_NIXL_STAGING_GB=${AIC_NIXL_STAGING_GB:-8}
+    # LMCache chunk_size. Empty = leave it unset and let LMCache default to 256.
+    #
+    # This is a STORAGE-CEILING knob, not a tuning knob. One chunk is stored as
+    # ONE object, and the SPDK-KV device caps a single value at the controller's
+    # max transfer size — 16 MiB on this target, logged at startup as
+    #   [SPDK_NVMe_KV] device KV format 0: ... -> effective=16777216
+    # A chunk larger than that fails the STORE with NIXL_ERR_BACKEND, which
+    # takes the whole vLLM server down rather than degrading. Per-rank bytes:
+    #
+    #   layers * chunk_size * (kv_heads / TP) * head_size * 2(K,V) * 2(bf16)
+    #
+    # TinyLlama TP=1 is 5.5 MiB and never approached it. Qwen2.5-72B TP=4 is
+    # 20 MiB at chunk_size 256 and DOES NOT FIT — measured 2026-09-09, it is
+    # what NIXL_ERR_BACKEND on this path means. chunk_size 128 halves it to
+    # 10 MiB. Note that raising TP also lowers it (fewer kv_heads per rank).
+    #
+    # It is part of the cache key, so BOTH P/D roles must use the SAME value or
+    # the receiver derives different keys and silently re-prefills.
+    AIC_CHUNK_SIZE=${AIC_CHUNK_SIZE:-}
     # Every per-deployment path and name hangs off INSTANCE. Defaulting it to
     # PD_ROLE (or "single") keeps every existing name byte-identical, so this
     # is not a rename — it is the knob that lets a SECOND in-process deployment
@@ -1516,12 +1544,18 @@ retrieve_locations: ["NixlStorageBackend"]' ;;
         BACKEND_PARAMS=$(printf '    dev_uri: "%s"' "${AIC_XNVME_DEV}")
     fi
 
+    # Emitted only when set, so an unset AIC_CHUNK_SIZE leaves the generated
+    # config byte-identical to every one written before this knob existed.
+    CHUNK_SIZE_LINE=""
+    [ -n "${AIC_CHUNK_SIZE}" ] && CHUNK_SIZE_LINE="chunk_size: ${AIC_CHUNK_SIZE}"
+
     cat > "${CONFIG_FILE}" <<EOF
 local_cpu: False
 max_local_cpu_size: ${AIC_NIXL_STAGING_GB}
 remote_serde: NULL
 ${ROLE_LOCATIONS}
-nixl_buffer_device: "cpu"
+nixl_buffer_device: "cpu"${CHUNK_SIZE_LINE:+
+${CHUNK_SIZE_LINE}}
 extra_config:
   enable_nixl_storage: true
   nixl_backend: "${NIXL_BACKEND}"
