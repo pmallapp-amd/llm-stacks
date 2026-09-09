@@ -1,13 +1,14 @@
 # HANDOFF — 2026-09-09 (fourth pass)
 
-**The KV corruption is fixed.** A ≥800-word prompt is stored, the container restarted, and the
-prompt's needle recovered correctly from the NVMe KV target with `need to load` non-zero — twice,
-with different needles. As far as this repo's records go that is the **first correct cross-process
-KV read this stack has ever performed**; every chunk before it was half-empty.
+**The KV corruption is fixed, built into an image, and deployed.** A ≥800-word prompt is stored,
+the container restarted, and the prompt's needle recovered correctly from the NVMe KV target with
+`need to load` non-zero — three times now, with different needles, the last one against the built
+image rather than a hand-patched container. As far as this repo's records go that is the **first
+correct cross-process KV read this stack has ever performed**; every chunk before it was half-empty.
 
-The fix is `patches/0009-lmcache-fused-kv-plane-count.patch`. `use_gpu_connector_v3: True` was
-tried first, per the previous NEXT ACTION, and does not work — that finding is kept below because
-it rules out the cheap option.
+The fix is `patches/0009-lmcache-fused-kv-plane-count.patch`, shipped in **`rocm-aic:kv-planefix`**
+and running as `aic-spdk-planefix`. `use_gpu_connector_v3: True` was tried first, per the previous
+NEXT ACTION, and does not work — that finding is kept below because it rules out the cheap option.
 
 Two corrections to earlier passes are recorded below and both matter more than they look:
 the shape's real origin is **not** `integration/vllm/utils.py:278`, and the deploy.sh config
@@ -140,9 +141,63 @@ End-to-end, on the dynamic backend, with **fresh keys** (the target's older data
 hit and not a cold recompute. Reproduce with `/var/tmp/fix_test.txt` and `/var/tmp/fix2.txt` on the
 prefill node.
 
-The patch is applied **in the running container only** (`docker cp`), not baked into any image. It
-survives `docker restart` but **not** a container recreate — a `deploy.sh` run reverts it until the
-image is rebuilt.
+### Now baked into an image
+
+The patch is no longer a `docker cp`. `ROCM_ARCH=gfx942 bash build.sh` staged it as
+`patches/lmcache/18-fused-kv-plane-count.patch` and the Docker build applied it:
+
+```
+Applied: /app/patches/lmcache/18-fused-kv-plane-count.patch
+```
+
+Result tagged **`rocm-aic:kv-planefix`** (also `rocm-aic:latest`). The build took ~10 minutes, not
+the ~90 the header quotes, because the layer cache was warm — only the LMCache layer onward
+rebuilt. Verified in the image itself, not just the source:
+
+```
+$ docker run --rm --entrypoint sh rocm-aic:kv-planefix -c 'grep -c _aic_kv_plane_count .../vllm_service_factory.py'
+2
+$ ... 'ls /opt/nixl/lib/x86_64-linux-gnu/plugins/ | grep -E "SPDK_NVMe_KV|XNVME_KV"'
+libplugin_SPDK_NVMe_KV.so
+libplugin_XNVME_KV.so
+```
+
+Pre-flight before building, worth repeating before any future pin bump: the patch was checked
+against a pristine `LMCache v0.5.3` clone (`git apply --check` → clean), the two files it touches
+were confirmed byte-identical to the ones it was developed against, no other patch in the series
+touches them, and the **whole 18-patch series was replayed in the Dockerfile's exact lexical order**
+against a scratch clone. All clean. That is ~2 minutes of checking against a build that can fail an
+hour in.
+
+### Redeployed from the image, and re-verified
+
+Deployed as **`aic-spdk-planefix`** with `INSTANCE=planefix`, which gives it **its own config file**
+(`pd-configs/lmcache-planefix-spdk.yaml`) instead of the shared `lmcache-single-spdk.yaml` — so this
+deployment cannot clobber the decode node's config, which is exactly what the `INSTANCE` knob from
+`610067d` is for. That is the working mitigation for the NFS problem until `CONFIG_DIR` is moved.
+
+The acceptance test was re-run against the image build, with a fresh needle and fresh keys:
+
+| | needle | result |
+|---|---|---|
+| cold store | `hotel yankee` | ✅ correct |
+| **after `docker restart`** | `hotel yankee` | ✅ **correct**, `computed 0, hit 1024, need to load: 1024` |
+
+With `local_cpu: False` and a freshly restarted container there is no local cache to serve that
+from — the bytes came back from the NVMe KV target.
+
+**Deploy gotcha:** `HF_HOME` defaults to `~/.cache/huggingface`, which `docker run` cannot create on
+the NFS home (`permission denied`, and the deploy dies *after* writing its config). Pass
+`HF_HOME=/var/tmp/hf`, which is what the earlier containers used.
+
+Full invocation, for reproduction:
+
+```bash
+MODE=inprocess INSTANCE=planefix BACKEND=spdk PORT=8303 GPU=0 \
+TENSOR_PARALLEL_SIZE=1 MAX_MODEL_LEN=2048 AIC_KV_POOL=0 \
+HF_TOKEN=none HF_HOME=/var/tmp/hf IMAGE_REF=rocm-aic:kv-planefix \
+AIC_SPDK_KV_TRID="<trid>" bash deploy.sh
+```
 
 ---
 
@@ -249,24 +304,26 @@ needle `victor tango`) and `/var/tmp/v3req.json`.
 
 ## NEXT ACTION
 
-**Rebuild the image with `patches/0009-…` in it, then re-run the benchmark — the existing numbers
-do not measure the KV path.**
+**Benchmark the dynamic backend — there is still no valid number for this stack.**
 
-In order:
+The patch is built, deployed and verified, so the remaining work is measurement and then P+D.
 
-1. **Bake the patch in.** It currently exists only as `docker cp` into one running container and
-   dies on the next container recreate. `ROCM_ARCH=<arch> bash build.sh` picks it up automatically
-   (`build.sh` globs `*-lmcache-*.patch`; this one stages as `patches/lmcache/18-…`). ~90 minutes.
-2. **Purge the target.** Every chunk written before this fix is half-empty, and a now-correct
-   reader will happily return that garbage. The RAM-backed `bdev_kvmalloc` target clears on
-   restart. Until it is cleared, only ever test with fresh keys — and remember keys are
-   **prefix**-derived, so the change must be at the *start* of the prompt.
-3. **Re-benchmark.** The recorded static-backend benchmark measured recomputation, not retrieval
-   (see the correction below), so there is no valid baseline yet. Take one on the dynamic backend,
-   where reads demonstrably happen.
-4. **Then P+D.** The defect that blocked it is gone, but disaggregation itself has still never been
-   run end-to-end on this stack. Expect to find its own problems; do not read "gather fixed" as
-   "P+D works".
+1. **Re-benchmark, on the dynamic backend.** The recorded static-backend benchmark measured
+   recomputation, not retrieval (see the correction below), so no baseline exists. `aic-spdk-planefix`
+   on :8303 demonstrably reads. Point a load generator at it, or bring up the proxy and use
+   `bench/llama-benchy/run.sh` per README Step 9. Note the deployment record landed in
+   `${XDG_RUNTIME_DIR}/kv-cache-bench/`, not `/run/kv-cache-bench/`, because the deploy ran
+   non-root.
+2. **Then P+D.** The defect that blocked it is gone, but disaggregation has still never been run
+   end-to-end here. Expect it to have its own problems; do not read "gather fixed" as "P+D works".
+
+**On purging the target — lower priority than the previous pass implied.** Chunk keys are
+content-derived, so pre-fix poisoned entries are only reachable by replaying a pre-fix *prompt*.
+Any new benchmark generates new keys and cannot collide with them. The poisoned entries waste RAM
+on the target and will mislead anyone who re-runs an old prompt, but they do **not** corrupt new
+measurements. Clear it when convenient (the RAM-backed target drops everything on restart) rather
+than treating it as a blocker — and note the target is shared with the decode node, so a restart is
+not a private action.
 
 Decide separately on the **NFS config-sharing** issue above — it will keep producing
 config-vs-live mismatches until a deploy writes somewhere host-local.
@@ -454,8 +511,8 @@ All five verified against live container state under `set -euo pipefail`.
 
 | Node (placeholder) | Role | State |
 |---|---|---|
-| `<SETUP3_PREFILL_NODE>` | diagnosis host | `aic-spdk-single` :8303, `rocm-aic:kv-dbg2`, **running the 0009 patch via `docker cp`** (survives restart, lost on recreate). Currently on the **dynamic** backend from an in-memory config; the shared file now says `2000000`, so a restart brings it up **static** — see the NFS section. `use_gpu_connector_v3` is back to `False` and the v3 probe was reverted. `aic-spdk-static` :8304 stays torn down; GPU 1 free. |
-| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — process still **untouched** (27 h, never restarted). Config repaired to match it. Runs **unpatched** LMCache. |
+| `<SETUP3_PREFILL_NODE>` | patched host | **`aic-spdk-planefix` :8303, `rocm-aic:kv-planefix`, dynamic backend, GPU 0** — the fix baked in, deployed by `deploy.sh`, acceptance-tested. Uses its **own** config `lmcache-planefix-spdk.yaml`, so it no longer shares a file with the decode node. The old `aic-spdk-single` diagnosis container was removed (its `docker cp` patch is now in the image). `aic-spdk-static` :8304 stays torn down; GPU 1 free. |
+| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — process still **untouched** (28 h, never restarted). Runs **unpatched** LMCache and still writes corrupt chunks; redeploy it on `rocm-aic:kv-planefix` before trusting anything it stores. |
 | `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds a mix**: everything written before the fix is poisoned; the two verification runs are correct. Clear it before benchmarking. |
 
 Target-reported limits, from the plugin's own startup line:
