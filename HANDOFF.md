@@ -228,17 +228,51 @@ still collide, silently, across hosts.
 flipped the prefill node to the static backend on its next restart. It had to be temporarily set
 back to `0` to finish testing, then restored.
 
-**Current state — deliberately chosen, and a trap if you forget it.** The shared file reads
-`nixl_pool_size: 2000000`, which is correct for the decode node (the long-lived reference instance,
-still untouched at 27 h). The **prefill** container is running the *dynamic* backend from the
-config it loaded when the file still said `0`. Its file therefore no longer describes it, and a
-restart will bring it up **static**. That is tolerable only because the prefill node is the scratch
-diagnosis host and it is written down here.
+**Resolved.** The prefill node now writes its config host-local under `AIC_RUNTIME_DIR`, so the two
+nodes no longer share a file at all. The NFS `lmcache-single-spdk.yaml` reads `nixl_pool_size:
+2000000` and has exactly one remaining user, the decode node, which it correctly describes — proven
+by restarting it (below).
 
-**Recommended durable fix (not done — needs a decision):** a bind-mounted runtime config must not
-live on a shared filesystem. Either point `CONFIG_DIR` at a host-local path such as
-`/var/tmp/aic/pd-configs`, or fold `$(hostname -s)` into the filename. The first is cleaner; both
-are a change to `deploy.sh` beyond the scope of this pass, so it is flagged rather than applied.
+### FIXED — runtime state moved off the shared filesystem
+
+`deploy.sh` no longer derives runtime paths from `ROCM_AIC_DIR`. A new **`AIC_RUNTIME_DIR`**
+(default `/var/tmp/aic-$(id -u)`) owns both the bind-mounted LMCache config and the log directory:
+
+```
+config: /var/tmp/aic-<uid>/pd-configs/lmcache-<instance>-<backend>.yaml
+logs  : /var/tmp/aic-<uid>/logs/<instance>
+```
+
+`/var/tmp` is host-local and survives reboots, which a bind mount outliving its container needs
+(`/run` does not); the uid keeps two operators on one host apart. `ROCM_AIC_DIR` is now **source
+only**.
+
+The log directory had the identical defect and is fixed with it — both nodes defaulted to
+`INSTANCE=single`, so two hosts were writing one NFS log directory.
+
+**A guard now enforces the class of mistake, not just this instance of it.** `deploy.sh` stats the
+filesystem behind `CONFIG_DIR` and refuses `nfs/cifs/smb/9p/glusterfs/ceph/lustre/afs`, pointing at
+`AIC_RUNTIME_DIR`; `AIC_ALLOW_SHARED_CONFIG=1` overrides it for a genuinely single-host path. The
+check runs **before** the `docker rm -f`, deliberately — a guard that refuses only after destroying
+the running container is worse than no guard.
+
+Verified on the real hosts, both directions:
+
+| | result |
+|---|---|
+| `stat -f -c %T` on the NFS home | `nfs` → matches |
+| `stat -f -c %T` on `/var/tmp` | `ext2/ext3` → passes |
+| redeploy with the default | config + logs land under `/var/tmp/aic-<uid>/` |
+| redeploy with `AIC_RUNTIME_DIR=<nfs path>` | **refused, exit 1** |
+| the running container during that refusal | **untouched** — identical `StartedAt` |
+
+Re-verified end-to-end afterwards: needle `oscar mike` stored, container restarted, recovered with
+`need to load: 1024`.
+
+**Not yet migrated:** the decode node still mounts `lmcache-single-spdk.yaml` from the NFS path,
+because it was restarted, not redeployed. That file must stay until it is redeployed. With the
+prefill node moved to host-local paths there is no longer a live collision — the NFS file now has
+exactly one user.
 
 ---
 
@@ -325,8 +359,10 @@ measurements. Clear it when convenient (the RAM-backed target drops everything o
 than treating it as a blocker — and note the target is shared with the decode node, so a restart is
 not a private action.
 
-Decide separately on the **NFS config-sharing** issue above — it will keep producing
-config-vs-live mismatches until a deploy writes somewhere host-local.
+**Redeploy the decode node** when you are ready to touch it. It is the last thing still running
+unpatched LMCache (so still writing corrupt chunks) and the last thing still mounting its config
+from NFS. A plain restart has been done and is clean; a redeploy on `rocm-aic:kv-planefix` moves it
+onto the fix and onto `AIC_RUNTIME_DIR` in one step.
 
 Two things worth carrying forward regardless:
 
@@ -512,7 +548,7 @@ All five verified against live container state under `set -euo pipefail`.
 | Node (placeholder) | Role | State |
 |---|---|---|
 | `<SETUP3_PREFILL_NODE>` | patched host | **`aic-spdk-planefix` :8303, `rocm-aic:kv-planefix`, dynamic backend, GPU 0** — the fix baked in, deployed by `deploy.sh`, acceptance-tested. Uses its **own** config `lmcache-planefix-spdk.yaml`, so it no longer shares a file with the decode node. The old `aic-spdk-single` diagnosis container was removed (its `docker cp` patch is now in the image). `aic-spdk-static` :8304 stays torn down; GPU 1 free. |
-| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static — process still **untouched** (28 h, never restarted). Runs **unpatched** LMCache and still writes corrupt chunks; redeploy it on `rocm-aic:kv-planefix` before trusting anything it stores. |
+| `<SETUP3_DECODE_NODE>` | decode | `aic-spdk-single` :8302, `rocm-aic:kv-canonical`, static. **Restarted 2026-09-09** after 28 h — came back on `nixl_pool_size: 2000000` / `NixlStaticStorageBackend`, i.e. exactly as before, which is the proof that the config repair held. Still mounts its config from the **NFS** path (restarted, not redeployed) and still runs **unpatched** LMCache, so it continues to write corrupt chunks — redeploy it on `rocm-aic:kv-planefix` before trusting anything it stores. |
 | `<SETUP3_TARGET_NODE>` | SPDK KV target | running: `max_io_size=16MB`, `max_io_qpairs_per_ctrlr=512`, never restarted. **Holds a mix**: everything written before the fix is poisoned; the two verification runs are correct. Clear it before benchmarking. |
 
 Target-reported limits, from the plugin's own startup line:

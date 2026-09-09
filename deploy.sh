@@ -103,8 +103,25 @@
 #                              "public model, already cached" so that fact lands
 #                              in the deployment record instead of being smuggled
 #                              in as a fake-looking token string.
-#   HF_HOME=<path>             (~/.cache/huggingface)
-#   ROCM_AIC_DIR=<path>        vendored checkout (<this-dir>/vendor/rocm-aic)
+#   HF_HOME=<path>             (~/.cache/huggingface). On an NFS home, `docker
+#                              run` cannot create this and the deploy dies AFTER
+#                              writing its config; pass HF_HOME=/var/tmp/hf.
+#   ROCM_AIC_DIR=<path>        vendored checkout (<this-dir>/vendor/rocm-aic).
+#                              SOURCE ONLY — no per-host runtime state lives
+#                              here any more; see AIC_RUNTIME_DIR.
+#   AIC_RUNTIME_DIR=<path>     In-process mode: where the bind-mounted LMCache
+#                              config and the log dir are written
+#                              (/var/tmp/aic-$(id -u)). MUST be host-local.
+#                              These used to sit under ROCM_AIC_DIR, i.e. in an
+#                              NFS home shared by every node, so two hosts
+#                              resolved to one inode and a deploy on either
+#                              rewrote the config mounted into the other's
+#                              running container. INSTANCE does not save you
+#                              there — both hosts default to the same one.
+#                              deploy.sh now refuses a shared filesystem here.
+#   AIC_ALLOW_SHARED_CONFIG=1  Permit AIC_RUNTIME_DIR on a shared filesystem.
+#                              Only correct when this host is genuinely the sole
+#                              user of that path.
 #   IMAGE_REF=<tag>            (rocm-aic:latest)
 #   AIC_SPDK_KV_TRID=<trid>    BACKEND=spdk target
 #   AIC_XNVME_DEV=<path>       BACKEND=xnvme device node (/dev/ng0n1)
@@ -1274,9 +1291,63 @@ else
     fi
 
     CONTAINER_NAME="aic-${BACKEND}-${INSTANCE}"
-    CONFIG_DIR="${ROCM_AIC_DIR}/pd-configs"
+    # Per-HOST runtime state. It must not live under ROCM_AIC_DIR.
+    #
+    # Both of the paths below are bind-mounted INTO the container, and
+    # ROCM_AIC_DIR sits in the operator's home directory, which in this lab is
+    # an NFS export shared by every node. Deriving them from it gave two
+    # different hosts the same file, with the same inode — so a deploy on one
+    # node silently rewrote the config that a live container on ANOTHER node
+    # had mounted, and the INSTANCE keying above could not help, because both
+    # nodes default to the same INSTANCE. That is exactly how the decode node
+    # came to have a config file that did not describe the process running from
+    # it, and why its mount then read `Stale file handle`: the inode it was
+    # pinned to had been replaced underneath it.
+    #
+    # /var/tmp is host-local and survives reboots, which a bind mount that must
+    # outlive the container needs (/run does not). The uid keeps two operators
+    # on one host from colliding.
+    AIC_RUNTIME_DIR=${AIC_RUNTIME_DIR:-/var/tmp/aic-$(id -u)}
+    CONFIG_DIR="${AIC_RUNTIME_DIR}/pd-configs"
     CONFIG_FILE="${CONFIG_DIR}/lmcache-${INSTANCE}-${BACKEND}.yaml"
-    LOG_SUBDIR="${ROCM_AIC_DIR}/logs/${INSTANCE}"
+    LOG_SUBDIR="${AIC_RUNTIME_DIR}/logs/${INSTANCE}"
+
+    # Refuse to bind-mount runtime config off a SHARED filesystem, whatever
+    # AIC_RUNTIME_DIR was set to. This guards the class of mistake, not just the
+    # default that used to be wrong: the failure it prevents is silent (another
+    # host's deploy rewrites this file while a container here has it mounted)
+    # and it presents as a container whose behaviour does not match its own
+    # config file, which is a genuinely confusing thing to debug.
+    #
+    # Deliberately BEFORE the `docker rm -f` below — a guard that refuses only
+    # after destroying the running container is worse than no guard. stat the
+    # nearest EXISTING ancestor so this needs no mkdir and has no side effects.
+    fs_probe="${CONFIG_DIR}"
+    while [ ! -e "${fs_probe}" ] && [ "${fs_probe}" != "/" ]; do
+        fs_probe=$(dirname "${fs_probe}")
+    done
+    CONFIG_FSTYPE=$(stat -f -c %T "${fs_probe}" 2>/dev/null || echo unknown)
+    case "${CONFIG_FSTYPE}" in
+        nfs*|cifs|smb*|fuse.sshfs|9p|glusterfs|ceph|lustre|afs)
+            if [ "${AIC_ALLOW_SHARED_CONFIG:-0}" = "1" ]; then
+                echo "  WARN: ${fs_probe} is on a shared filesystem (${CONFIG_FSTYPE})."
+                echo "        AIC_ALLOW_SHARED_CONFIG=1 — proceeding. A deploy on another"
+                echo "        host using INSTANCE=${INSTANCE} will overwrite this config"
+                echo "        underneath this container."
+            else
+                echo "ERR: ${fs_probe} is on a shared filesystem (${CONFIG_FSTYPE})." >&2
+                echo "     The LMCache config is bind-mounted into the container, so a" >&2
+                echo "     deploy on any other host using INSTANCE=${INSTANCE} would" >&2
+                echo "     rewrite it underneath this one — silently, and the running" >&2
+                echo "     container would keep serving from the replaced inode." >&2
+                echo "" >&2
+                echo "     Set AIC_RUNTIME_DIR to a host-local path (default is" >&2
+                echo "     /var/tmp/aic-\$(id -u)), or AIC_ALLOW_SHARED_CONFIG=1 if this" >&2
+                echo "     host genuinely is the only one using that path." >&2
+                exit 1
+            fi
+            ;;
+    esac
 
     # Which port is container $1 serving, if it is RUNNING? Empty otherwise.
     #
