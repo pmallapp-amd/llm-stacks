@@ -26,9 +26,27 @@ FILLER = ("The quarterly logistics review noted that regional distribution "
           "centers continued to operate within expected tolerances. ")
 
 
-def build_prompt(seed: int, approx_tokens: int) -> str:
-    # ~13 tokens per filler sentence; seed varies the PREFIX so chunk keys differ
+def build_prompt(seed: int, approx_tokens: int, shared_prefix: int = 0) -> str:
+    """
+    shared_prefix=0  -> every request gets a UNIQUE long prefix. Chunk keys are
+                        prefix-derived, so nothing is reusable and every request
+                        pays a full prefill. This is the HANDOFF case.
+
+    shared_prefix=N  -> every request shares ONE long prefix keyed by N, and
+                        differs only in a short trailing question. All but the
+                        final chunk are therefore reusable across requests, so
+                        one store amortises over many loads. This is the REUSE
+                        case, and the only one where the economics can work.
+
+    vLLM's own prefix cache MUST be off (--no-enable-prefix-caching) or vLLM
+    answers the repeat itself and LMCache is never consulted -- the number would
+    then be measuring vLLM, not the storage tier.
+    """
     reps = max(1, approx_tokens // 13)
+    if shared_prefix:
+        body = (f"Document reference {shared_prefix:09d}. Internal circulation only.\n\n"
+                + FILLER * reps)
+        return body + f"\n\nQuestion {seed:06d}: summarize the status.\nAnswer:"
     return (f"Document reference {seed:09d}. Internal circulation only.\n\n"
             + FILLER * reps
             + "\n\nSummarize the operational status in one sentence.\nAnswer:")
@@ -49,7 +67,7 @@ def one_request(url, model, prompt, max_tokens, timeout):
     return dt, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
 
 
-def run_level(url, model, conc, total, ptokens, max_tokens, timeout, seed0):
+def run_level(url, model, conc, total, ptokens, max_tokens, timeout, seed0, shared=0):
     work = queue.Queue()
     for i in range(total):
         work.put(seed0 + i)
@@ -63,7 +81,8 @@ def run_level(url, model, conc, total, ptokens, max_tokens, timeout, seed0):
             except queue.Empty:
                 return
             try:
-                r = one_request(url, model, build_prompt(seed, ptokens),
+                r = one_request(url, model,
+                                build_prompt(seed, ptokens, shared),
                                 max_tokens, timeout)
                 with lock:
                     results.append(r)
@@ -92,19 +111,25 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--seed-base", type=int, default=100000)
+    ap.add_argument("--reuse", type=int, default=0, metavar="KEY",
+                    help="shared-prefix REUSE mode: all requests share the long "
+                         "prefix keyed by KEY and differ only in a short suffix. "
+                         "0 (default) = unique prefix per request (no reuse).")
     args = ap.parse_args()
 
     levels = [int(x) for x in args.concurrency.split(",")]
     seed = args.seed_base
+    mode = f"REUSE(shared prefix key={args.reuse})" if args.reuse else "UNIQUE prefix per request"
     print(f"# {args.label}  url={args.url}  prompt~{args.prompt_tokens}tok  "
           f"max_tokens={args.max_tokens}  n={args.requests}/level")
+    print(f"# mode: {mode}")
     print(f"{'conc':>5} {'ok':>4} {'err':>4} {'wall_s':>8} {'req/s':>7} "
           f"{'mean_s':>8} {'p50_s':>8} {'p95_s':>8} {'ptok':>6}")
     rows = []
     for c in levels:
         res, errs, wall = run_level(args.url, args.model, c, args.requests,
                                     args.prompt_tokens, args.max_tokens,
-                                    args.timeout, seed)
+                                    args.timeout, seed, args.reuse)
         seed += args.requests * 10          # never reuse a prefix
         if not res:
             print(f"{c:>5} {0:>4} {len(errs):>4}   ALL FAILED: {errs[:1]}")

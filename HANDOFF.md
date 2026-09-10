@@ -37,6 +37,8 @@ Branch `rocm-aic`, **not pushed**. The remote GPU-node tree is a plain copy kept
 | **P+D on a real model** | ✅ **Qwen2.5-72B-Instruct, TP=4**, 4/4 needles, `need to load: 1152` |
 | P+D under concurrency | ✅ measured at c=1/4/8 — and the gap **widens** with load |
 | **P+D latency/throughput** | ⚠️ **measured, and it LOSES**: 0.17–0.41x an aggregated node on 2x the GPUs. Correct, not worthwhile. See OPEN-1 |
+| **KV reuse (cache) case** | ⚠️ **measured, dead heat** — cache hit confirmed (`need to load: 3840`) and still no gain. See OPEN-1b |
+| **Root cause of both** | 🔎 **KV path runs at ~20% of line rate** (617 MB/s on a 25 Gb/s link). At line rate reuse would win **4.7x**. See OPEN-1c |
 | `patches/0009` upstreamed | ❌ **don't** — superseded by LMCache PR #4467, see OPEN-2 |
 | LMCache PR #4467 on MI300X | ✅ **validated, replaces `patches/0009`** — 72B TP=4 P/D, 4/4, `need to load: 1152` |
 
@@ -119,24 +121,78 @@ The 2.40x single-node figure in "Benchmarking" is not in tension with this: that
 **retrieve-vs-recompute on one host**, which is the reuse case. This measures a **cross-host one-shot
 handoff**. They are different questions and only the first one currently wins.
 
-### OPEN-1b — Re-measure only if something structural changes *(medium)*
+### OPEN-1b — MEASURED: the reuse case doesn't pay either, and now we know why *(answered)*
 
-OPEN-1 is answered and the answer is negative, so the useful follow-ups are the ones that change a
-term in the mechanism rather than another sweep of the same stack. Each needs a re-run to settle:
+The handoff case lost, so the obvious follow-up was the **reuse** case — one store amortised over
+many loads, which is where the 2.40x single-node figure came from. Measured on a single `kv_both`
+72B instance (`reuse72`, TP=4, vLLM prefix caching off), shared 3840-token prefix vs a unique prefix
+per request:
 
-- **Drop `--enforce-eager`.** Hardcoded in `deploy.sh` with no override, and it inflates decode on
-  both arms. It is the cheapest confound to remove and the only one that is purely a code change.
-- **Overlap the proxy.** `proxy.py` calls prefill, waits, then decodes, so both transfers sit on the
-  critical path. Pipelining the decode host's load against the prefill host's next request is the
-  change the architecture actually needs.
-- **Change the transport.** TCP to a RAM-backed target is what the KV volume runs into. RDMA or the
-  real DSC device is the interesting comparison.
-- **Measure the reuse case, not the handoff case.** One store amortised over many loads is where the
-  2.40x single-node figure comes from and where the economics plausibly work.
+| concurrency | A: unique prefix (full recompute) | B: shared prefix (warmed, cache hit) |
+|---|---|---|
+| 1 | 0.120 req/s · 8.31 s | 0.118 req/s · 8.45 s |
+| 4 | 0.253 req/s · 15.74 s | 0.285 req/s · 14.02 s |
+| 8 | 0.332 req/s · 23.78 s | 0.341 req/s · 23.48 s |
 
-Re-run with `pd_bench.py`; it already verifies unique prefixes and prints the warning about c=1.
-Whatever changes, keep checking `need to load` on the receiver — a "win" that turns out to be the
-receiver silently re-prefilling is the standing failure mode on this path.
+**A dead heat.** And the cache really was hit — 24/24 requests logged
+`hit tokens: 3840, need to load: 3840`, so this is not the silent-re-prefill failure mode. Reuse
+genuinely fetched the KV and still bought nothing.
+
+Isolating decode with a tiny 81-token prompt at the same `max_tokens=32` gives **6.41 s**, which is
+what makes the result legible:
+
+| | |
+|---|---|
+| KV per request (3840 tok × 320 KiB) | **1.26 GB** |
+| Prefill 3840 tokens (8.31 − 6.41) | **1.90 s** |
+| KV load 3840 tokens (8.45 − 6.41) | **2.04 s** → **617 MB/s** |
+| Link (decode node → target, `ens50f0`) | 25 Gb/s = **3125 MB/s** |
+| **Storage path efficiency** | **~20% of line rate** |
+| Decode share of request latency | **76%** |
+
+Three conclusions, in order of usefulness:
+
+1. **The KV path runs at ~20% of the wire.** 617 MB/s against a 25 Gb/s link. The bottleneck is not
+   the network and not the GPU — it is the software path: ~120 objects per request (30 chunks × 4
+   ranks) and `nixl_buffer_device: "cpu"`, so every byte stages GPU → host → NIC → host → GPU.
+2. **Fix that and reuse wins.** At line rate the same 1.26 GB lands in **0.40 s** against a **1.90 s**
+   recompute — a **4.7x** win. The prize is real and roughly 5x of software headroom stands between
+   here and it. That is the single most valuable thing left in this repo.
+3. **`--enforce-eager` is distorting everything.** 6.41 s of decode is 76% of each request, so both
+   arms are mostly measuring a handicap that is hardcoded in `deploy.sh` with no override. Remove it
+   before taking any further performance number.
+
+Caveat on the arithmetic: decode was isolated at 81 tokens of context, and decode attention costs
+slightly more at 3840, so the 1.90 s and 2.04 s are mild over-estimates. They move together, so the
+comparison holds; treat them as "roughly equal, ~2 s" rather than as three-significant-figure values.
+
+**Why this does not contradict the 2.40x.** That was TinyLlama — 22 KiB/token, so ~22 MB for 1024
+tokens, small enough that even a 20%-of-line-rate path beat recompute. Scaling to 72B multiplied KV
+volume by ~55x while MI300X prefill stayed fast, and the storage path did not scale with it.
+
+### OPEN-1c — Fix the KV transfer path, then re-measure *(high)*
+
+Both cases are now measured and both lose, but OPEN-1b localises **why** to one place: the KV
+transfer path delivers **~20% of line rate**. Everything below is ordered by that finding rather
+than by guesswork, and the prize is quantified — a **4.7x** win on the reuse case if the path
+reaches the wire.
+
+1. **Drop `--enforce-eager` first.** 76% of request latency, hardcoded in `deploy.sh` with no
+   override. Until it goes, every number is mostly measuring it, and the two arms of any comparison
+   will look identical for reasons that have nothing to do with the cache. Cheapest fix, biggest
+   distortion removed.
+2. **Attack the staging path.** `nixl_buffer_device: "cpu"` means every byte goes GPU → host → NIC →
+   host → GPU. A GPU-resident buffer, or RDMA straight from device memory, removes two copies. This
+   is where the missing 5x most likely lives.
+3. **Cut the object count.** ~120 objects per request (30 chunks × 4 ranks) at `chunk_size 128`. If
+   per-object round trips dominate rather than bandwidth, larger chunks help — but see the 16 MiB
+   ceiling, which is what forced 128 in the first place. Measure per-object overhead before
+   assuming it.
+4. **Only then re-measure.** Another sweep of the current path will reproduce the dead heat above.
+
+Re-run with `pd_bench.py` (`--reuse KEY` selects the shared-prefix arm). Whatever changes, keep
+checking `need to load` — a "win" that turns out to be a silent re-prefill is the standing failure
+mode here, and a dead heat that turns out to be a cache *miss* is its twin.
 
 `MAX_MODEL_LEN=32768` allows 8k–16k prompts if a longer-prefill regime is wanted; note 16k tokens is
 ~5 GB of KV per request, and the target is RAM-backed.
