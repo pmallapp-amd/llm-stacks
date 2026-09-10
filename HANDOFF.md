@@ -9,6 +9,11 @@ Getting to a real model surfaced a ceiling that had been latent the whole time: 
 stored object, and the device caps a single value at 16 MiB.** Every result on this branch before
 today was taken at TinyLlama's 5.5 MiB and never approached it. See "The 16 MiB store ceiling".
 
+**And now the uncomfortable part: it was measured, and P/D loses.** Against a single aggregated
+node the disaggregated pair runs at 0.17–0.41x the throughput while holding twice the GPUs, and
+concurrency widens the gap rather than closing it. The stack is correct; the architecture, on this
+transport, does not pay for itself. That is the honest headline and OPEN-1 carries the numbers.
+
 This document replaces the four earlier passes. Everything below has been executed, not inferred —
 where something is reasoning rather than measurement, it says so.
 
@@ -30,8 +35,8 @@ Branch `rocm-aic`, **not pushed**. The remote GPU-node tree is a plain copy kept
 | KV-path benchmark | ✅ first valid one taken: **2.40x** faster than recompute at c=1 |
 | **P+D across two hosts** | ✅ **verified end to end**, 4/4 needles through the proxy |
 | **P+D on a real model** | ✅ **Qwen2.5-72B-Instruct, TP=4**, 4/4 needles, `need to load: 1152` |
-| P+D under concurrency | ❌ never measured |
-| P+D latency/throughput | ❌ **no number has ever been taken through the proxy** |
+| P+D under concurrency | ✅ measured at c=1/4/8 — and the gap **widens** with load |
+| **P+D latency/throughput** | ⚠️ **measured, and it LOSES**: 0.17–0.41x an aggregated node on 2x the GPUs. Correct, not worthwhile. See OPEN-1 |
 | `patches/0009` upstreamed | ❌ **don't** — superseded by LMCache PR #4467, see OPEN-2 |
 | LMCache PR #4467 on MI300X | ✅ **validated, replaces `patches/0009`** — 72B TP=4 P/D, 4/4, `need to load: 1152` |
 
@@ -69,23 +74,72 @@ Both 72B roles carry `DEPLOY_DEGRADED=enforce-eager,disable-custom-all-reduce,gp
 
 Ordered by what I would do next.
 
-### OPEN-1 — Measure P+D, don't just run it *(high)*
+### OPEN-1 — MEASURED: P+D is correct, and on this stack it is **not worth it** *(answered)*
 
-No latency or throughput number has been taken through the proxy. Note the proxy is **sequential** —
-it calls prefill with `max_tokens=1`, discards the response, then streams from decode — so
-end-to-end latency is both legs. The win has to come from freeing the decode host from prefill work,
-which only appears under **concurrent** load. A single-request measurement will look like a loss and
-that would be a misreading, not a result.
+Measured 2026-09-09 with `pd_bench.py`, Qwen2.5-72B TP=4, ~3940-token prompts, 8 requests per
+level, unique prefixes throughout. Both arms verified from the receiver's own log: the
+disaggregated arm loaded (`need to load: 3840`, 30 chunks × 128) and the aggregated arm cold-computed
+(`hit 0, need to load: 0`). 24 requests each, no errors.
 
-The 72B pair is the right place to take this — it is the first deployment where prefill is expensive
-enough for the answer to mean anything. Two things to control for before quoting a number: both
-roles run `--enforce-eager` (hardcoded, inflates decode) and `--gpu-memory-utilization 0.6`, and the
-observed single-request latency through proxy 9001 was ~11 s warm against ~39 s on the first call.
-Neither figure is a result; they are recorded only so nobody mistakes the warm one for a win.
+| concurrency | disaggregated (8 GPUs) | aggregated, one node (4 GPUs) | disagg vs agg |
+|---|---|---|---|
+| 1 | 0.062 req/s · 16.1 s mean | 0.153 req/s · 6.5 s mean | **0.41x** |
+| 4 | 0.087 req/s · 42.2 s mean | 0.506 req/s · 7.9 s mean | **0.17x** |
+| 8 | 0.147 req/s · 43.2 s mean | 0.692 req/s · 11.3 s mean | **0.21x** |
 
-`MAX_MODEL_LEN=32768` is available on the 72B pair, so the demonstration can use 8k–16k prompts
-rather than the ~1.2k used to prove correctness. Note that 16k tokens is ~5 GB of KV per request
-against a RAM-backed target — check the target's capacity before sending it.
+**Disaggregation is 2.4–5.8x slower while using twice the GPUs — roughly 5–12x worse per GPU.** It
+also scales worse with load: 1 → 2.36x from c=1 to c=8, against the aggregated instance's 4.52x.
+
+The concurrency argument this item was built on does not rescue it. The prediction was that a
+single-request measurement would look like a loss and only concurrency would show the win. Concurrency
+was measured, and the gap **widens** rather than closes.
+
+Why, mechanically: a one-shot P/D handoff moves the **entire** KV over the wire —
+`3840 tokens × 320 KiB = ~1.2 GB per request`, as ~120 objects (30 chunks × 4 ranks) — and the proxy
+is sequential, so store-to-target and load-from-target both sit on the critical path rather than
+overlapping with compute. The aggregated instance keeps that KV in HBM and never pays it, and its
+continuous batching packs concurrent requests into one engine instead of splitting them across two
+with a serialization point between.
+
+**What this does and does not say.** It is one configuration: SPDK-KV over **TCP** to a RAM-backed
+target, `--enforce-eager` hardcoded on both roles, a sequential proxy, `chunk_size 128`. It says this
+stack's P/D path is not competitive as built. It does **not** say P/D disaggregation is worthless —
+the honest reading is that a one-shot handoff has to move KV faster than the prefill it saves, and
+TCP to a remote target does not. Before quoting this anywhere, note the aggregated arm was
+`receiver72` itself, which still pays a lookup miss per request, so the aggregated numbers are if
+anything slightly pessimistic.
+
+Where the architecture could still pay, in rough order of promise: **KV reuse across many requests**
+(the caching case, where one store amortises over many loads — unlike this one-shot handoff), a
+**faster transport** (RDMA, or the real DSC device rather than TCP), and a **non-sequential proxy**
+that overlaps the decode host's load with the prefill host's next request. Also worth re-running
+without `--enforce-eager`, which is hardcoded in `deploy.sh` and inflates decode on both arms.
+
+The 2.40x single-node figure in "Benchmarking" is not in tension with this: that measures
+**retrieve-vs-recompute on one host**, which is the reuse case. This measures a **cross-host one-shot
+handoff**. They are different questions and only the first one currently wins.
+
+### OPEN-1b — Re-measure only if something structural changes *(medium)*
+
+OPEN-1 is answered and the answer is negative, so the useful follow-ups are the ones that change a
+term in the mechanism rather than another sweep of the same stack. Each needs a re-run to settle:
+
+- **Drop `--enforce-eager`.** Hardcoded in `deploy.sh` with no override, and it inflates decode on
+  both arms. It is the cheapest confound to remove and the only one that is purely a code change.
+- **Overlap the proxy.** `proxy.py` calls prefill, waits, then decodes, so both transfers sit on the
+  critical path. Pipelining the decode host's load against the prefill host's next request is the
+  change the architecture actually needs.
+- **Change the transport.** TCP to a RAM-backed target is what the KV volume runs into. RDMA or the
+  real DSC device is the interesting comparison.
+- **Measure the reuse case, not the handoff case.** One store amortised over many loads is where the
+  2.40x single-node figure comes from and where the economics plausibly work.
+
+Re-run with `pd_bench.py`; it already verifies unique prefixes and prints the warning about c=1.
+Whatever changes, keep checking `need to load` on the receiver — a "win" that turns out to be the
+receiver silently re-prefilling is the standing failure mode on this path.
+
+`MAX_MODEL_LEN=32768` allows 8k–16k prompts if a longer-prefill regime is wanted; note 16k tokens is
+~5 GB of KV per request, and the target is RAM-backed.
 
 ### OPEN-2 — Validate LMCache PR #4467 on our MI300X *(high)*
 
