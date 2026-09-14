@@ -8,8 +8,10 @@ fails, this document points at the relevant section of
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 Every command block below is labeled with the node it runs on. `[SMC1]` =
-prefill (`REDACTED-ADDR`), `[SMC2]` = decode (`REDACTED-ADDR`), `[SMC3]` =
-target (`REDACTED-ADDR`), `[any]` = any node or a jump host with network reach.
+prefill (`${PREFILL_HOST}`), `[SMC2]` = decode (`${DECODE_HOST}`), `[SMC3]` =
+target (`${TARGET_HOST}`), `[any]` = any node or a jump host with network
+reach. These variables come from `creds/active.env` — see the README's
+"Credentials / lab setup" section.
 
 ## §0 Prerequisites
 
@@ -43,44 +45,48 @@ Gather before starting — nothing below can complete without these:
   `DECODE_DATA_IF` once known (unpinned falls back to UCX's own
   autodetection at every vLLM start, which is not guaranteed stable across a
   network hiccup — see `start-vllm.sh`'s comment).
-- SSH access to all three nodes as `root` (see the README's Topology table
-  for credentials) and, ideally, working serial console access as a
-  fallback (see §1).
+- SSH access to all three nodes (see `creds/active.env` — `SSH_USER`, and
+  the README's "Credentials / lab setup" section) and, ideally, working
+  serial console access as a fallback (see §1).
 
 ## §1 Access check
 
 `[any]` — confirm you can reach every node before touching anything.
 
 ```bash
+# any node with reach to the lab
+source creds/active.env
+
 # SSH — from your jump host / laptop
-ssh root@REDACTED-ADDR hostname   # SMC1, expect: smc1
-ssh root@REDACTED-ADDR hostname   # SMC2, expect: smc2
-ssh root@REDACTED-ADDR hostname   # SMC3, expect: target
+ssh "${SSH_USER}@${PREFILL_HOST}" hostname   # SMC1, expect: ${PREFILL_NAME}
+ssh "${SSH_USER}@${DECODE_HOST}" hostname    # SMC2, expect: ${DECODE_NAME}
+ssh "${SSH_USER}@${TARGET_HOST}" hostname    # SMC3, expect: ${TARGET_NAME}
 ```
 
 BMC reachability (out-of-band; used for power actions or when SSH is down):
 
 ```bash
 # ping is sufficient to confirm the BMC network path is up; full BMC login
-# (Redfish/IPMI/web) is credential-gated per the README's Topology table.
-ping -c2 REDACTED-ADDR    # SMC1 BMC  (admin / REDACTED-PASSWORD)
-ping -c2 REDACTED-ADDR    # SMC2 BMC  (admin / REDACTED-PASSWORD)
-ping -c2 REDACTED-ADDR   # SMC3 BMC  (root  / REDACTED-PASSWORD)
+# (Redfish/IPMI/web) needs PREFILL_BMC_USER/PREFILL_BMC_PASS (and the
+# DECODE_*/TARGET_* equivalents) from creds/active.env.
+ping -c2 "${PREFILL_BMC}"    # SMC1 BMC
+ping -c2 "${DECODE_BMC}"     # SMC2 BMC
+ping -c2 "${TARGET_BMC}"     # SMC3 BMC
 ```
 
 Serial console access (fallback when SSH is unavailable):
 
 ```bash
-telnet REDACTED-ADDR 2024   # SMC1, "REDACTED-LABEL" port A
-telnet REDACTED-ADDR 2025   # SMC1, port B
-telnet REDACTED-ADDR 2022   # SMC2, port A
-telnet REDACTED-ADDR 2023   # SMC2, port B
-telnet REDACTED-ADDR  2022   # SMC3 "REDACTED-LABEL" — KNOWN UNRESOLVED: connection
-                           # was REFUSED the last time this was tried. Do not
-                           # rely on this path being available; use SMC3's
-                           # BMC (REDACTED-ADDR) instead until this is
-                           # re-investigated. See README gap #6.
-telnet REDACTED-ADDR  2023   # SMC3 "REDACTED-LABEL" — same caveat
+${PREFILL_CONSOLE}       # SMC1, port A
+${PREFILL_CONSOLE_ALT}   # SMC1, port B
+${DECODE_CONSOLE}        # SMC2, port A
+${DECODE_CONSOLE_ALT}    # SMC2, port B
+${TARGET_CONSOLE}        # SMC3, Pollara port A — KNOWN UNRESOLVED: connection
+                         # was REFUSED the last time this was tried. Do not
+                         # rely on this path being available; use SMC3's
+                         # BMC (${TARGET_BMC}) instead until this is
+                         # re-investigated. See README gap #5.
+${TARGET_CONSOLE_ALT}    # SMC3, Pollara port B — same caveat
 ```
 
 If any SSH path is down, use the console for that node; if the console is
@@ -229,9 +235,9 @@ Expected output ends with:
 
 ```
 ok  kv-target up
-    TRID for initiators: trtype:TCP adrfam:IPv4 traddr:REDACTED-ADDR trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0
+    TRID for initiators: trtype:TCP adrfam:IPv4 traddr:${TARGET_HOST} trsvcid:4420 subnqn:nqn.2024-01.io.nixl:kv0
     verify from this host: scripts/target/04-verify-target.sh
-    verify from SMC1/SMC2: nvme discover -t tcp -a REDACTED-ADDR -s 4420
+    verify from SMC1/SMC2: nvme discover -t tcp -a ${TARGET_HOST} -s 4420
 ```
 
 If it fails: check `bdev_kvmalloc_create`'s exact RPC argument names first —
@@ -277,9 +283,9 @@ to it):
 
 ```bash
 # on SMC1
-rsync -az root@REDACTED-ADDR:/opt/kvstack/src/kv_spdk/ /opt/kvstack/src/spdk/
+rsync -az "${SSH_USER}@${TARGET_HOST}:/opt/kvstack/src/kv_spdk/" /opt/kvstack/src/spdk/
 # on SMC2 — identical command
-rsync -az root@REDACTED-ADDR:/opt/kvstack/src/kv_spdk/ /opt/kvstack/src/spdk/
+rsync -az "${SSH_USER}@${TARGET_HOST}:/opt/kvstack/src/kv_spdk/" /opt/kvstack/src/spdk/
 ```
 
 (Source path shown is the default `SPDK_TARGET_SRC`; destination is the

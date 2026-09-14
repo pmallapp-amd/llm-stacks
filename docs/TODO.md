@@ -243,9 +243,9 @@ Done means: N/A for this section — these are accepted limitations and
 watch items, not work items with a completion state. Re-review each at
 the next relevant hardware session.
 
-- [ ] **4.1** SMC3 Pollara serial console (`telnet REDACTED-ADDR 2022/2023`) refused
-      connection when last tried. Lower priority now that this leg is TCP-only; BMC
-      (`REDACTED-ADDR`) is the fallback out-of-band path.
+- [ ] **4.1** SMC3 Pollara serial console (`${TARGET_CONSOLE}` / `${TARGET_CONSOLE_ALT}`, see
+      `creds/active.env`) refused connection when last tried. Lower priority now that this
+      leg is TCP-only; BMC (`${TARGET_BMC}`) is the fallback out-of-band path.
 - [ ] **4.2** No geometry manifest for stored KV objects — changing `KV_MAX_VALUE_SIZE`
       without draining the namespace silently yields half-stale reads. Mitigated by
       `scripts/target/50-reset-namespace.sh` and documented, but not solved.
@@ -303,3 +303,10 @@ the next relevant hardware session.
       plugin (`spdk_nvme_kv_backend.h` declares `supportsRemote() { return false; }`,
       which `pd_backend.py`'s `transfer_channel` requires `true` for). Narrows, but
       does not close, **0.1**.
+- [x] **5.14** Repo made public: moved per-setup identity (addresses, users,
+      passwords, BMC and console endpoints) out of tracked files into an
+      untracked `creds/` directory (`creds/setup-N.env` + `creds/active.env`
+      symlink, `CREDS_FILE` override), scrubbed every tracked doc/script down
+      to `${PREFILL_HOST}`-style variable references, and purged the real
+      values from git history via `git filter-repo`. See the README's
+      "Credentials / lab setup" section and `docs/HANDOFF.md` §2.

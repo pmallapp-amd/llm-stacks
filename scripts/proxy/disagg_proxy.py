@@ -92,9 +92,9 @@ class Config:
     """
 
     def __init__(self) -> None:
-        self.prefill_host = os.environ.get("PREFILL_HOST", "REDACTED-ADDR")
+        self.prefill_host = os.environ.get("PREFILL_HOST", "prefill.invalid")
         self.prefill_port = int(os.environ.get("PREFILL_PORT", "8100"))
-        self.decode_host = os.environ.get("DECODE_HOST", "REDACTED-ADDR")
+        self.decode_host = os.environ.get("DECODE_HOST", "decode.invalid")
         self.decode_port = int(os.environ.get("DECODE_PORT", "8200"))
         self.proxy_port = int(os.environ.get("PROXY_PORT", "8000"))
 

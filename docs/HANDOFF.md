@@ -15,9 +15,12 @@ machines and share KV cache:
 
 | Node | Host | Address | Role |
 |---|---|---|---|
-| SMC1 | `smc1` | REDACTED-ADDR | Prefill — 8× MI300X, 2× DSC3-2Q400 |
-| SMC2 | `smc2` | REDACTED-ADDR | Decode — 8× MI300X, 2× DSC3-2Q400 |
-| SMC3 | `target` | REDACTED-ADDR | Storage target — no GPU, 2× POLLARA-1Q400 |
+| SMC1 | `${PREFILL_NAME}` | `${PREFILL_HOST}` | Prefill — 8× MI300X, 2× DSC3-2Q400 |
+| SMC2 | `${DECODE_NAME}` | `${DECODE_HOST}` | Decode — 8× MI300X, 2× DSC3-2Q400 |
+| SMC3 | `${TARGET_NAME}` | `${TARGET_HOST}` | Storage target — no GPU, 2× POLLARA-1Q400 |
+
+Real values for the live lab come from `creds/active.env` (untracked) —
+see the README's "Credentials / lab setup" section.
 
 Stack: vLLM + LMCache + NIXL + the two NIXL plugins vendored in `plugins/`.
 Model: Qwen2.5-72B-Instruct at TP=8. Reference implementation:
@@ -30,7 +33,9 @@ bring-up phase, not the destination.
 
 ## 2. Current state
 
-Thirteen commits on `main`, 67 files, clean tree. The target-side
+Thirteen commits on `main`, 67 files, clean tree (commit hashes below are
+pre-history-purge; see the credentials note in §2 below — they will differ
+after the rewrite). The target-side
 configuration (§5, §6 below) now derives from a proven sibling deployment
 rather than inference — every RPC argument name, transport-sizing formula
 and startup flag traces to a working target with measured failure dates,
@@ -56,7 +61,26 @@ a0a2c7b  chore: add gitignore
 ```
 
 `config/cluster.env` is the single source of truth. No script hardcodes an
-address, port or size. Credentials are committed deliberately — private repo.
+address, port or size.
+
+**This repo is public.** An earlier version of this project committed real
+lab credentials and addresses directly into `config/cluster.env` and the
+docs on the (since-invalidated) premise that the repo was private. That
+premise no longer holds. The fix:
+
+- `config/cluster.env` now sources per-setup identity from an untracked,
+  gitignored `creds/` directory (`creds/active.env`, a symlink to the live
+  `creds/setup-N.env`), falling back to safe `.invalid`-TLD placeholders
+  when no creds file is present — see the README's "Credentials / lab
+  setup" section and `config/cluster.env`'s own header comment.
+- Every tracked file (`README.md`, `docs/*`, `scripts/*`) has been scrubbed
+  of the literal addresses, users, and passwords that were previously
+  committed; they now reference `${PREFILL_HOST}`-style variables or
+  `creds/active.env` instead.
+- **Git history was purged** of the commits that carried the real values,
+  via `git filter-repo`, before this repo was made public. If you have an
+  older clone or fork with the pre-purge history, discard it and re-clone —
+  do not merge it back in.
 
 ---
 

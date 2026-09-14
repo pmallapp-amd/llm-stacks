@@ -44,25 +44,53 @@ comment block).
 
 ## Topology
 
-| Host / Card | IP / Address | User | Password |
-|---|---|---|---|
-| **SMC1 — smc1** (prefill role), 8x MI300X `[1dd8:5303]` | `REDACTED-ADDR` | `root` | `docker` |
-| &nbsp;&nbsp;└ BMC | `REDACTED-ADDR` | `admin` | `REDACTED-PASSWORD` |
-| &nbsp;&nbsp;└ Serial console (2x DSC3-2Q400 `[1dd8:5200]` host) | `telnet REDACTED-ADDR 2024 / 2025` ("REDACTED-LABEL") | — | — |
-| **SMC2 — smc2** (decode role), 8x MI300X `[1dd8:5303]` | `REDACTED-ADDR` | `root` | `docker` |
-| &nbsp;&nbsp;└ BMC | `REDACTED-ADDR` | `admin` | `REDACTED-PASSWORD` |
-| &nbsp;&nbsp;└ Serial console (2x DSC3-2Q400 `[1dd8:5200]` host) | `telnet REDACTED-ADDR 2022 / 2023` | — | — |
-| **SMC3 — target** (storage target role), no GPU | `REDACTED-ADDR` | `root` | `docker` |
-| &nbsp;&nbsp;└ BMC | `REDACTED-ADDR` | `root` | `REDACTED-PASSWORD` |
-| &nbsp;&nbsp;└ Serial console (2x POLLARA-1Q400 `[1dd8:1002]` @ 64:00.0, 84:00.0) | `telnet REDACTED-ADDR 2022 / 2023` ("REDACTED-LABEL/2") | — | — **connection REFUSED when last tried — unresolved, see gap #5 below** |
+| Host / Card | Address | Credentials |
+|---|---|---|
+| **SMC1** (prefill role), 8x MI300X `[1dd8:5303]` | `${PREFILL_HOST}` | `creds/active.env` |
+| &nbsp;&nbsp;└ BMC | `${PREFILL_BMC}` | `creds/active.env` |
+| &nbsp;&nbsp;└ Serial console (2x DSC3-2Q400 `[1dd8:5200]` host) | `${PREFILL_CONSOLE}` / `${PREFILL_CONSOLE_ALT}` | `creds/active.env` |
+| **SMC2** (decode role), 8x MI300X `[1dd8:5303]` | `${DECODE_HOST}` | `creds/active.env` |
+| &nbsp;&nbsp;└ BMC | `${DECODE_BMC}` | `creds/active.env` |
+| &nbsp;&nbsp;└ Serial console (2x DSC3-2Q400 `[1dd8:5200]` host) | `${DECODE_CONSOLE}` / `${DECODE_CONSOLE_ALT}` | `creds/active.env` |
+| **SMC3** (storage target role), no GPU | `${TARGET_HOST}` | `creds/active.env` |
+| &nbsp;&nbsp;└ BMC | `${TARGET_BMC}` | `creds/active.env` |
+| &nbsp;&nbsp;└ Serial console (2x POLLARA-1Q400 `[1dd8:1002]` @ 64:00.0, 84:00.0) | `${TARGET_CONSOLE}` / `${TARGET_CONSOLE_ALT}` | `creds/active.env` — **connection REFUSED when last tried — unresolved, see gap #5 below** |
 
 Compute nodes (SMC1, SMC2) each carry 2x DSC3-2Q400 `[1dd8:5200]` data-plane
 NICs. The storage node (SMC3) carries 2x POLLARA-1Q400 `[1dd8:1002]`. Both
 families are 400G-class NICs. This repo's `config/cluster.env` is the
-machine-readable form of this table.
+machine-readable form of this table's shape; the actual values for the live
+lab are not in this table, or in this repo at all.
 
-This is a private repo; the credentials above are intentionally committed —
-see `config/cluster.env`'s own header comment.
+This repo is public. Per-setup identity (addresses, users, passwords, BMC
+and console endpoints) lives entirely in the untracked, gitignored `creds/`
+directory, never in a tracked file. `creds/active.env` is a symlink to
+whichever `creds/setup-N.env` is the current lab. To point this repo at a
+new lab, create `creds/setup-N.env` (shape below, real values only) and
+repoint the symlink:
+
+```bash
+ln -sfn setup-N.env creds/active.env
+```
+
+```bash
+# creds/setup-N.env — shape only; never commit real values
+PREFILL_HOST=10.0.0.1
+PREFILL_NAME=prefill-host
+PREFILL_USER=root
+PREFILL_PASS=<password>
+PREFILL_BMC=10.0.0.2
+PREFILL_BMC_USER=admin
+PREFILL_BMC_PASS=<password>
+PREFILL_CONSOLE="telnet 10.0.0.3 2024"
+PREFILL_CONSOLE_ALT="telnet 10.0.0.3 2025"
+# DECODE_* / TARGET_* mirror the PREFILL_* shape above
+SSH_USER=root
+```
+
+See "Credentials / lab setup" under Configuration below for the full
+mechanism, including the `CREDS_FILE` override and how a missing creds file
+fails.
 
 ## Architecture
 
@@ -367,6 +395,34 @@ See `config/cluster.env` itself for the full list (~50 variables), each with
 an inline comment explaining what reads it and why its default is what it
 is.
 
+### Credentials / lab setup
+
+`config/cluster.env` is tracked and public, but it carries no addresses,
+usernames, passwords, or console endpoints — only safe `.invalid`-TLD
+(RFC 2606) placeholders such as `prefill.invalid`, `prefill-bmc.invalid`.
+Per-setup identity lives in `creds/`, which is entirely gitignored:
+
+- `creds/setup-N.env` — one file per lab, holding the real
+  `PREFILL_HOST` / `PREFILL_NAME` / `PREFILL_USER` / `PREFILL_PASS` /
+  `PREFILL_BMC` / `PREFILL_BMC_USER` / `PREFILL_BMC_PASS` /
+  `PREFILL_CONSOLE` / `PREFILL_CONSOLE_ALT` (and the `DECODE_*` /
+  `TARGET_*` equivalents), plus `SSH_USER`. Never commit this file.
+- `creds/active.env` — a symlink to whichever `setup-N.env` is the
+  current lab. Repoint it (`ln -sfn setup-N.env creds/active.env`) to
+  switch labs without editing any tracked file.
+- `CREDS_FILE` — set this environment variable to override the symlink
+  entirely and point at any path, e.g. for CI or a one-off lab:
+  `CREDS_FILE=/path/to/other.env scripts/common/00-preflight.sh`.
+
+`config/cluster.env` sources `${CREDS_FILE:-creds/active.env}` **first**, so
+every real value wins over its `.invalid` fallback when the file is
+present. If no creds file is present — a fresh clone, or a misconfigured
+symlink — every address degrades to its `.invalid` placeholder, so a
+missing creds file fails loudly (DNS/connection failure against a
+reserved, unroutable TLD) instead of silently pointing at whatever real
+host happens to resolve. See `config/cluster.env`'s own header comment for
+the mechanics.
+
 ## Verification
 
 `scripts/verify/run-all.sh` runs the applicable ladder below for whichever
@@ -430,10 +486,10 @@ negative result.
    `make_key()` comment). This cluster's actual LMCache path always sets
    `metaInfo`, so this gap does not affect normal operation, but any custom
    tooling built against `kv_io.py`/`nixlbench`-style calls will hit it.
-5. **SMC3's Pollara serial console (`telnet REDACTED-ADDR 2022/2023`) refused
+5. **SMC3's Pollara serial console (`${TARGET_CONSOLE}` / `${TARGET_CONSOLE_ALT}`) refused
    the connection the last time it was tried.** Unresolved; out-of-band
    access to SMC3 in a wedged state currently depends on its BMC
-   (`REDACTED-ADDR`) instead.
+   (`${TARGET_BMC}`) instead.
 6. **No geometry manifest for stored KV objects.** Nothing records the
    `max_value_size` an object was split under; changing `KV_MAX_VALUE_SIZE`
    without draining the namespace first

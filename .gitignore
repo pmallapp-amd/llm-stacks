@@ -1,9 +1,11 @@
 # kv-cache .gitignore
 #
-# NOTE: config/cluster.env IS tracked deliberately (this is a private repo —
-# see its own header comment and README.md's "private repo" note). Do not
-# add it or any config/local.env-style override here without reconsidering
-# that decision explicitly.
+# NOTE: config/cluster.env IS tracked deliberately — it carries only
+# `.invalid`-placeholder defaults and sources per-setup identity from the
+# untracked creds/ directory (see its own header comment and README.md's
+# "Credentials / lab setup" section). Do not add it or any
+# config/local.env-style override here without reconsidering that decision
+# explicitly.
 
 # ---- Build directories -----------------------------------------------------
 build/
@@ -64,3 +66,6 @@ config/local.env
 *~
 .idea/
 .vscode/
+
+# Per-setup identity and credentials. Never tracked.
+/creds/

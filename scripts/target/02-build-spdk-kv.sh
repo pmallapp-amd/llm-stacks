@@ -222,7 +222,7 @@ if [ "${SPDK_INITIATOR_FLAVOR}" = "fork" ]; then
     log ""
     log "  rsync -az ${SSH_USER}@${TARGET_HOST}:${SPDK_TARGET_SRC}/ ${SPDK_SRC}/"
     log ""
-    log "(run FROM smc1/smc2, against this host — matching path on both ends"
+    log "(run FROM SMC1/SMC2, against this host — matching path on both ends"
     log " because meson.build's -Dspdk_path is baked into that build's command"
     log " line, not portable to a different path without re-running meson)"
 else

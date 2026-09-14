@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 01-host-prep.sh — target (SMC3) storage-node host preparation.
 #
-# Node:          SMC3 (target), ${TARGET_HOST} / target. No GPU.
+# Node:          SMC3 (target), ${TARGET_HOST} / ${TARGET_NAME}. No GPU.
 #                2x POLLARA-1Q400 [1dd8:1002] @ 64:00.0, 84:00.0. Refuses to
 #                run elsewhere.
 # Prerequisites: outbound network access to the distro apt mirror; root.
