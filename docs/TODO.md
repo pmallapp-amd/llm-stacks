@@ -5,7 +5,7 @@ Working task list for the P/D-disaggregated KV cache cluster.
 Status key: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
 (on a decision or on someone else)
 
-Last updated: 2026-09-14
+Last updated: 2026-09-14 (compute-leg direct-transfer implementation pass)
 
 ## How to use this list
 
@@ -26,8 +26,8 @@ file.
 
 | § | Section | Items | Done | Blocked |
 |---|---|---|---|---|
-| 0 | Blocking decisions | 1 | 0 | 1 |
-| 1 | Architecture correction (compute leg) | 9 | 0 | 2 |
+| 0 | Blocking decisions | 1 | 1 | 0 |
+| 1 | Architecture correction (compute leg) | 13 | 6 | 0 |
 | 2 | Hardware bring-up (Phase 1, TCP) | 9 | 0 | 0 |
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 4 | 0 | 0 |
 | 4 | Open items / known limitations | 5 | 0 | 0 |
@@ -40,20 +40,20 @@ file.
 Done means: the decision below is recorded, with rationale, in this file
 and reflected in HANDOFF.md §3.
 
-- [!] **0.1 — Scope of SMC3 in the P→D path.** The acceptance criterion says P→D transfer
-  is RDMA; SMC3 is NVMe-oF/TCP by definition. But `plugins/nvme-kv/spdk_nvme_kv_backend.h`
-  (the `queryMem()` comment) documents storage-mediated P/D as a real, intended,
-  previously-broken-and-fixed path. Both can be true. Pick one:
-  1. **Both legs, direct wins** — NixlConnector carries P→D, SMC3 sits behind it as
-     an L2 tier for cross-request reuse and capacity spill. Likely needs `MultiConnector`.
-  2. **Direct only** — SMC3 demoted to optional/experimental, out of the acceptance path.
-  3. **Keep both as peers** — storage-mediated P/D retained as a comparison route
-     against the direct leg.
-
-  Recommendation: (1). It matches the hardware layout and the plugin's design intent,
-  and is reinforced by 5.13 below: a sibling project independently reached the same
-  storage-mediated-as-L2 conclusion after separately confirming LMCache's own p2p path
-  is unusable with this plugin. This decision determines the scope of 1.1 and 1.4.
+- [x] **0.1 — Scope of SMC3 in the P→D path. DECIDED: option (1), both legs, direct
+  wins.** The acceptance criterion says P→D transfer is RDMA; SMC3 is NVMe-oF/TCP by
+  definition. But `plugins/nvme-kv/spdk_nvme_kv_backend.h` (the `queryMem()` comment)
+  documents storage-mediated P/D as a real, intended, previously-broken-and-fixed path.
+  Both can be true — and now are: vLLM runs `MultiConnector[NixlConnector,
+  LMCacheMPConnector]`. NixlConnector carries the direct P→D transfer (the RDMA
+  acceptance criterion); LMCacheMPConnector stays `kv_both` on both sides as an L2 reuse
+  tier, not the P/D transport. Confirmed by reading the live `MultiConnector` class
+  (`multi_connector.py:213`) and that both children implement `SupportsHMA`, so the
+  hybrid KV cache manager needs no disabling. See
+  `scripts/common/gen-kv-transfer-config.sh` for the exact composed JSON. This matches
+  the hardware layout and the plugin's design intent, and is reinforced by 5.13: a
+  sibling project independently reached the same storage-mediated-as-L2 conclusion
+  after separately confirming LMCache's own p2p path is unusable with this plugin.
 
 ---
 
@@ -73,12 +73,17 @@ corrected model:
 | A — P→D KV transfer | SMC1 → SMC2 direct, GPU-to-GPU via NIXL/UCX | TCP now → **RDMA = acceptance** | DSC3-2Q400 |
 | B — Shared KV storage | SMC1/SMC2 → SMC3 over NVMe-oF | **TCP, permanently by design** | Pollara-1Q400 |
 
-- [~] **1.1** Research vLLM `NixlConnector`: `--kv-transfer-config` schema, side-channel
-  handshake and port allocation (per-TP-rank?), `kv_transfer_params` flow, which NIXL
-  backend it uses and whether `UCX_TLS` genuinely reaches RDMA on ROCm. Plus
-  `MultiConnector` schema, LMCache `nixl` p2p keys, and a recommendation between
-  MultiConnector and LMCache-only composition. *(Previous run was aborted.)*
-  **blocked by 0.1** — re-dispatch once the scoping decision is made.
+- [x] **1.1** Research vLLM `NixlConnector`: `--kv-transfer-config` schema, side-channel
+  handshake and port allocation, `kv_transfer_params` flow, which NIXL backend it uses
+  and whether `UCX_TLS` genuinely reaches RDMA on ROCm. Plus `MultiConnector` schema,
+  LMCache `nixl` p2p keys, and a recommendation between MultiConnector and LMCache-only
+  composition. Resolved: `MultiConnector[NixlConnector, LMCacheMPConnector]` (see 0.1);
+  side channel is `VLLM_NIXL_SIDE_CHANNEL_HOST`/`_PORT`, one port per role (not a
+  per-TP-rank range — no evidence for that was found; ports 5600/5601, see
+  `config/cluster.env`'s `NIXL_SIDE_CHANNEL_PORT_PREFILL`/`_DECODE`); `UCX_TLS` reaches
+  RDMA on ROCm only with `ib,rocm,self,sm` (see 3.2's note — the OLD
+  `rc_verbs,rc_mlx5,dc,ud,self,sm` value was wrong on two counts, fixed in `lib.sh`'s
+  `setup_ucx_env`).
 
 - [ ] **1.2** Split the conflated transport switch. `KV_TRANSPORT` currently drives both
   legs. Replace with `PD_TRANSPORT=tcp|rdma` (compute leg, the acceptance gate) and a
@@ -86,39 +91,87 @@ corrected model:
   `config/cluster.env`, `scripts/common/{lib.sh,00-preflight.sh,10-build-stack.sh,start-vllm.sh,tune-tcp.sh}`,
   `scripts/{prefill,decode,target}/01-host-prep.sh`, `scripts/target/03-start-kv-target.sh`,
   `scripts/verify/10-verify-network.sh`, `scripts/bench/{lib-bench.sh,40-bench-transport-compare.sh}`,
-  and all five docs.
+  and all five docs. **Explicitly NOT done by the 1.3-1.7 direct-leg implementation
+  pass** — that pass was told to keep `KV_TRANSPORT`'s name as-is rather than rename it
+  here, so all of this task's new RDMA-mode plumbing (`UCX_TLS_RDMA`,
+  `require_rdma_access`, `PREFILL_UCX_NET_DEVICES`/`DECODE_UCX_NET_DEVICES`, etc.) is
+  still keyed off `KV_TRANSPORT`, unchanged. Revisit whether `PD_TRANSPORT` is still
+  worth introducing once the compute leg has been exercised on real hardware.
 
-- [ ] **1.3** Implement the direct P→D leg. It does not exist in the repo today — `grep`
-  for `NixlConnector|MultiConnector|SIDE_CHANNEL|kv_transfer_params` finds one unused
-  variable (`NIXL_SIDE_CHANNEL_PORT`) and two comments. This is the path that carries
-  the acceptance criterion. Depends on **1.1**.
+- [x] **1.3** Implement the direct P→D leg. It did not exist in the repo before this —
+  `grep` for `NixlConnector|MultiConnector|SIDE_CHANNEL|kv_transfer_params` used to find
+  one unused variable (`NIXL_SIDE_CHANNEL_PORT`) and two comments. Now:
+  `scripts/common/gen-kv-transfer-config.sh` emits the composed `--kv-transfer-config`;
+  `lib.sh`'s `setup_pd_env`/`require_rdma_access` wire the side channel and the F4 device
+  preflight; `scripts/common/start-vllm.sh` calls all of it. `PD_ENABLED=0` reverts to
+  exactly the pre-correction LMCache-only form.
 
-- [ ] **1.4** Compose leg A with leg B in `scripts/common/start-vllm.sh`'s
-  `--kv-transfer-config` (MultiConnector chain, or LMCache configured for both p2p
-  and storage). **blocked by 0.1**.
+- [x] **1.4** Compose leg A with leg B in `scripts/common/start-vllm.sh`'s
+  `--kv-transfer-config` — done via `gen-kv-transfer-config.sh`'s `MultiConnector[
+  NixlConnector, LMCacheMPConnector]`, order controlled by `PD_LMCACHE_FIRST`.
 
-- [ ] **1.5** Fix `scripts/proxy/disagg_proxy.py` to thread `kv_transfer_params` from the
-  prefill response into the decode request. Today it replays the prompt to prefill then
-  decode, which populates a cache but will **not** trigger a direct NIXL transfer.
+- [x] **1.5** Fix `scripts/proxy/disagg_proxy.py` to thread `kv_transfer_params` from the
+  prefill response into the decode request — `_prime_prefill()` now parses prefill's JSON
+  response, extracts `PD_HANDOFF_FIELD` (configurable; exact field name not independently
+  verified against a specific installed vLLM, see that variable's comment), and
+  `handle_completion()` merges it into decode's request body. `Stats.prefill_no_handoff`
+  counts responses missing the field — the signature of a misconfigured direct leg.
 
-- [ ] **1.6** Open NIXL side-channel ports SMC1↔SMC2 in `scripts/prefill/01-host-prep.sh`
-  and `scripts/decode/01-host-prep.sh`. Likely a per-TP-rank port *range*, not a single
-  port — confirm in **1.1**.
+- [x] **1.6** Open NIXL side-channel ports SMC1↔SMC2 in `scripts/prefill/01-host-prep.sh`
+  and `scripts/decode/01-host-prep.sh` — one port per role (5600/5601, not a per-TP-rank
+  range; see 1.1), opened via `ufw`/`firewalld` mirroring the target's existing pattern.
 
-- [ ] **1.7** Retarget `scripts/verify/10-verify-network.sh` RDMA checks from the Pollara
-  storage leg to the DSC3 compute leg (`ibv_devinfo`, `ib_write_bw` SMC1↔SMC2), and add a
-  verify rung proving the direct transfer actually fired (NIXL transfer counters or the
-  side-channel handshake in logs). Today `scripts/verify/40-verify-disagg.sh` asserts a
-  cache-hit counter rises, which passes identically whether the hit came from SMC3 or
-  from a direct transfer — it cannot distinguish them, so it cannot verify acceptance.
+- [x] **1.7** Add a verify rung proving the direct transfer actually fired, distinct from
+  a storage/L2 cache hit — `scripts/verify/50-verify-pd-direct.sh`, wired into
+  `scripts/verify/run-all.sh`. Asserts on non-zero `need to load:` **and** non-zero
+  `External prefix cache hit rate` in decode's own log (F5 — never on a flag), and
+  explicitly distinguishes NixlConnector-direct / LMCache-L2 / vLLM's-own-prefix-cache
+  outcomes. **Split off, NOT closed by this item:** retargeting
+  `scripts/verify/10-verify-network.sh`'s RDMA checks away from the Pollara storage leg
+  (which is TCP-only, permanently, by design — those checks running against it at all is
+  stale) onto the DSC3 compute leg specifically — spun out as new item **1.10** below,
+  since it touches a different file this pass did not.
 
 - [ ] **1.8** Rewrite the two-leg architecture in docs — `README.md` status block,
   `ARCHITECTURE.md`, `BRINGUP.md` §9, `TROUBLESHOOTING.md`. State plainly that the
   storage leg is TCP *by design*, not by phase. Retarget
   `scripts/bench/40-bench-transport-compare.sh` and `docs/BENCHMARKING.md` so the
-  TCP-vs-RDMA comparison measures the compute leg.
+  TCP-vs-RDMA comparison measures the compute leg. `docs/BENCHMARKING.md`'s F5 confound
+  section (added this pass, see 1.7/1.13) can be folded into this rewrite rather than
+  duplicated.
 
 - [ ] **1.9** Commit the correction as its own staged commits on top of the existing history.
+
+- [ ] **1.10** Retarget `scripts/verify/10-verify-network.sh`'s RDMA fabric checks
+  (`ibv_devinfo`, `ib_write_bw`) so they run against the DSC3 compute leg (SMC1↔SMC2)
+  specifically, not against `TARGET_HOST`/Pollara — the storage leg is TCP-only,
+  permanently, by design (see `config/cluster.env`'s "Transport selection" comment), so an
+  RDMA check against it is stale regardless of `KV_TRANSPORT`. Split off from 1.7 (done)
+  because it touches a different file. Depends on **1.2** for a clean `*_RDMA_DEV` vs.
+  `*_UCX_NET_DEVICES` naming pass while in there.
+
+- [ ] **1.11** Per-host `PREFILL_UCX_NET_DEVICES`/`DECODE_UCX_NET_DEVICES` mapping (F3):
+  both default to `ionic_0:1` today because that is the one index confirmed to line up on
+  both hosts. `scripts/{prefill,decode}/01-host-prep.sh` now report each host's
+  `ionic_* -> pci=` mapping, but nobody has cross-checked that report against the actual
+  DSC3 cabling on SMC1/SMC2 — do that on first real hardware contact, and pin
+  higher-numbered `ionic_N` values explicitly (not by copying one host's report to the
+  other) if the fabric ever uses more than the one confirmed-symmetric port pair.
+
+- [ ] **1.12** Connector-order experiment: run `scripts/verify/50-verify-pd-direct.sh` and
+  `scripts/bench/20-bench-prefix-cache.sh --confirm-connector-hit` under both
+  `PD_LMCACHE_FIRST=0` (default — NixlConnector first refusal) and `PD_LMCACHE_FIRST=1`
+  (LMCache first refusal) and record how often each connector actually ends up serving a
+  given request under each order. This is the follow-up `PD_LMCACHE_FIRST`'s own
+  `config/cluster.env` comment references; nobody has run it on real hardware yet.
+
+- [ ] **1.13** F5 benchmark rework: `scripts/bench/20-bench-prefix-cache.sh` now warns
+  about and has a `--confirm-connector-hit` mode for the "vLLM's own prefix cache sits
+  upstream of the connector" confound (see `docs/BENCHMARKING.md`'s F5 section), but the
+  underlying sweep still re-sends context to the SAME decode instance — a genuinely
+  cross-instance or post-eviction measurement protocol (per F5's own recommendation) has
+  not been built. Design and add that as its own script/mode once real hardware is
+  available to validate the eviction-forcing mechanism against.
 
 ---
 
@@ -167,9 +220,17 @@ inference, and the verify ladder plus transport-compare benchmark both
 pass in that mode.
 
 - [ ] **3.1** RoCE fabric config on the DSC3 NICs SMC1↔SMC2 — PFC/ECN/DSCP, MTU 9000.
-- [ ] **3.2** Flip `PD_TRANSPORT=rdma`. `setup_ucx_env` in `scripts/common/lib.sh`
-      deliberately omits `tcp` from `UCX_TLS` in RDMA mode so a half-configured fabric
-      fails loudly instead of silently falling back — keep that property. Depends on **1.2**.
+- [ ] **3.2** Flip `KV_TRANSPORT=rdma` (still this variable's name until **1.2** lands —
+      see 1.2's note). `setup_ucx_env` in `scripts/common/lib.sh` now exports
+      `UCX_TLS="ib,rocm,self,sm"` in RDMA mode (corrected this pass — the old
+      `rc_verbs,rc_mlx5,dc,ud,self,sm` pinned a transport, `rc`, this fabric's ionic
+      provider doesn't expose at all; see the F3 writeup in `setup_ucx_env`'s own
+      comment) and deliberately still omits `tcp` from `UCX_TLS` so a half-configured
+      fabric fails loudly instead of silently falling back — keep that property.
+      `require_rdma_access` (also new this pass) is the preflight that catches an
+      unopenable `/dev/infiniband/uverbs*` node before vLLM burns ~90s looking like a
+      hang (F4) — run it (via `start-vllm.sh`, automatic) before assuming a failure
+      here is the fabric's fault.
 - [ ] **3.3** Prove RDMA is actually carrying the KV traffic (counters, not inference from
       throughput alone).
 - [ ] **3.4** Re-run the verify ladder and `scripts/bench/40-bench-transport-compare.sh`.

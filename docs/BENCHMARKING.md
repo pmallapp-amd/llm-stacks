@@ -134,16 +134,45 @@ comparison is measured against.
 
 ### Prefix-cache benefit (the headline number)
 
+> **Read this before trusting the number below.** vLLM's **own** prefix
+> cache sits **upstream** of the connector layer (LMCache / NixlConnector).
+> If it hits, **no connector is consulted at all** — with a large GPU KV
+> cache (this cluster's default), a same-instance repeat can be served
+> entirely out of vLLM's own cache, making the disaggregated tier look like
+> it delivered the win when it was never touched. This script's own
+> depth>0 "Inference" step re-sends the same context to the same
+> proxy->decode path a second time — exactly the shape of this confound.
+>
+> A valid reuse number is either **cross-instance** (decode loading what
+> prefill stored, having never run that context itself) or measured only
+> **after the GPU cache has genuinely been evicted** — and even then,
+> confirm it with a non-zero `need to load:` **and** a non-zero
+> `External prefix cache hit rate` in decode's own log, never with the
+> mere presence of `--enable-prefix-caching` or a plausible-looking
+> speedup. This confound invalidated every earlier retrieve measurement on
+> the reference project this repo's compute leg is modeled on.
+>
+> Always run with `--confirm-connector-hit` (below) and treat a run
+> without it as a smoke test, not a reportable number. For the
+> unambiguous, single-request version of the same check, see
+> `scripts/verify/50-verify-pd-direct.sh`.
+
 ```bash
-scripts/bench/20-bench-prefix-cache.sh
+scripts/bench/20-bench-prefix-cache.sh --confirm-connector-hit   # run ON decode (SMC2)
 python3 scripts/bench/compare_runs.py --prefix-benefit --format md \
     "${BENCHY_RESULT_DIR}"/<timestamp>-prefix-cache/result.json
 ```
-Read the `ctx_pp @ d{N}` rows as "the prefill node populating SMC3"; read
-the `pp{n} @ d{N}` rows as "the decode node retrieving it." The
-`--prefix-benefit` speedup column (`cold_est_ppt / warm_est_ppt`) is the
-single number answering the task's central question. A speedup
-meaningfully above 1.0x, marked significant (`*`), is a positive result.
+`--confirm-connector-hit` greps `${LOG_DIR}/vllm-decode.log` for the
+post-sweep evidence above and **dies loudly** if none is found — it
+requires running the script on the decode node itself, since the log is
+not fetched remotely. Read the `ctx_pp @ d{N}` rows as "the prefill node
+populating SMC3"; read the `pp{n} @ d{N}` rows as "the decode node
+retrieving it." The `--prefix-benefit` speedup column
+(`cold_est_ppt / warm_est_ppt`) is the single number answering the task's
+central question, but ONLY once `--confirm-connector-hit` (or
+`scripts/verify/50-verify-pd-direct.sh`) has confirmed a connector was
+actually consulted. A speedup meaningfully above 1.0x, marked significant
+(`*`), is a positive result — conditional on that confirmation.
 
 ### Concurrency saturation
 
@@ -199,14 +228,21 @@ find out which of the two known causes it is:
    request pair rather than a full sweep. A clean pass there with a
    negative benchmark result here would itself be a useful, specific data
    point (worth filing as its own investigation).
-2. Read `docs/TROUBLESHOOTING.md`'s **"LMCache hit tokens: 0" on every
+2. Run `scripts/verify/50-verify-pd-direct.sh` on the decode node — it
+   distinguishes a NixlConnector direct hit from an LMCache L2 hit from
+   vLLM's own upstream prefix cache serving the request with no connector
+   consulted at all (the F5 confound above). If `20-bench-prefix-cache.sh
+   --confirm-connector-hit` also failed, this is the next thing to run.
+3. Read `docs/TROUBLESHOOTING.md`'s **"LMCache hit tokens: 0" on every
    decode request** entry — it enumerates the two concrete causes this
    repo has hit before (wrong LMCache storage-backend mode; the plugin's
    `queryMem()` existence-probe missing or reverted) and how to
    distinguish them.
 
 A benchmark harness cannot fix a broken cache; it can only tell you,
-precisely, that one exists to fix.
+precisely, that one exists to fix. And per F5 above, a POSITIVE-looking
+number is not proof either, unless `--confirm-connector-hit` (or
+`50-verify-pd-direct.sh`) confirmed the connector was actually consulted.
 
 ## 7. Order-of-magnitude expectations — ESTIMATES, replace with measured values
 

@@ -201,30 +201,258 @@ srcip_to() {
 # ─────────────────────────────────────────────────────────────────────────────
 # UCX / NIXL transport selection
 # ─────────────────────────────────────────────────────────────────────────────
-# Exports UCX_TLS / UCX_NET_DEVICES appropriate to KV_TRANSPORT for the direct
-# P<->D NIXL leg. Call this before launching a vLLM instance.
+# setup_ucx_env <prefill|decode> — exports UCX_TLS and its RDMA-mode
+# dependents appropriate to KV_TRANSPORT for the direct P<->D NIXL leg. Call
+# this before launching a vLLM instance.
 #
 #   tcp   force TCP so a half-configured RoCE fabric cannot silently be used
 #         (or silently fail over) during bring-up. Determinism beats speed here.
-#   rdma  RC verbs over the RoCE-capable device. Deliberately does NOT include
-#         tcp in the list: acceptance must FAIL LOUDLY rather than fall back.
+#   rdma  verbs-only over the RoCE-capable ionic device. Deliberately does
+#         NOT include tcp in the list: acceptance must FAIL LOUDLY rather
+#         than fall back.
+#
+# WHY the RDMA branch below is NOT "rc_verbs,rc_mlx5,dc,ud,self,sm" (this
+# repo's OLD value, wrong on two counts, corrected 2026-09-14):
+#
+#   1. "rc" not reachable on this fabric. The ionic (Pensando) provider
+#      exposes ud/ud_verbs to UCX but NOT rc_verbs — pinning "rc" (or the
+#      mlx5-specific "rc_mlx5") fails outright on this hardware. "ib"
+#      (UCX_TLS_RDMA's actual value, config/cluster.env) means verbs-only:
+#      it matches whatever the device actually offers instead of pinning a
+#      transport that doesn't exist here, and because it is still
+#      verbs-only, it retains the "cannot silently degrade to TCP" property
+#      the acceptance criterion needs — pinning "rc" achieved that same
+#      property but only by accident of also being wrong.
+#   2. "rocm" IS NOT OPTIONAL and IS NOT a network transport. With "ib"
+#      alone, UCX loads no ROCm memory domain, so its memory-type detection
+#      cannot recognize a HIP/ROCm device pointer as VRAM — it reports VRAM
+#      as host memory, and NIXL's registerMem() then fails:
+#        ucx_utils.cpp:576 VRAM memory is detected as host by UCX. UCX is
+#          likely not configured with CUDA/ROCm support.
+#        nixl_agent.cpp:468 registerMem: registration failed
+#      That message is MISLEADING: the installed UCX build DOES have ROCm
+#      support (HAVE_ROCM 1, uct_MODULES ":ib:rdmacm:rocm:cma", rocm_cpy/
+#      rocm_ipc both enumerate in `ucx_info -d`) — it was CONFIGURED OUT by
+#      UCX_TLS omitting "rocm". rocm_cpy/rocm_ipc are LOCAL memory-domain
+#      components, not network transports, so adding them back cannot
+#      reintroduce the TCP fallback pinning "ib" exists to prevent.
+#      Recorded as BLOCKER 7, 2026-09-11.
+#
+# UCX_IB_ROCE_LOCAL_SUBNET=y + UCX_IB_ROCE_SUBNET_PREFIX_LEN=16 are
+# MANDATORY, not tuning: every DSC3 fabric link is a /31 point-to-point, so
+# prefill and decode sit in DIFFERENT IP subnets, and UCX's RoCE
+# reachability check derives its compare length from the netmask by
+# default — rejecting a perfectly routable peer with "unreachable IB
+# device address" unless the check is told to compare at /16 instead.
+#
+# UCX_NET_DEVICES is looked up PER ROLE (PREFILL_UCX_NET_DEVICES /
+# DECODE_UCX_NET_DEVICES), not assumed symmetric: the device index does not
+# map to the same fabric plane on both hosts (e.g. ionic_2 can be a
+# different physical port on SMC1 than on SMC2) — only ionic_0/ionic_1 are
+# confirmed to line up. See scripts/{prefill,decode}/01-host-prep.sh for
+# the per-host device/port report.
 setup_ucx_env() {
-    local rdma_dev="${1:-}" net_dev="${2:-}"
+    local role="${1:-}"
+    local ucx_net_dev tcp_net_dev
+    case "${role}" in
+        prefill) ucx_net_dev="${PREFILL_UCX_NET_DEVICES}"; tcp_net_dev="${PREFILL_DATA_IF}" ;;
+        decode)  ucx_net_dev="${DECODE_UCX_NET_DEVICES}";  tcp_net_dev="${DECODE_DATA_IF}"  ;;
+        *) die "setup_ucx_env: role must be prefill|decode, got '${role}'" ;;
+    esac
+
     case "${KV_TRANSPORT}" in
         tcp)
-            export UCX_TLS="tcp,self,sm"
-            [ -n "${net_dev}" ] && export UCX_NET_DEVICES="${net_dev}"
-            log "UCX: TCP mode (UCX_TLS=${UCX_TLS} UCX_NET_DEVICES=${UCX_NET_DEVICES:-all})"
+            export UCX_TLS="${UCX_TLS_TCP}"
+            # Not load-bearing in TCP mode; drop the EXPORT attribute (not
+            # the variable itself — `unset` would also erase cluster.env's
+            # own default, breaking a LATER setup_ucx_env call for the
+            # OTHER mode in the same shell/session, e.g. a verify script
+            # that calls this more than once) so a stale RDMA-mode export
+            # from an earlier call can't leak into a TCP-mode child process.
+            export -n UCX_IB_GID_INDEX UCX_IB_ROCE_LOCAL_SUBNET \
+                      UCX_IB_ROCE_SUBNET_PREFIX_LEN NCCL_CUMEM_ENABLE 2>/dev/null || true
+            if [ -n "${tcp_net_dev}" ]; then
+                export UCX_NET_DEVICES="${tcp_net_dev}"
+            else
+                # UCX_NET_DEVICES (unlike the RoCE knobs above) has no
+                # cluster.env default of its own — this function is the
+                # only place that ever sets it — so unsetting it outright
+                # is safe here.
+                unset UCX_NET_DEVICES 2>/dev/null || true
+            fi
+            log "UCX: TCP mode (UCX_TLS=${UCX_TLS} UCX_NET_DEVICES=${UCX_NET_DEVICES:-<auto>})"
             ;;
         rdma)
-            [ -n "${rdma_dev}" ] || die "KV_TRANSPORT=rdma but no RDMA device given (set *_RDMA_DEV in config/cluster.env)"
-            export UCX_TLS="rc_verbs,rc_mlx5,dc,ud,self,sm"
-            export UCX_NET_DEVICES="${rdma_dev}"
-            # No TCP in UCX_TLS on purpose: see function comment.
-            log "UCX: RDMA mode (UCX_TLS=${UCX_TLS} UCX_NET_DEVICES=${UCX_NET_DEVICES})"
+            [ -n "${ucx_net_dev}" ] || die "KV_TRANSPORT=rdma but no UCX_NET_DEVICES resolved for" \
+                " role=${role} (set PREFILL_UCX_NET_DEVICES/DECODE_UCX_NET_DEVICES in" \
+                " config/cluster.env)"
+            export UCX_TLS="${UCX_TLS_RDMA}"
+            export UCX_NET_DEVICES="${ucx_net_dev}"
+            export UCX_IB_GID_INDEX
+            export UCX_IB_ROCE_LOCAL_SUBNET
+            export UCX_IB_ROCE_SUBNET_PREFIX_LEN
+            export NCCL_CUMEM_ENABLE
+            # No TCP in UCX_TLS on purpose: see function comment above.
+            log "UCX: RDMA mode (UCX_TLS=${UCX_TLS} UCX_NET_DEVICES=${UCX_NET_DEVICES}" \
+                " UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX}" \
+                " UCX_IB_ROCE_LOCAL_SUBNET=${UCX_IB_ROCE_LOCAL_SUBNET}" \
+                " UCX_IB_ROCE_SUBNET_PREFIX_LEN=${UCX_IB_ROCE_SUBNET_PREFIX_LEN}" \
+                " NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE})"
             ;;
         *) die "invalid KV_TRANSPORT='${KV_TRANSPORT}' (expected tcp|rdma)" ;;
     esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NIXL side channel (F2) — the out-of-band handshake letting the two vLLM
+# engines exchange memory descriptors BEFORE any RDMA happens. NOT the data
+# path itself (that's UCX over the fabric, setup_ucx_env above) — but it
+# must be reachable from the peer host, or the whole direct P<->D leg
+# silently never fires.
+#
+# setup_pd_env <prefill|decode> — resolves and validates
+# VLLM_NIXL_SIDE_CHANNEL_HOST/_PORT and exports them.
+#
+# WHY this refuses loopback/empty rather than letting vLLM fall back to its
+# own default: vLLM's default VLLM_NIXL_SIDE_CHANNEL_HOST is a loopback
+# address, which only fails once the PEER tries to connect to it — i.e.
+# deep into a run, long after startup looked healthy (the local engine
+# starts fine, binds its side channel on loopback, and only the SECOND
+# engine's connect attempt reveals the address was never externally
+# reachable). Refusing outright, at launch time, turns that into an
+# immediate, unambiguous failure instead of a "why did the handoff never
+# happen" investigation later.
+# ─────────────────────────────────────────────────────────────────────────────
+setup_pd_env() {
+    local role="$1"
+    local host_override port
+    case "${role}" in
+        prefill) host_override="${PD_SIDE_CHANNEL_HOST_PREFILL}"; port="${NIXL_SIDE_CHANNEL_PORT_PREFILL}" ;;
+        decode)  host_override="${PD_SIDE_CHANNEL_HOST_DECODE}";  port="${NIXL_SIDE_CHANNEL_PORT_DECODE}"  ;;
+        *) die "setup_pd_env: role must be prefill|decode, got '${role}'" ;;
+    esac
+
+    local host="${host_override}"
+    if [ -z "${host}" ]; then
+        host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+
+    case "${host}" in
+        ""|127.*|0.0.0.0|localhost)
+            die "resolved NIXL side-channel host for role=${role} is" \
+                " loopback/empty ('${host}') — refusing to start. vLLM's" \
+                " own default here is a loopback address that fails only" \
+                " once the PEER engine tries to connect to it, long after" \
+                " this process looked healthy (F2). Pin" \
+                " PD_SIDE_CHANNEL_HOST_${role^^} in config/cluster.env" \
+                " explicitly if \`hostname -I\` on this host doesn't return" \
+                " the address the peer should use, or fix routing/hostname" \
+                " config so it does."
+            ;;
+    esac
+
+    export VLLM_NIXL_SIDE_CHANNEL_HOST="${host}"
+    export VLLM_NIXL_SIDE_CHANNEL_PORT="${port}"
+    log "NIXL side channel (role=${role}): ${VLLM_NIXL_SIDE_CHANNEL_HOST}:${VLLM_NIXL_SIDE_CHANNEL_PORT}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RDMA device access preflight (F4) — presence of /dev/infiniband/uverbs*
+# nodes is NOT the same as permission to open them.
+#
+# Measured 2026-09-11: with nodes present but unopenable, open() returns
+# EPERM, ibverbs enumerates nothing, UCX reports "network device 'ionic_0:1'
+# is not available" / "no usable transports", and NIXL fails createBackend
+# with NIXL_ERR_BACKEND.
+#
+# THIS PRESENTS AS A HANG, not an obvious error: vLLM's EngineCore burns
+# ~100% CPU compiling for roughly 60 seconds BEFORE it ever reaches the
+# connector, so the real error only surfaces at t~90s. An earlier session
+# misread that startup CPU burn as the process simply being slow and
+# stopped watching before the real failure printed — this preflight exists
+# so that failure happens at t=0, with a specific cause, instead of at
+# t~90s looking like a stall.
+#
+# require_rdma_access [net_dev] — no-op (logged) unless KV_TRANSPORT=rdma.
+# Call this AFTER setup_ucx_env so UCX_NET_DEVICES is already resolved if
+# the caller wants to pass it through for the ibv_devinfo cross-check.
+# ─────────────────────────────────────────────────────────────────────────────
+require_rdma_access() {
+    local net_dev="${1:-}"
+    if [ "${KV_TRANSPORT}" != "rdma" ]; then
+        log "require_rdma_access: skipped (KV_TRANSPORT=${KV_TRANSPORT})"
+        return 0
+    fi
+
+    step "RDMA device access preflight (F4 — see require_rdma_access() in lib.sh)"
+
+    shopt -s nullglob
+    local _nodes=(/dev/infiniband/uverbs*)
+    shopt -u nullglob
+    [ "${#_nodes[@]}" -gt 0 ] || die "no /dev/infiniband/uverbs* device nodes present." \
+        " KV_TRANSPORT=rdma requires them; without them ibverbs enumerates" \
+        " nothing, UCX reports 'network device ... is not available' /" \
+        " 'no usable transports', and NIXL fails createBackend with" \
+        " NIXL_ERR_BACKEND. NOTE: vLLM's EngineCore burns ~100% CPU" \
+        " compiling for ~60s BEFORE it ever reaches the connector, so this" \
+        " failure PRESENTS AS A HANG and would only have surfaced at" \
+        " t~90s if this preflight hadn't caught it first (measured" \
+        " 2026-09-11)."
+
+    local _opened=0 _n
+    for _n in "${_nodes[@]}"; do
+        if { exec 3<>"${_n}"; } 2>/dev/null; then
+            exec 3>&- 2>/dev/null || true
+            _opened=1
+            break
+        fi
+    done
+    [ "${_opened}" -eq 1 ] || die "found ${#_nodes[@]} /dev/infiniband/uverbs* node(s)" \
+        " (${_nodes[*]}) but none could be OPENED (EPERM) — node presence is" \
+        " NOT the same as permission to use them. Measured 2026-09-11: this" \
+        " exact symptom (nodes present, unopenable) makes ibverbs enumerate" \
+        " nothing, UCX report 'no usable transports', and NIXL fail" \
+        " createBackend with NIXL_ERR_BACKEND — and because vLLM's" \
+        " EngineCore spends ~60s compiling before it ever reaches the" \
+        " connector, this PRESENTS AS A ~90-SECOND HANG, not an immediate" \
+        " error. Grant read/write on these nodes (device cgroup rule, udev" \
+        " rule, or group membership + IPC_LOCK capability) before retrying."
+
+    local _memlock
+    _memlock="$(ulimit -l)"
+    [ "${_memlock}" = "unlimited" ] || die "memlock limit is '${_memlock}', not" \
+        " unlimited — RDMA memory registration (ibv_reg_mr()) needs to pin" \
+        " arbitrary amounts of userspace memory. scripts/{prefill,decode}/" \
+        "01-host-prep.sh writes /etc/security/limits.d/99-kvstack.conf with" \
+        " unlimited memlock, but that only takes effect in a NEW login" \
+        " session — this shell (or whatever launched it) predates that" \
+        " write, or the limits file is missing/wrong. Start a fresh" \
+        " session and retry."
+
+    require_cmd ibv_devinfo
+    local _devinfo
+    _devinfo="$(ibv_devinfo 2>/dev/null || true)"
+    if printf '%s\n' "${_devinfo}" | grep -q 'state:.*PORT_ACTIVE'; then
+        ok "ibv_devinfo reports at least one port PORT_ACTIVE"
+    else
+        die "no RDMA port reports PORT_ACTIVE in ibv_devinfo output —" \
+            " KV_TRANSPORT=rdma cannot proceed without an active fabric" \
+            " link. Full ibv_devinfo output:"$'\n'"${_devinfo}"
+    fi
+    if [ -n "${net_dev}" ]; then
+        local _dev_name="${net_dev%%:*}"
+        if printf '%s\n' "${_devinfo}" | grep -q "${_dev_name}"; then
+            ok "configured UCX_NET_DEVICES device '${_dev_name}' present in ibv_devinfo"
+        else
+            warn "configured UCX_NET_DEVICES device '${_dev_name}' (from" \
+                 " '${net_dev}') not seen in ibv_devinfo output — double" \
+                 " check PREFILL_UCX_NET_DEVICES/DECODE_UCX_NET_DEVICES" \
+                 " against THIS host's actual device name (F3: the device" \
+                 " index is not guaranteed symmetric across hosts)."
+        fi
+    fi
+
+    ok "RDMA device access preflight passed"
 }
 
 # Exports the NIXL_KV_* environment the SPDK_NVMe_KV plugin reads.
@@ -305,6 +533,8 @@ ${_C_DIM}
   target    : ${TARGET_HOST}:${NVMF_TRSVCID}  subnqn=${NVMF_SUBNQN}
   model     : ${MODEL}  (TP=${TP_SIZE})
   trid      : ${KV_TRID}
+  compute leg (P->D): PD_ENABLED=${PD_ENABLED} PD_CONNECTOR=${PD_CONNECTOR} PD_LMCACHE_FIRST=${PD_LMCACHE_FIRST}
+  nixl side channel : prefill=${NIXL_SIDE_CHANNEL_PORT_PREFILL} decode=${NIXL_SIDE_CHANNEL_PORT_DECODE}
 ${_C_RST}
 EOF
 }

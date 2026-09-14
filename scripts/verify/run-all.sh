@@ -64,6 +64,7 @@ case "${THIS_ROLE}" in
         SCRIPTS+=("20-verify-nixl-plugin.sh")
         SCRIPTS+=("30-verify-kv-roundtrip.sh")
         SCRIPTS+=("40-verify-disagg.sh")
+        SCRIPTS+=("50-verify-pd-direct.sh")
         ;;
     target)
         SCRIPTS+=("10-verify-network.sh")
@@ -71,15 +72,21 @@ case "${THIS_ROLE}" in
              " NIXL_PLUGIN_DIR, which only exist on a compute node" \
              " (SMC1/SMC2). Run those from prefill or decode instead."
         SCRIPTS+=("40-verify-disagg.sh")
+        info "skipping 50- on the target: its log-based direct-transfer" \
+             " verdict (F5) requires reading \${LOG_DIR}/vllm-decode.log" \
+             " locally, which only exists on SMC2. Run it from decode" \
+             " instead for the authoritative verdict."
         ;;
     unknown)
         info "role unknown (not one of PREFILL_HOST/DECODE_HOST/TARGET_HOST)" \
              " — running only the checks meaningful from an arbitrary host:" \
              " network reachability and the full end-to-end disaggregation" \
              " proof. Run 20-/30- directly on SMC1 or SMC2 for the" \
-             " plugin-level and roundtrip-level checks."
+             " plugin-level and roundtrip-level checks; run 50- directly" \
+             " on SMC2 (decode) for its log-based direct-transfer verdict."
         SCRIPTS+=("10-verify-network.sh")
         SCRIPTS+=("40-verify-disagg.sh")
+        SCRIPTS+=("50-verify-pd-direct.sh")
         ;;
 esac
 

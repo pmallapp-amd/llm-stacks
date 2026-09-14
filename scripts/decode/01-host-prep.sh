@@ -117,15 +117,88 @@ if [ -z "${DECODE_DATA_IF}" ]; then
 fi
 
 # DSC3-2Q400 NICs [1dd8:5200] + RDMA device presence (Phase 2 prerequisite;
-# advisory in Phase 1).
-step "DSC3-2Q400 NICs [1dd8:5200] and RDMA devices"
+# advisory in Phase 1). Also reports the ionic_* -> PCI-device mapping so an
+# operator can pin DECODE_UCX_NET_DEVICES to the CORRECT physical port on
+# THIS host — F3: the device index is not guaranteed to line up the same
+# way on SMC2 as it does on SMC1 (e.g. ionic_2 can be a different physical
+# port on each). Only ionic_0/ionic_1 are confirmed to line up.
+step "DSC3-2Q400 NICs [1dd8:5200], RDMA devices, and ionic_* -> PCI mapping"
 lspci -d 1dd8:5200 -nn 2>/dev/null | while IFS= read -r line; do log "  ${line}"; done
 if command -v ibv_devinfo >/dev/null 2>&1; then
     ibv_devinfo -l 2>/dev/null | tail -n +2 | while IFS= read -r d; do log "  rdma dev: ${d}"; done
 fi
+if [ -d /sys/class/infiniband ]; then
+    for _ibdev in /sys/class/infiniband/*; do
+        [ -e "${_ibdev}" ] || continue
+        _ibname="$(basename "${_ibdev}")"
+        _ibpci="$(basename "$(readlink -f "${_ibdev}/device" 2>/dev/null || true)" 2>/dev/null || true)"
+        log "  ${_ibname} -> pci=${_ibpci:-<unknown>}"
+    done
+    warn "F3 (verified 2026-09-11): cross-check the pci= addresses above" \
+         " against this host's physical cabling before trusting" \
+         " DECODE_UCX_NET_DEVICES='${DECODE_UCX_NET_DEVICES}' in" \
+         " config/cluster.env — the same ionic_N NAME can be a different" \
+         " physical port on SMC1, so a value copied verbatim from" \
+         " prefill's report is not safe to assume correct here."
+else
+    info "/sys/class/infiniband absent — nothing to map yet (fine for" \
+         " KV_TRANSPORT=tcp; required before Phase 2)."
+fi
 if [ "${KV_TRANSPORT}" = "rdma" ] && [ -z "${DECODE_RDMA_DEV}" ]; then
     die "KV_TRANSPORT=rdma but DECODE_RDMA_DEV is unset — setup_ucx_env" \
         " will refuse to start vLLM without it (see lib.sh)."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RDMA device ACCESS (F4) — distinct from device PRESENCE above. Node files
+# existing is not the same as this process being able to open them. Hard
+# gate in RDMA mode (reuses lib.sh's require_rdma_access, the same
+# preflight start-vllm.sh runs before every launch); advisory-only in TCP
+# mode, since Phase 1 doesn't need RDMA access yet but a problem here WILL
+# block Phase 2 later, so it's worth surfacing now rather than at cutover.
+# ─────────────────────────────────────────────────────────────────────────────
+step "RDMA device access (required in RDMA mode, advisory in TCP mode — F4)"
+if [ "${KV_TRANSPORT}" = "rdma" ]; then
+    require_rdma_access "${DECODE_UCX_NET_DEVICES}"
+else
+    shopt -s nullglob
+    _uverbs_nodes=(/dev/infiniband/uverbs*)
+    shopt -u nullglob
+    if [ "${#_uverbs_nodes[@]}" -eq 0 ]; then
+        info "no /dev/infiniband/uverbs* nodes yet (advisory — not needed" \
+             " until KV_TRANSPORT=rdma)"
+    else
+        _uverbs_opened=0
+        for _uv in "${_uverbs_nodes[@]}"; do
+            if { exec 3<>"${_uv}"; } 2>/dev/null; then
+                exec 3>&- 2>/dev/null || true
+                _uverbs_opened=1
+                break
+            fi
+        done
+        if [ "${_uverbs_opened}" -eq 1 ]; then
+            ok "uverbs node(s) present and openable: ${_uverbs_nodes[*]}"
+        else
+            warn "uverbs node(s) present but NOT openable (EPERM) —" \
+                 " harmless under KV_TRANSPORT=tcp today, but per F4 this" \
+                 " WILL block KV_TRANSPORT=rdma later, and it presents as" \
+                 " a ~90-second HANG (vLLM's EngineCore compiles for ~60s" \
+                 " before it ever reaches the connector), not an" \
+                 " immediate, obvious error. Fix device permissions" \
+                 " (device cgroup rule, udev rule, group membership) before" \
+                 " Phase 2 cutover."
+        fi
+    fi
+    if command -v ibv_devinfo >/dev/null 2>&1; then
+        _devinfo_soft="$(ibv_devinfo 2>/dev/null || true)"
+        if printf '%s\n' "${_devinfo_soft}" | grep -q 'state:.*PORT_ACTIVE'; then
+            ok "ibv_devinfo: at least one port PORT_ACTIVE"
+        else
+            warn "ibv_devinfo: no port reports PORT_ACTIVE (advisory in TCP mode)"
+        fi
+    else
+        warn "ibv_devinfo not installed — cannot report RDMA port state (advisory)"
+    fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,6 +239,42 @@ cat > "${LIMITS_FILE}" <<'EOF'
 EOF
 ok "wrote ${LIMITS_FILE} (takes effect on next login/session; a running" \
    " shell used to launch vLLM must be a NEW session after this)"
+
+_memlock_now="$(ulimit -l)"
+if [ "${_memlock_now}" = "unlimited" ]; then
+    ok "THIS session's memlock is already unlimited — F4's preflight" \
+       " (require_rdma_access, run by start-vllm.sh in RDMA mode) will pass"
+else
+    warn "THIS session's memlock is still '${_memlock_now}', not unlimited" \
+         " — ${LIMITS_FILE} was just written but limits only apply to a" \
+         " NEW login session. Log out/in (or start a fresh shell) before" \
+         " running scripts/common/start-vllm.sh in RDMA mode, or its" \
+         " require_rdma_access preflight will refuse to start."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Firewall — open the NIXL side-channel port to the peer (prefill) node.
+# Same pattern as scripts/target/01-host-prep.sh's NVMe-oF port opening: act
+# only if a host firewall is actually enforcing anything, and say so
+# plainly if neither ufw nor firewalld is active rather than guessing at
+# iptables rules. Without this, the side-channel handshake (F2) can fail
+# exactly the way an unreachable loopback default does — silently, until
+# the peer actually tries to connect.
+# ─────────────────────────────────────────────────────────────────────────────
+step "Firewall (${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp, NIXL side channel <- ${PREFILL_NAME})"
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    ufw allow "${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp" comment "NIXL side channel (kvstack, decode)"
+    ok "ufw: opened ${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp"
+elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-port="${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp"
+    firewall-cmd --reload
+    ok "firewalld: opened ${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp"
+else
+    info "neither ufw nor firewalld is active — no firewall changes made" \
+         " (if some other mechanism blocks" \
+         " ${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp, e.g. raw iptables/nftables" \
+         " rules or an upstream security group, open it there manually)"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Target reachability (soft — target may not be started yet)

@@ -46,17 +46,62 @@
 # vLLM's own server-side prefix cache, which this script's depth=0 rows do
 # not).
 #
-# usage: 20-bench-prefix-cache.sh (no flags — always targets the proxy;
-#   depth>0 requires the FULL disaggregated path, priming through the
-#   proxy, to mean anything. Pointing this at prefill or decode directly
-#   would skip the very hop under test.)
+# ═══════════════════════════════════════════════════════════════════════════
+# F5 — THE MEASUREMENT TRAP THIS SCRIPT IS EXPOSED TO (read before trusting
+# any speedup number this script reports)
+# ═══════════════════════════════════════════════════════════════════════════
+# vLLM's OWN prefix cache sits UPSTREAM of the connector layer (LMCache /
+# NixlConnector). If it hits, NO connector is consulted at all. With a
+# large GPU KV cache (this cluster's default GPU_MEM_UTIL leaves the
+# overwhelming majority of 192GB/GPU HBM3 for KV — see config/cluster.env's
+# model comment), a same-instance "warm" repeat sent back to the SAME
+# decode process can be served entirely out of vLLM's own cache, making
+# the disaggregated-cache tier look like it delivered the win when it was
+# never consulted. This is exactly the shape of this script's own
+# depth>0 "Inference" step: it re-sends the SAME context to the SAME
+# proxy -> decode path a second time.
+#
+# A speedup number from this script is THEREFORE NOT, on its own, proof
+# the connector tier did anything. An honest reuse number is either
+# CROSS-INSTANCE (decode loading what prefill stored, never having run
+# that context itself) or measured only AFTER the GPU cache has genuinely
+# been evicted — and even then, confirm it with a non-zero "need to load:"
+# and a non-zero "External prefix cache hit rate" in decode's own log, not
+# with the presence of --enable-prefix-caching or a plausible-looking
+# number. This confound invalidated every earlier retrieve measurement on
+# the reference project this repo's compute leg is modeled on.
+#
+# Use --confirm-connector-hit (below) to have this script check for that
+# log evidence itself, immediately after the sweep, and fail loudly if it
+# is absent — see docs/BENCHMARKING.md's own F5 section for the full
+# writeup and scripts/verify/50-verify-pd-direct.sh for the single-request,
+# unambiguous version of the same check.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# usage: 20-bench-prefix-cache.sh [--confirm-connector-hit]
+#   (no other flags — always targets the proxy; depth>0 requires the FULL
+#   disaggregated path, priming through the proxy, to mean anything.
+#   Pointing this at prefill or decode directly would skip the very hop
+#   under test.)
+#
+#   --confirm-connector-hit   after the sweep, grep ${LOG_DIR}/vllm-decode.log
+#                             for connector evidence (F5) and die loudly if
+#                             none is found. REQUIRES running this script ON
+#                             the decode node (SMC2) — the log is not
+#                             fetched remotely.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../common/lib.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib-bench.sh"
 
-[ "$#" -eq 0 ] || die "20-bench-prefix-cache.sh takes no arguments" \
-    " (it always targets the proxy — see this script's header comment" \
-    " for why depth>0 is meaningless against prefill or decode alone)"
+CONFIRM_CONNECTOR_HIT=0
+for arg in "$@"; do
+    case "${arg}" in
+        --confirm-connector-hit) CONFIRM_CONNECTOR_HIT=1 ;;
+        *) die "unknown argument: ${arg} (expected --confirm-connector-hit;" \
+               " see this script's header comment for why it takes no" \
+               " other flags)" ;;
+    esac
+done
 
 BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}/v1"
 
@@ -64,6 +109,18 @@ step "Prefix-cache benefit sweep against proxy: ${BASE_URL}"
 log "  depth sweep: ${BENCHY_DEPTH}"
 banner_config
 ensure_dirs
+
+_decode_log="$(logfile_for "vllm-decode")"
+_decode_log_lines_before=0
+if [ "${CONFIRM_CONNECTOR_HIT}" -eq 1 ]; then
+    [ -f "${_decode_log}" ] || die "--confirm-connector-hit requires" \
+        " ${_decode_log} to exist locally — run this flag ON the decode" \
+        " node (SMC2), not from a jump host/laptop. Grepping the log is" \
+        " the only reliable way to rule out the F5 confound (vLLM's own" \
+        " upstream prefix cache serving every repeat with no connector" \
+        " ever consulted); see this script's F5 header comment."
+    _decode_log_lines_before="$(wc -l < "${_decode_log}")"
+fi
 
 benchy_preflight "${BASE_URL}"
 
@@ -76,6 +133,28 @@ RUNDIR="$(benchy_run "prefix-cache" "${BASE_URL}" \
 
 ok "prefix-cache sweep complete: ${RUNDIR}"
 log "next: python3 $(dirname "${BASH_SOURCE[0]}")/compare_runs.py --prefix-benefit ${RUNDIR}/result.json"
+
+if [ "${CONFIRM_CONNECTOR_HIT}" -eq 1 ]; then
+    step "Confirming a connector was actually consulted during this sweep (F5)"
+    _decode_new_log="$(tail -n "+$((_decode_log_lines_before + 1))" "${_decode_log}")"
+    if printf '%s\n' "${_decode_new_log}" | grep -qE 'need to load: *[1-9][0-9]*' || \
+       printf '%s\n' "${_decode_new_log}" | grep -qE 'External prefix cache hit rate' || \
+       printf '%s\n' "${_decode_new_log}" | grep -qiE 'lmcache.*(hit|retriev).*[1-9]'; then
+        ok "connector activity found in ${_decode_log} for this sweep —" \
+           " the warm rows above reflect a real connector hit, not just" \
+           " vLLM's own upstream prefix cache serving every repeat"
+    else
+        err "no connector activity ('need to load:', 'External prefix" \
+            " cache hit rate', or an lmcache hit/retrieve log line with a" \
+            " nonzero count) found in ${_decode_log} for this sweep."
+        die "connector-hit confirmation FAILED (F5): every repeat in this" \
+            " sweep was most likely served by vLLM's OWN upstream prefix" \
+            " cache, which sits ABOVE the connector layer — LMCache and" \
+            " NixlConnector were never consulted, and this run's speedup" \
+            " number is MEANINGLESS as a measurement of the disaggregated" \
+            " cache. See docs/BENCHMARKING.md's F5 section."
+    fi
+fi
 
 # Printed on stdout, deliberately the ONLY stdout output of this script —
 # see 10-bench-baseline.sh's identical trailing comment for why.

@@ -46,18 +46,27 @@ source "${STACK_ROOT}/etc/env.sh"
 
 setup_nixl_kv_env "${ROLE}"
 
-# The data-plane NIC for the P<->D UCX side channel and the RDMA device (only
-# meaningful for KV_TRANSPORT=rdma) are per-role, per-node values discovered
-# by 01-host-prep.sh and left for the operator to pin into cluster.env
-# (PREFILL_DATA_IF/DECODE_DATA_IF, PREFILL_RDMA_DEV/DECODE_RDMA_DEV) once
-# known — they cannot be safely re-autodetected here on every start, because
-# a route to a specific peer can change if the host briefly has an
-# alternate path (e.g. through a management NIC) during a network hiccup.
-case "${ROLE}" in
-    prefill) _NET_DEV="${PREFILL_DATA_IF}"; _RDMA_DEV="${PREFILL_RDMA_DEV}" ;;
-    decode)  _NET_DEV="${DECODE_DATA_IF}";  _RDMA_DEV="${DECODE_RDMA_DEV}"  ;;
-esac
-setup_ucx_env "${_RDMA_DEV}" "${_NET_DEV}"
+# The data-plane NIC (TCP mode) / UCX device (RDMA mode) for the P<->D side
+# channel are per-role, per-node values pinned in cluster.env
+# (PREFILL_DATA_IF/DECODE_DATA_IF for TCP,
+# PREFILL_UCX_NET_DEVICES/DECODE_UCX_NET_DEVICES for RDMA — F3) — they
+# cannot be safely re-autodetected here on every start, because a route to
+# a specific peer can change if the host briefly has an alternate path
+# (e.g. through a management NIC) during a network hiccup. setup_ucx_env
+# looks these up itself, keyed by role.
+setup_ucx_env "${ROLE}"
+
+# NIXL side channel (F2): resolve/validate VLLM_NIXL_SIDE_CHANNEL_HOST/_PORT,
+# refusing loopback/empty outright — see setup_pd_env()'s comment in lib.sh
+# for why that failure mode is otherwise invisible until the PEER connects.
+setup_pd_env "${ROLE}"
+
+# RDMA device access preflight (F4): a no-op (logged) in TCP mode. In RDMA
+# mode this is a HARD gate — without it, a permission problem on
+# /dev/infiniband/uverbs* presents as vLLM hanging for ~90s (EngineCore
+# compiling) before failing, rather than failing here, at t=0, with a
+# specific cause.
+require_rdma_access "${UCX_NET_DEVICES:-}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Generate + validate the LMCache config for this role.
@@ -115,12 +124,11 @@ export VLLM_ATTENTION_BACKEND
 export HF_HOME
 export HF_TOKEN
 
-KV_TRANSFER_CONFIG=$(cat <<JSON
-{"kv_connector":"LMCacheConnectorV1","kv_role":"${KV_ROLE}","kv_connector_extra_config":{}}
-JSON
-)
+KV_TRANSFER_CONFIG="$("${REPO_ROOT}/scripts/common/gen-kv-transfer-config.sh" "${ROLE}")"
 
 log "kv-transfer-config: ${KV_TRANSFER_CONFIG}"
+log "PD_ENABLED=${PD_ENABLED} PD_CONNECTOR=${PD_CONNECTOR} PD_LMCACHE_FIRST=${PD_LMCACHE_FIRST}"
+log "NIXL side channel: ${VLLM_NIXL_SIDE_CHANNEL_HOST}:${VLLM_NIXL_SIDE_CHANNEL_PORT}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Launch.
