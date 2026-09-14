@@ -42,26 +42,6 @@ nixl_dep = declare_dependency(
 spdk_lib_dir = spdk_path + '/build/lib'
 dpdk_lib_dir = spdk_path + '/dpdk/build/lib'
 
-# Phase 2: RDMA transport, opt-in via -Denable_rdma=true (default false).
-# libspdk_nvme_rdma_only.a is prepare-spdk-libs.sh's split of nvme_rdma.o
-# out of libspdk_nvme.a (see that script's own comment) — it only exists if
-# the SPDK tree at spdk_path was configured --with-rdma; nvme_rdma.o
-# self-registers the RDMA transport the same way nvme_tcp.o/nvme_pcie.o do,
-# so it must join the SAME --whole-archive group for the same reason
-# (SPDK_NVME_TRANSPORT_REGISTER runs as a constructor that a normal,
-# non-whole-archive link would otherwise never pull in, since nothing else
-# in this binary directly references a symbol from it). rdmacm/verbs are
-# needed at link time for the same reason any RDMA-linked binary needs them.
-# Building these as plain strings/lists that are empty when disabled (rather
-# than branching the whole spdk_dep block) keeps the -Denable_rdma=false
-# path producing the EXACT SAME link line as before this option existed —
-# '' concatenated onto a string, or [] appended to a list, changes nothing.
-enable_rdma = get_option('enable_rdma')
-rdma_whole_archive_suffix = enable_rdma \
-    ? ',' + spdk_lib_dir + '/libspdk_nvme_rdma_only.a' \
-    : ''
-rdma_syslibs = enable_rdma ? ['-lrdmacm', '-libverbs'] : []
-
 spdk_dep = declare_dependency(
     link_args: [
         '-L' + spdk_lib_dir,
@@ -98,7 +78,6 @@ spdk_dep = declare_dependency(
             + spdk_lib_dir + '/libspdk_nvme_tcp_only.a,'
             + spdk_lib_dir + '/libspdk_sock_posix_only.a,'
             + spdk_lib_dir + '/libspdk_nvme_pcie_only.a'
-            + rdma_whole_archive_suffix
             + ',--no-whole-archive',
         spdk_lib_dir + '/libspdk_nvme.a',
         spdk_lib_dir + '/libspdk_dma.a',
@@ -132,7 +111,7 @@ spdk_dep = declare_dependency(
         spdk_path + '/isa-l/.libs/libisal.a',
         # System deps
         '-lnuma', '-ldl', '-lm', '-lpthread', '-lssl', '-lcrypto', '-luuid',
-    ] + rdma_syslibs)
+    ])
 
 thread_dep = dependency('threads')
 uring_dep  = dependency('liburing')

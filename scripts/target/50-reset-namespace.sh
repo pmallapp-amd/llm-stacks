@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# 50-reset-namespace.sh — drain and recreate the SMC3 NVMe-KV namespace.
+# 50-reset-namespace.sh — drain the SMC3 NVMe-KV namespace by restarting
+# nvmf_tgt.
 #
 # Node:          SMC3 (target), ${TARGET_HOST}. Refuses to run elsewhere.
 # Prerequisites: scripts/target/03-start-kv-target.sh already run
-#                (spdk_tgt up and configured).
+#                (nvmf_tgt up and configured).
 # Next step:     scripts/target/04-verify-target.sh.
 #
 # WHY THIS SCRIPT EXISTS — read before skipping the confirmation prompt:
@@ -25,21 +26,28 @@
 # geometry wrote what, so there is no way to detect this after the fact.
 #
 # The only safe fix is to never let two splits coexist in the same
-# namespace: whenever KV_MAX_VALUE_SIZE changes, drain the namespace with
-# this script BEFORE anything writes under the new geometry.
+# namespace: whenever KV_MAX_VALUE_SIZE (or NVMF_MAX_IO_SIZE /
+# NVMF_LARGE_BUFSIZE) changes, drain the namespace with this script BEFORE
+# anything writes under the new geometry.
 #
-# Shares the RPC sequence with scripts/target/03-start-kv-target.sh via
-# lib-kv-rpc.sh's kv_target_teardown_namespace()/kv_target_apply_config() —
-# duplicating "delete everything, recreate everything" in two files that
-# could then drift apart is exactly the kind of bug this script exists to
-# prevent one layer up; it would be self-defeating to introduce a new one
-# here.
+# WHY A RESTART, NOT AN INCREMENTAL RPC TEARDOWN: an earlier version of
+# this script called nvmf_subsystem_remove_listener / nvmf_delete_
+# subsystem / bdev_kvmalloc_delete, then re-ran the same RPC sequence
+# scripts/target/03-start-kv-target.sh used to bring the target up fresh —
+# two hand-maintained RPC call sequences that had to stay in lockstep.
+# scripts/target/03-start-kv-target.sh now applies the ENTIRE configuration
+# via one --json file at process start (see lib-kv-rpc.sh's
+# kv_target_gen_json_config), so there is no operation smaller than
+# "restart the process" that still guarantees the exact same config comes
+# back — and bdev_kvmalloc is RAM-backed anyway, so a restart already
+# drains it as a side effect. Stopping and restarting nvmf_tgt IS the
+# drain-and-recreate operation now; it just has one moving part instead of
+# two RPC sequences that could silently diverge.
 #
 # usage: 50-reset-namespace.sh   (set KV_ASSUME_YES=1 to skip confirmation)
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../common/lib.sh"
-source "$(dirname "${BASH_SOURCE[0]}")/lib-kv-rpc.sh"
 
 require_root
 require_host "${TARGET_HOST}" "target"
@@ -51,19 +59,18 @@ is_running "kv-target" \
     || die "kv-target is not running — nothing to reset." \
            " Start it first: scripts/target/03-start-kv-target.sh"
 
-warn "This will DELETE the namespace '${KV_BDEV_NAME}' and every KV object" \
-     " stored in it (bdev_kvmalloc is RAM-backed — this data does not" \
-     " survive a bdev delete regardless of whether you run this script)." \
-     " Any prefill/decode process with an open qpair against it will start" \
-     " failing I/O until this script finishes recreating the namespace."
-confirm "Proceed with draining and recreating '${KV_BDEV_NAME}'?" \
+warn "This will RESTART nvmf_tgt and DELETE every KV object stored in" \
+     " '${KV_BDEV_NAME}' (bdev_kvmalloc is RAM-backed — this data does not" \
+     " survive a process restart regardless of whether you run this" \
+     " script). Any prefill/decode process with an open qpair against it" \
+     " will start failing I/O until the restart completes and they" \
+     " reconnect."
+confirm "Proceed with restarting nvmf_tgt and draining '${KV_BDEV_NAME}'?" \
     || die "aborted by operator"
 
-step "Draining namespace"
-kv_target_teardown_namespace
-
-step "Recreating namespace"
-kv_target_apply_config
+step "Restarting kv-target (regenerates + re-applies config/cluster.env's" \
+     " --json config against a fresh process)"
+"${REPO_ROOT}/scripts/target/03-start-kv-target.sh" --restart
 
 ok "namespace reset complete"
 log "verify: scripts/target/04-verify-target.sh"

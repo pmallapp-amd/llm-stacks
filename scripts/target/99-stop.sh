@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 99-stop.sh — stop the SMC3 NVMe-KV target (spdk_tgt).
+# 99-stop.sh — stop the SMC3 NVMe-KV target (nvmf_tgt).
 #
 # Node:          SMC3 (target), ${TARGET_HOST}. Refuses to run elsewhere.
 # Prerequisites: none (safe to run even if kv-target isn't running).
@@ -27,25 +27,28 @@ step "Stopping kv-target"
 stop_bg "kv-target"
 
 if [ "${RELEASE_HUGEPAGES}" -eq 1 ]; then
-    step "Releasing hugepages"
-    # WHY opt-in, not automatic: the same 2MiB hugepage pool sized by
-    # HUGEPAGE_COUNT is what scripts/target/01-host-prep.sh fought memory
-    # fragmentation to allocate in the first place (see its comment on
-    # partial grants). Zeroing it back to reclaim RAM for something else
-    # means the NEXT scripts/target/03-start-kv-target.sh run has to re-win
-    # that same fragmentation fight from scratch — worth doing only when
-    # this host is being repurposed or is under real memory pressure, not
-    # on every routine stop/start cycle.
-    echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-    ok "nr_hugepages set to 0"
+    if [ "${TARGET_HUGE_PAGES}" -gt 0 ]; then
+        step "Releasing hugepages"
+        # Same sysfs node scripts/target/03-start-kv-target.sh writes to
+        # when TARGET_HUGE_PAGES>0 (rocm-aic/target.sh's mechanism:
+        # /proc/sys/vm/nr_hugepages, not the per-size hugetlbfs sysfs node
+        # scripts/target/01-host-prep.sh uses for the initiator-style
+        # allocation path).
+        echo 0 > /proc/sys/vm/nr_hugepages 2>/dev/null || true
+        ok "nr_hugepages set to 0"
+    else
+        info "TARGET_HUGE_PAGES=0 — kv-target never allocated hugepages" \
+             " (it runs --no-huge); nothing to release"
+    fi
 else
-    info "hugepages left allocated (use --release-hugepages to zero them)"
+    info "hugepages left allocated (use --release-hugepages to zero them," \
+         " only meaningful if TARGET_HUGE_PAGES>0)"
 fi
 
 if [ "${CLEAN_CONFIG}" -eq 1 ]; then
-    step "Removing saved RPC config"
-    rm -f "${STACK_ROOT}/etc/kv-target-config.json"
-    ok "removed ${STACK_ROOT}/etc/kv-target-config.json"
+    step "Removing generated --json config"
+    rm -f "${STACK_ROOT}/etc/kv-target.json"
+    ok "removed ${STACK_ROOT}/etc/kv-target.json"
 fi
 
 ok "kv-target stopped"

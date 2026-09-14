@@ -53,51 +53,66 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Hugepages — SPDK's embedded DPDK EAL pins its DMA-capable memory pool
-#    out of this pool at spdk_env_init() time (scripts/target/03-start-kv-
-#    target.sh). Written to the per-size sysfs node (not /proc/sys/vm/
-#    nr_hugepages) so this script's request is unambiguous about which page
-#    size it wants, regardless of what other hugepage sizes this host might
-#    also have configured.
+# 2. Hugepages — OPT-IN on the target (TARGET_HUGE_PAGES, default 0).
+#    rocm-aic/target.sh — the PROVEN configuration this repo's target
+#    scripts were rewritten from — runs nvmf_tgt with --no-huge -s
+#    ${TARGET_MEM_MB} (malloc-backed DPDK EAL memory) by default: it does
+#    NOT need hugepages at all. An earlier version of this script
+#    unconditionally allocated HUGEPAGE_COUNT hugepages here regardless,
+#    which is unnecessary RAM pinned for nothing in the default
+#    configuration. Set TARGET_HUGE_PAGES>0 (config/cluster.env) to opt
+#    back into a hugepage-backed target — scripts/target/03-start-kv-
+#    target.sh then allocates via /proc/sys/vm/nr_hugepages and drops
+#    --no-huge/-s from the launch args.
 # ─────────────────────────────────────────────────────────────────────────────
-step "Hugepages (HUGEPAGE_COUNT=${HUGEPAGE_COUNT} x 2MiB)"
-HP_SYSFS="/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
-require_file "${HP_SYSFS}"
-echo "${HUGEPAGE_COUNT}" > "${HP_SYSFS}"
-_hp_actual="$(cat "${HP_SYSFS}")"
-if [ "${_hp_actual}" -lt "${HUGEPAGE_COUNT}" ]; then
-    # Physically-contiguous 2MiB pages become scarce as host uptime grows
-    # and memory fragments; the kernel silently grants fewer than requested
-    # rather than erroring. A short-allocated pool means spdk_tgt's DPDK EAL
-    # gets less memory than its reactor/qpair buffers need and fails at
-    # spdk_env_init() time with a message that gives no hint the root cause
-    # is fragmentation, not configuration.
-    _pct_short=$(( (HUGEPAGE_COUNT - _hp_actual) * 100 / HUGEPAGE_COUNT ))
-    warn "requested ${HUGEPAGE_COUNT} hugepages, kernel granted ${_hp_actual}" \
-         " (short by ${_pct_short}%)."
-    if [ "${_pct_short}" -gt 10 ]; then
-        warn "SHORT BY MORE THAN 10% — this host's memory is significantly" \
-             " fragmented. REBOOT this host before running this again to" \
-             " get a fresh, unfragmented pool; spdk_tgt is likely to fail" \
-             " to start with only ${_hp_actual} hugepages."
+if [ "${TARGET_HUGE_PAGES}" -gt 0 ]; then
+    step "Hugepages (TARGET_HUGE_PAGES=${TARGET_HUGE_PAGES} x 2MiB)"
+    HP_SYSFS="/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
+    require_file "${HP_SYSFS}"
+    echo "${TARGET_HUGE_PAGES}" > "${HP_SYSFS}"
+    _hp_actual="$(cat "${HP_SYSFS}")"
+    if [ "${_hp_actual}" -lt "${TARGET_HUGE_PAGES}" ]; then
+        # Physically-contiguous 2MiB pages become scarce as host uptime
+        # grows and memory fragments; the kernel silently grants fewer than
+        # requested rather than erroring. A short-allocated pool means
+        # nvmf_tgt's DPDK EAL gets less memory than its reactor/qpair
+        # buffers need and fails at spdk_env_init() time with a message
+        # that gives no hint the root cause is fragmentation, not
+        # configuration.
+        _pct_short=$(( (TARGET_HUGE_PAGES - _hp_actual) * 100 / TARGET_HUGE_PAGES ))
+        warn "requested ${TARGET_HUGE_PAGES} hugepages, kernel granted" \
+             " ${_hp_actual} (short by ${_pct_short}%)."
+        if [ "${_pct_short}" -gt 10 ]; then
+            warn "SHORT BY MORE THAN 10% — this host's memory is" \
+                 " significantly fragmented. REBOOT this host before" \
+                 " running this again to get a fresh, unfragmented pool;" \
+                 " nvmf_tgt is likely to fail to start with only" \
+                 " ${_hp_actual} hugepages."
+        fi
+    else
+        ok "hugepages: ${_hp_actual} allocated"
+    fi
+
+    step "hugetlbfs mount at /mnt/huge"
+    mkdir -p /mnt/huge
+    if ! mountpoint -q /mnt/huge 2>/dev/null; then
+        mount -t hugetlbfs nodev /mnt/huge
+        ok "mounted hugetlbfs at /mnt/huge"
+    else
+        info "/mnt/huge already mounted"
+    fi
+    if grep -qE '^\S+\s+/mnt/huge\s+hugetlbfs\s' /etc/fstab 2>/dev/null; then
+        info "/mnt/huge already in /etc/fstab"
+    else
+        echo "nodev /mnt/huge hugetlbfs defaults 0 0" >> /etc/fstab
+        ok "added /mnt/huge to /etc/fstab (survives reboot)"
     fi
 else
-    ok "hugepages: ${_hp_actual} allocated"
-fi
-
-step "hugetlbfs mount at /mnt/huge"
-mkdir -p /mnt/huge
-if ! mountpoint -q /mnt/huge 2>/dev/null; then
-    mount -t hugetlbfs nodev /mnt/huge
-    ok "mounted hugetlbfs at /mnt/huge"
-else
-    info "/mnt/huge already mounted"
-fi
-if grep -qE '^\S+\s+/mnt/huge\s+hugetlbfs\s' /etc/fstab 2>/dev/null; then
-    info "/mnt/huge already in /etc/fstab"
-else
-    echo "nodev /mnt/huge hugetlbfs defaults 0 0" >> /etc/fstab
-    ok "added /mnt/huge to /etc/fstab (survives reboot)"
+    _hp_actual=0
+    info "TARGET_HUGE_PAGES=0 (default) — skipping hugepage allocation and" \
+         " hugetlbfs mount. nvmf_tgt runs --no-huge (malloc-backed DPDK EAL" \
+         " memory), matching rocm-aic/target.sh's proven configuration." \
+         " Set TARGET_HUGE_PAGES>0 in config/cluster.env to opt in."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,7 +217,7 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. memlock limits — SPDK's DPDK EAL mlock()s its hugepage pool at
-#    spdk_env_init() time; the default 64KB soft limit makes spdk_tgt fail
+#    spdk_env_init() time; the default 64KB soft limit makes nvmf_tgt fail
 #    to start with a message that does not mention memlock at all. Also
 #    required for ibv_reg_mr() once KV_TRANSPORT=rdma (Phase 2).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,7 +229,7 @@ cat > "${LIMITS_FILE}" <<'EOF'
 #
 # unlimited memlock: SPDK's embedded DPDK EAL pins its hugepage pool with
 # mlock(); the default 64KB soft limit means spdk_env_init() fails to lock
-# down its DMA-capable memory immediately at spdk_tgt startup, surfacing as
+# down its DMA-capable memory immediately at nvmf_tgt startup, surfacing as
 # an opaque EAL init failure with no mention of memlock anywhere in it. In
 # Phase 2 (KV_TRANSPORT=rdma) the same unlimited memlock is ALSO required
 # for ibv_reg_mr() to pin arbitrary amounts of memory for RDMA.
@@ -222,7 +237,7 @@ cat > "${LIMITS_FILE}" <<'EOF'
 * hard memlock unlimited
 EOF
 ok "wrote ${LIMITS_FILE} (takes effect on next login/session; a running" \
-   " shell used to launch spdk_tgt must be a NEW session after this)"
+   " shell used to launch nvmf_tgt must be a NEW session after this)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. Directories
@@ -234,7 +249,7 @@ ok "directories present: ${STACK_ROOT} ${STACK_ROOT}/etc ${LOG_DIR} ${RUN_DIR}"
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
 step "Summary"
-log "hugepages: ${_hp_actual}/${HUGEPAGE_COUNT}"
+log "hugepages: ${_hp_actual}/${TARGET_HUGE_PAGES} (TARGET_HUGE_PAGES)"
 log "storage-leg interfaces: prefill=${_if_prefill:-?} decode=${_if_decode:-?}"
 log "KV_TRANSPORT=${KV_TRANSPORT}  NVMF_TRSVCID=${NVMF_TRSVCID}"
 ok "target host prep complete"

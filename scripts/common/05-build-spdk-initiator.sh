@@ -64,9 +64,11 @@ banner_config
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. apt dependencies. Same SPDK build deps as scripts/target/01-host-prep.sh
 #    installs on SMC3, since this script configures/builds the same upstream
-#    tree the same way. librdmacm-dev/libibverbs-dev only matter when
-#    SPDK_WITH_RDMA=1 (F4) — installed unconditionally anyway since they are
-#    small and 10-build-stack.sh already installs them for UCX's --with-verbs.
+#    tree the same way. librdmacm-dev/libibverbs-dev are installed
+#    unconditionally — this tree no longer configures --with-rdma itself
+#    (see step 3 below: the storage leg, NVMe-oF to SMC3, is TCP only by
+#    design), but 10-build-stack.sh needs them regardless for UCX's
+#    --with-verbs (the compute-leg RDMA path, KV_TRANSPORT=rdma).
 # ─────────────────────────────────────────────────────────────────────────────
 if [ "${SKIP_APT}" -eq 1 ]; then
     info "apt deps — skipped (--skip-apt)"
@@ -144,11 +146,17 @@ SPDK_INITIATOR_WITH_NVMF="${SPDK_INITIATOR_WITH_NVMF:-0}"
 _configure_args=(--without-shared --with-uring
     --disable-tests --disable-unit-tests --disable-examples)
 [ "${SPDK_INITIATOR_WITH_NVMF}" = "1" ] && _configure_args+=(--with-nvmf)
-if [ "${SPDK_WITH_RDMA}" = "1" ]; then
-    # F4: verbs provider by default; see scripts/target/02-build-spdk-kv.sh's
-    # matching comment for --with-rdma=mlx5_dv / SPDK_RDMA_PROVIDER details.
-    _configure_args+=(--with-rdma="${SPDK_RDMA_PROVIDER:-verbs}")
-fi
+# No --with-rdma here: the storage leg (NVMe-oF, this SPDK tree's only use
+# on SMC1/SMC2) is TCP only by design — see config/cluster.env's "NVMe-oF
+# target" section. An earlier version of this script configured
+# --with-rdma unconditionally under SPDK_WITH_RDMA=1 to keep a Phase-2
+# relink option open; that variable and this branch have been removed
+# along with the rest of the storage-leg RDMA scaffolding
+# (plugins/nvme-kv/meson.build's -Denable_rdma, prepare-spdk-libs.sh's
+# libspdk_nvme_rdma_only.a split) since rocm-aic/target.sh, the PROVEN
+# configuration this repo now follows, never exercises NVMe-oF/RDMA. The
+# compute-leg RDMA path (KV_TRANSPORT=rdma, UCX over RoCE) is unrelated and
+# untouched — it does not depend on this SPDK tree's configure flags at all.
 step "./configure ${_configure_args[*]} ..."
 # WHY --without-shared matters: see plugins/nvme-kv/meson.build's own
 # comment (also duplicated in scripts/target/02-build-spdk-kv.sh) — a
@@ -205,9 +213,10 @@ ok "NVMe-KV initiator API present: nvme_kv.h + spdk_nvme_kv_{store,retrieve,exis
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Generate the "_only" split archives the plugin's meson.build links
-#    with --whole-archive (tcp/pcie/sock_posix always; rdma_only too when
-#    this tree was configured --with-rdma — prepare-spdk-libs.sh detects
-#    that itself and skips it cleanly otherwise, see its own comments).
+#    with --whole-archive: tcp, pcie and sock_posix. These isolate the
+#    transport self-registration constructors so they survive a static link
+#    that would otherwise drop them as unreferenced.
+#    There is no rdma split: the storage leg is NVMe-oF/TCP by design.
 # ─────────────────────────────────────────────────────────────────────────────
 step "Generating split archives (prepare-spdk-libs.sh)"
 SPDK_SRC="${SPDK_SRC}" "${REPO_ROOT}/plugins/nvme-kv/prepare-spdk-libs.sh"
@@ -218,6 +227,6 @@ ok "split archives ready in ${SPDK_SRC}/build/lib"
 # ─────────────────────────────────────────────────────────────────────────────
 step "Summary"
 ok "SPDK (initiator, ${SPDK_INITIATOR_FLAVOR}) built at ${SPDK_SRC}"
-log "SPDK_WITH_RDMA=${SPDK_WITH_RDMA}  SPDK_INITIATOR_WITH_NVMF=${SPDK_INITIATOR_WITH_NVMF}"
+log "SPDK_INITIATOR_WITH_NVMF=${SPDK_INITIATOR_WITH_NVMF}"
 log "next: scripts/common/10-build-stack.sh (plugin build, step 4/6, now"
 log "expects this tree to already exist rather than building it itself)"

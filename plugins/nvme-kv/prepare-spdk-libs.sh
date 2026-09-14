@@ -41,21 +41,4 @@ make_split libspdk_nvme_tcp_only.a   libspdk_nvme.a       nvme_tcp.o nvme_transp
 make_split libspdk_nvme_pcie_only.a  libspdk_nvme.a       nvme_pcie.o nvme_pcie_common.o
 make_split libspdk_sock_posix_only.a libspdk_sock_posix.a posix.o
 
-# libspdk_nvme_rdma_only.a — Phase 2 (RDMA) prerequisite. nvme_rdma.o only
-# exists inside libspdk_nvme.a if this tree was configured --with-rdma
-# (F4); a TCP-only tree (the common case, SPDK_WITH_RDMA=0) simply does not
-# have it. Detect with `ar t` FIRST and skip cleanly rather than letting
-# make_split's `ar x` fail on a name that isn't in the archive — this must
-# be a no-op on a TCP-only build, not a script failure.
-# Building this archive alone does not enable RDMA in the plugin: see
-# plugins/nvme-kv/meson.build's -Denable_rdma option, which must ALSO add
-# this archive to the --whole-archive group plus -lrdmacm -libverbs before
-# an RDMA-linked plugin actually works.
-if ar t "${LIB_DIR}/libspdk_nvme.a" 2>/dev/null | grep -q '^nvme_rdma\.o$'; then
-    make_split libspdk_nvme_rdma_only.a libspdk_nvme.a nvme_rdma.o
-else
-    echo "  libspdk_nvme_rdma_only.a — skipped (nvme_rdma.o not in" \
-         " libspdk_nvme.a; this tree was not configured --with-rdma)"
-fi
-
 echo "OK: split archives ready in ${LIB_DIR}"

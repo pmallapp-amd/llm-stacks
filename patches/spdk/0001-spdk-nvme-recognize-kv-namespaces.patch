@@ -1,0 +1,40 @@
+From 76df595957dd71dae50e746fd9d01d42750ef381 Mon Sep 17 00:00:00 2001
+From: Ben Walker <ben@nvidia.com>
+Date: Sun, 22 Mar 2026 21:39:50 -0700
+Subject: [PATCH] nvme: recognize KV command set namespaces
+
+Teach the NVMe bdev module to recognize namespaces that report the KV
+command set identifier. Set the CSI on the bdev so that upper layers
+can identify it as a KV namespace and route commands accordingly.
+
+The NVMe bdev module already supports admin passthru, so KV-specific
+identify commands forwarded from the NVMf target will flow through to
+the real NVMe device automatically.
+
+Change-Id: Ie7975a8a33f7915eca99586d1120e25895ca1889
+Signed-off-by: Ben Walker <ben@nvidia.com>
+---
+
+diff --git a/module/bdev/nvme/bdev_nvme.c b/module/bdev/nvme/bdev_nvme.c
+index a913409..1d87ac1 100644
+--- a/module/bdev/nvme/bdev_nvme.c
++++ b/module/bdev/nvme/bdev_nvme.c
+@@ -4689,6 +4689,8 @@
+ 	csi = spdk_nvme_ns_get_csi(ns);
+ 	opts = spdk_nvme_ctrlr_get_opts(ctrlr);
+ 
++	disk->csi = csi;
++
+ 	switch (csi) {
+ 	case SPDK_NVME_CSI_NVM:
+ 		disk->product_name = "NVMe disk";
+@@ -4702,6 +4704,9 @@
+ 		disk->max_open_zones = spdk_nvme_zns_ns_get_max_open_zones(ns);
+ 		disk->max_active_zones = spdk_nvme_zns_ns_get_max_active_zones(ns);
+ 		break;
++	case SPDK_NVME_CSI_KV:
++		disk->product_name = "NVMe KV disk";
++		break;
+ 	default:
+ 		if (bdev_opts->allow_unrecognized_csi) {
+ 			disk->product_name = "NVMe Passthrough disk";
