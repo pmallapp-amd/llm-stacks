@@ -877,7 +877,7 @@ scripts/proxy/start-proxy.sh
 
 **Namespace reset** (required after changing `KV_MAX_VALUE_SIZE`, or any
 time you suspect stale cross-geometry data — see
-[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#half-stale--corrupted-reads)):
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#half-stale-corrupted-reads)):
 
 ```bash
 # [SMC3]

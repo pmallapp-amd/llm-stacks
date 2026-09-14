@@ -129,7 +129,7 @@ NVMe-oF/TCP for the storage leg and `UCX_TLS="tcp,self,sm"` for the compute
 leg; `rdma` picks NVMe-oF/RDMA and `UCX_TLS="rc_verbs,rc_mlx5,dc,ud,self,sm"`
 (TCP deliberately excluded from the RDMA list — see that function's comment).
 The two legs' RDMA readiness is **not** the same — see Status above and
-[`docs/BRINGUP.md` §9](docs/BRINGUP.md#9-phase-2-tcp--rdma).
+[`docs/BRINGUP.md` §9](docs/BRINGUP.md#9-phase-2-tcp-rdma).
 
 ## Repository layout
 
