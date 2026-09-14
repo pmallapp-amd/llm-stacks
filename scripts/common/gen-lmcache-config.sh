@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# gen-lmcache-config.sh — emit the LMCache YAML for one role.
+#
+# Node:          SMC1 (prefill) or SMC2 (decode) — generates the file, does
+#                not itself start anything.
+# Prerequisites: scripts/common/20-build-vllm-lmcache.sh (need LMCACHE_VERSION
+#                to know what this generator is targeting).
+# Next step:     scripts/common/25-validate-lmcache-config.sh <this file>
+#                MUST pass before the file is trusted; scripts/common/
+#                start-vllm.sh runs that validation automatically.
+#
+# usage: gen-lmcache-config.sh <prefill|decode> <output-path>
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# READ THIS BEFORE TOUCHING THIS FILE
+# ═══════════════════════════════════════════════════════════════════════════
+# LMCacheEngineConfig's accepted top-level keys, and — separately — the keys
+# recognized *inside* `extra_config` by the NIXL storage backend
+# (lmcache/v1/storage_backend/nixl_storage_backend.py), are both internal,
+# undocumented-as-a-stable-contract, and DO change between LMCache minor
+# versions. LMCache silently IGNORES an unrecognized top-level key in some
+# versions and silently ignores an unrecognized extra_config sub-key in ALL
+# versions (extra_config is typed as an opaque dict — nothing validates its
+# contents until NixlStorageConfig.from_cache_engine_config() reads it at
+# backend-construction time, deep inside LMCache, well after this YAML loads
+# cleanly). That combination is exactly how you end up with a config that
+# LOADS FINE, LOGS NOTHING WRONG, and never actually talks to the remote KV
+# target — LMCache quietly falls back to CPU-only caching and every request
+# still "works", just without any P/D cache sharing. This is precisely why
+# scripts/common/25-validate-lmcache-config.sh exists: it inspects the
+# INSTALLED LMCache's source to prove every key below is both recognized AND
+# routed to the NIXL storage backend, rather than trusting this generator's
+# assumptions. NEVER run a node with a config this generator produced without
+# 25-validate-lmcache-config.sh having passed against it first.
+#
+# The schema below reflects LMCache v0.5.4 (this repo's pinned
+# LMCACHE_VERSION, see scripts/common/20-build-vllm-lmcache.sh), verified
+#2026-09 against lmcache/v1/config.py and
+# lmcache/v1/storage_backend/nixl_storage_backend.py at tag v0.5.4. In
+# particular:
+#   - `enable_nixl_storage`, `nixl_backend`, `nixl_pool_size`,
+#     `nixl_backend_params` all live UNDER `extra_config`, NOT at the
+#     top level, in v0.5.4 — despite how they may look in older
+#     examples/blog posts that predate this nesting.
+#   - `nixl_pool_size: 0` (not a separate boolean) is what selects
+#     NixlDynamicStorageBackend over NixlStaticStorageBackend. See the
+#     "content-derived key" comment block below — this is the single
+#     most load-bearing value in this file.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# THE CONTENT-DERIVED-KEY CONSTRAINT (do not weaken this)
+# ═══════════════════════════════════════════════════════════════════════════
+# nixl_pool_size MUST be 0. LMCache's NixlStorageBackend factory
+# (NixlStorageBackend.CreateNixlStorageBackend) picks:
+#   pool_size == 0   -> NixlDynamicStorageBackend  (content-derived keys:
+#                        NixlDynamicStorageAgent._format_object_key() hashes
+#                        the CacheEngineKey — model+chunk-hash+token content —
+#                        the SAME bytes on every process that sees the same
+#                        prompt prefix, prefill or decode, this run or the
+#                        next.)
+#   pool_size  > 0   -> NixlStaticStorageBackend    (pool of PRE-ALLOCATED
+#                        slot names, `obj_{slot}_{uuid4}` — a fresh random
+#                        uuid4 suffix generated independently by EVERY
+#                        process at startup. See NixlObjectPool.__init__ in
+#                        nixl_storage_backend.py.)
+# With pool_size > 0, the prefill process's object names and the decode
+# process's object names for the "same" cached content share nothing but the
+# `obj_{slot}_` prefix — the decode side can never guess the uuid4 the
+# prefill side happened to allocate, so every lookup misses. This is not a
+# hypothetical: it is the plugin-level bug this repo already found and fixed
+# once (see the `queryMem()` doc comment in
+# plugins/nvme-kv/spdk_nvme_kv_backend.h, "Observed 2026-09-07 as 'LMCache
+# hit tokens: 0' on every decode request") for the layer BELOW this one (the
+# transport had no existence-probe at all). Getting nixl_pool_size right is
+# the LMCache-side half of that same fix — get either half wrong and you are
+# back to hit_tokens=0 with no error anywhere.
+#
+# save_unfull_chunk therefore stays False (LMCache's own
+# NixlDynamicStorageAgent constructor asserts `not config.save_unfull_chunk`
+# when pool_size==0 — see nixl_storage_backend.py's dynamic_storage branch).
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# THE BACKEND-ALLOWLIST RISK (read this before assuming this file "works")
+# ═══════════════════════════════════════════════════════════════════════════
+# Stock LMCache v0.5.4's NixlStorageConfig.validate_nixl_backend() only
+# recognizes a fixed set of backend names: GDS/GDS_MT/OBJ (cpu or cuda) and
+# POSIX/HF3FS/AZURE_BLOB/DOCA_MEMOS (cpu only). "SPDK_NVMe_KV" is NOT in that
+# list. A stock install therefore raises
+# `AssertionError: Invalid NIXL backend & device combination` the first time
+# the NIXL storage backend is constructed — before a single byte reaches the
+# plugin. Separately, NixlDynamicStorageAgent decides its NIXL mem_type by a
+# SECOND hardcoded name list (backend in ("OBJ","AZURE_BLOB","DOCA_MEMOS") ->
+# OBJ, else FILE); "SPDK_NVMe_KV" falls into the FILE branch there too, which
+# would make LMCache open real POSIX files on the LOCAL filesystem at
+# `extra_config.nixl_path` per KV chunk — silently correct-looking, silently
+# wrong (it would never touch SMC3 at all).
+#
+# Getting SPDK_NVMe_KV working therefore requires BOTH name lists in the
+# installed LMCache to include "SPDK_NVMe_KV" mapped to the OBJ mem_type path
+# — i.e. an LMCache patch, matching the pattern referenced in this repo's own
+# plugin comments (plugins/nvme-kv/spdk_nvme_kv_plugin.cpp mentions
+# "stack/tracks/lmcache/patches/0002-*.patch", "0003-*.patch" for the
+# multipart-split and max_value_size wiring; the backend-allowlist patch is
+# the same family). scripts/common/25-validate-lmcache-config.sh greps the
+# INSTALLED LMCache's source for exactly these two name lists and FAILS
+# LOUDLY if SPDK_NVMe_KV is absent from either, instead of letting you
+# discover it as a silent local-file fallback during a live P/D test.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+ROLE="${1:-}"
+OUT="${2:-}"
+if [ -z "${ROLE}" ] || [ -z "${OUT}" ]; then
+    die "usage: $0 <prefill|decode> <output-path>"
+fi
+case "${ROLE}" in
+    prefill) _SLOT_OFFSET="${KV_SLOT_OFFSET_PREFILL}" ;;
+    decode)  _SLOT_OFFSET="${KV_SLOT_OFFSET_DECODE}"  ;;
+    *) die "role must be prefill|decode, got '${ROLE}'" ;;
+esac
+
+# Every value below is overridable via an env var — nobody should have to
+# edit this generator to change a config value.
+_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE}"
+_LOCAL_CPU="${LMCACHE_LOCAL_CPU}"
+_MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE}"
+
+# save_unfull_chunk: see "THE CONTENT-DERIVED-KEY CONSTRAINT" above. Do not
+# override this to true unless nixl_pool_size is also changed away from 0 —
+# LMCache's own assertion will reject that combination anyway, but silently
+# flipping this without understanding why is how someone "fixes" an
+# assertion error by breaking the property that made this work.
+_SAVE_UNFULL_CHUNK="${LMCACHE_SAVE_UNFULL_CHUNK:-false}"
+
+# NIXL staging buffer: a bounce buffer NIXL/UCX moves KV pages through on
+# their way to/from the SPDK_NVMe_KV plugin — sized independently of
+# KV_MAX_VALUE_SIZE (that's the plugin's per-STORE/RETRIEVE ceiling; this is
+# how much in-flight staging capacity the backend gets). 1 GiB default is
+# generous headroom over a single ~5.7MB KV page (chunk_size=256) with room
+# for several in-flight transfers; too small shows up as
+# "Failed to allocate memory, consider increasing the `nixl_buffer_size`
+# value" in nixl_storage_backend.py's warning, not a hang.
+_NIXL_BUFFER_SIZE="${LMCACHE_NIXL_BUFFER_SIZE:-1073741824}"
+
+# "cuda": ROCm/HIP presents its device memory API as "cuda" to torch (HIP is
+# built as a CUDA-compatible shim on AMD GPUs), and LMCache's device-selection
+# code (get_correct_device) only knows the "cpu"/"cuda" vocabulary — there is
+# no "rocm" or "hip" value to pass here.
+_NIXL_BUFFER_DEVICE="${LMCACHE_NIXL_BUFFER_DEVICE:-cuda}"
+
+_NIXL_BACKEND="${LMCACHE_NIXL_BACKEND:-SPDK_NVMe_KV}"
+
+# 0 = dynamic/content-derived storage backend. See the constraint block
+# above — do not change this without changing everything else that depends
+# on it.
+_NIXL_POOL_SIZE="${LMCACHE_NIXL_POOL_SIZE:-0}"
+
+mkdir -p "$(dirname "${OUT}")"
+
+cat > "${OUT}" <<EOF
+# Generated by scripts/common/gen-lmcache-config.sh for role=${ROLE}.
+# Targets LMCache ${LMCACHE_VERSION:-0.5.4 (default pin; see scripts/common/20-build-vllm-lmcache.sh)}.
+#
+# DO NOT HAND-EDIT — re-run the generator (all values are env-var
+# overridable, see the header comment above). Before trusting this
+# file, run:
+#   scripts/common/25-validate-lmcache-config.sh ${OUT}
+# which introspects the INSTALLED LMCache to confirm every key below is
+# both recognized and actually wired to the NIXL storage backend — LMCache
+# silently ignores unknown keys in extra_config in every version, so a
+# clean load of this file proves nothing on its own.
+#
+# kv_role for this node: ${ROLE} (kv_producer/kv_consumer set on the vLLM
+# --kv-transfer-config side, not here — see scripts/common/start-vllm.sh).
+
+chunk_size: ${_CHUNK_SIZE}
+local_cpu: ${_LOCAL_CPU}
+max_local_cpu_size: ${_MAX_LOCAL_CPU_SIZE}
+local_disk: null
+
+# See "THE CONTENT-DERIVED-KEY CONSTRAINT" in the header comment above
+# — must stay false while extra_config.nixl_pool_size is 0.
+save_unfull_chunk: ${_SAVE_UNFULL_CHUNK}
+
+# --- NIXL remote storage staging buffer (top-level fields; NOT under
+#     extra_config — these two ARE real LMCacheEngineConfig dataclass
+#     fields, unlike everything in the extra_config block below) ---
+nixl_buffer_size: ${_NIXL_BUFFER_SIZE}
+nixl_buffer_device: "${_NIXL_BUFFER_DEVICE}"
+
+extra_config:
+  # Selects the NixlStorageBackend.CreateNixlStorageBackend NIXL code path
+  # (see lmcache/v1/storage_backend/nixl_storage_backend.py). Everything
+  # below this key is read ONLY by that code path, at backend-construction
+  # time — a typo here fails silently at YAML-load time and loudly (or not
+  # at all — see the FILE/OBJ mem_type note above) only once a request
+  # actually tries to store/retrieve.
+  enable_nixl_storage: true
+
+  # The plugin name the NIXL create_backend() dlopens from ${NIXL_PLUGIN_DIR}
+  # (see lib.sh setup_nixl_kv_env, which exports NIXL_PLUGIN_DIR).
+  # REQUIRES the LMCache backend-allowlist patch — see the header
+  # comment above.
+  nixl_backend: "${_NIXL_BACKEND}"
+
+  # 0 = NixlDynamicStorageBackend (content-derived keys). See the
+  # constraint block above. Do not set > 0.
+  nixl_pool_size: ${_NIXL_POOL_SIZE}
+
+  # Parameters handed verbatim to the plugin create_backend(name, params)
+  # — these three are exactly the {trid, max_value_size, kv_slot_offset}
+  # triple documented in plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's
+  # getParams(). scripts/common/25-validate-lmcache-config.sh echoes the
+  # plugin's own get_plugin_params("${_NIXL_BACKEND}") defaults back so you
+  # can diff them against what's set here.
+  nixl_backend_params:
+    trid: "${KV_TRID}"
+    max_value_size: "${KV_MAX_VALUE_SIZE}"
+    # NOTE: this offset is a NO-OP on this deployment. make_key() in
+    # spdk_nvme_kv_backend.h derives the on-wire key from metaInfo whenever
+    # the caller sets it (nixlBlobDesc::metaInfo), and
+    # NixlDynamicStorageAgent._format_object_key() ALWAYS sets metaInfo (it
+    # is the content-derived key itself) — so kv_slot_offset, which only
+    # applies on the devId/addr fallback path taken by callers that never
+    # set metaInfo (kv_io.py, nixlbench), never applies here. Kept
+    # populated anyway for symmetry with those tools and because
+    # 25-validate-lmcache-config.sh echoes it back from the plugin's real
+    # get_plugin_params() so a reader can see it's consistent, not because
+    # it changes this deployment's behavior.
+    kv_slot_offset: "${_SLOT_OFFSET}"
+EOF
+
+ok "wrote ${OUT} (role=${ROLE}, nixl_backend=${_NIXL_BACKEND}, nixl_pool_size=${_NIXL_POOL_SIZE})"
+log "next: scripts/common/25-validate-lmcache-config.sh ${OUT}"
