@@ -31,12 +31,12 @@ why.
 > NICs — which is **not yet implemented in this repo**.
 >
 > Corrected model and full account: [`docs/HANDOFF.md` §3](docs/HANDOFF.md#3-the-correction).
-> Remaining work: [`docs/TODO.md` §1](docs/TODO.md#1-architecture-correction-in-flight).
+> Remaining work: [`docs/TODO.md` §1](docs/TODO.md#1-architecture-correction-compute-leg).
 
 | Phase | Transport | State |
 |---|---|---|
 | **Phase 1 — bring-up** | NVMe-oF/TCP (storage leg) + UCX/TCP (compute leg) | Implemented in this repo (`KV_TRANSPORT=tcp`, the default in `config/cluster.env`). **Not yet run on the physical hardware** — every script has been written and reasoned through against the actual plugin/SPDK/LMCache source, but no end-to-end run on SMC1/SMC2/SMC3 has been recorded in this repo. |
-| **Phase 2 — acceptance** | NVMe-oF/RDMA + UCX/RoCE | Groundwork landed, opt-in, **unvalidated on hardware**. `plugins/nvme-kv/prepare-spdk-libs.sh` splits `nvme_rdma.o` into `libspdk_nvme_rdma_only.a` when the initiator's SPDK tree was built `--with-rdma`, and `meson.build`'s `-Denable_rdma=true` (default `false`, `meson_options.txt`) links it plus `-lrdmacm -libverbs`. Nobody has rebuilt with `-Denable_rdma=true`, flipped `KV_TRANSPORT=rdma`, or run the RDMA path end to end yet — see [`docs/BRINGUP.md` §9.1](docs/BRINGUP.md#91-initiator-side-current-state) and gap #1 below. |
+| **Phase 2 — acceptance** | UCX/RoCE (compute leg only — the storage leg is TCP by design, permanently; see [`docs/HANDOFF.md` §3](docs/HANDOFF.md#3-the-correction)) | **Not yet implemented.** The direct compute-leg transfer this criterion depends on does not exist in this repo yet — see [`docs/TODO.md` §1](docs/TODO.md#1-architecture-correction-compute-leg). A previous pass added *storage-leg* RDMA groundwork under the wrong premise (an `-Denable_rdma` meson option, an `nvme_rdma.o` split archive); both have been removed entirely — the proven target configuration this repo now follows never exercises NVMe-oF/RDMA. |
 
 `KV_TRANSPORT=tcp|rdma` in `config/cluster.env` is the single switch that
 gates both legs of the datapath between these two phases (see that file's
@@ -54,7 +54,7 @@ comment block).
 | &nbsp;&nbsp;└ Serial console (2x DSC3-2Q400 `[1dd8:5200]` host) | `telnet REDACTED-ADDR 2022 / 2023` | — | — |
 | **SMC3 — target** (storage target role), no GPU | `REDACTED-ADDR` | `root` | `docker` |
 | &nbsp;&nbsp;└ BMC | `REDACTED-ADDR` | `root` | `REDACTED-PASSWORD` |
-| &nbsp;&nbsp;└ Serial console (2x POLLARA-1Q400 `[1dd8:1002]` @ 64:00.0, 84:00.0) | `telnet REDACTED-ADDR 2022 / 2023` ("REDACTED-LABEL/2") | — | — **connection REFUSED when last tried — unresolved, see gap #6 below** |
+| &nbsp;&nbsp;└ Serial console (2x POLLARA-1Q400 `[1dd8:1002]` @ 64:00.0, 84:00.0) | `telnet REDACTED-ADDR 2022 / 2023` ("REDACTED-LABEL/2") | — | — **connection REFUSED when last tried — unresolved, see gap #5 below** |
 
 Compute nodes (SMC1, SMC2) each carry 2x DSC3-2Q400 `[1dd8:5200]` data-plane
 NICs. The storage node (SMC3) carries 2x POLLARA-1Q400 `[1dd8:1002]`. Both
@@ -87,12 +87,13 @@ see `config/cluster.env`'s own header comment.
                        │                                │
                        └────────────┬───────────────────┘
                                     ▼
-                     NVMe-oF/TCP  (Phase 1; RDMA is Phase 2, opt-in groundwork
-                                   landed, unvalidated — see §9 below)
+                     NVMe-oF/TCP  (permanently, by design — see Status above;
+                                   this leg never speaks RDMA at any phase)
                                      │
                      ┌──────────────▼───────────────┐
                      │ SMC3 — storage target          │
-                     │ spdk_tgt (kv_spdk fork) +       │
+                     │ nvmf_tgt (upstream SPDK +       │
+                     │ patches/spdk/0002+0003) +        │
                      │ NVMe-KV namespace (bdev_kvmalloc,│
                      │ RAM-backed)                     │
                      └────────────────────────────────┘
@@ -131,6 +132,40 @@ leg; `rdma` picks NVMe-oF/RDMA and `UCX_TLS="rc_verbs,rc_mlx5,dc,ud,self,sm"`
 The two legs' RDMA readiness is **not** the same — see Status above and
 [`docs/BRINGUP.md` §9](docs/BRINGUP.md#9-phase-2-tcp-rdma).
 
+## SPDK and the NVMe-KV patches
+
+This project builds **upstream** SPDK — there is no private fork — and
+layers four small, upstream-bound patches on top for the target side.
+SMC1/SMC2 (the initiators) need none of them: the NVMe-KV *initiator* API
+(`spdk_nvme_kv_store/retrieve/exist/delete/list()`) has been upstream since
+SPDK v26.05. SMC3 (the target) needs `bdev_kvmalloc` and the nvmf KV opcode
+routing, which have not both landed upstream yet, so
+`scripts/target/02-build-spdk-kv.sh` clones upstream SPDK at
+`SPDK_TARGET_REF` and applies whichever of the four patches below aren't
+already present in that tree (detected by content, not by ref name).
+
+All four patches are authored by Ben Walker `<ben@nvidia.com>` and tracked
+on the public SPDK Gerrit review queue
+(<https://review.spdk.io/q/topic:kv>):
+
+| # | Subject | Status |
+|---|---|---|
+| `0001` | nvme: recognize KV command set namespaces | **MERGED** 2026-08-25 (`8dc8327`) |
+| `0002` | bdev/kvmalloc: malloc-like bdev supporting the KV command set | **OPEN** — Gerrit [27889](https://review.spdk.io/c/spdk/spdk/+/27889), CR+2, Verified+1, hashtag `26.09` |
+| `0003` | nvmf: add KV namespace support | **OPEN** — Gerrit [28298](https://review.spdk.io/c/spdk/spdk/+/28298), CR+2 (two reviewers), Verified+1, hashtag `26.09`; depends on `0002` |
+| `0004` | nvme: unit test suite for the KV command set | **MERGED** 2026-08-25 (`b12a372`) |
+
+**v26.05** (the initiator's default `SPDK_VERSION`) has the initiator API
+but predates all four patches. **Current master** (`26.09.0-pre`, the
+target's default `SPDK_TARGET_REF`) already carries `0001`/`0004`; only
+`0002` and `0003` — the target-side pieces — still need to be applied, and
+both are review-complete (`CR+2`, mergeable) as of this writing. Re-check
+<https://review.spdk.io/q/topic:kv+status:open> periodically — see
+[TODO.md §4.4](docs/TODO.md#4-open-items-known-limitations). Full per-patch
+detail, Change-Ids and the apply order:
+[`patches/spdk/README.md`](patches/spdk/README.md) — this section
+summarises it, it does not duplicate it.
+
 ## Repository layout
 
 ```
@@ -160,17 +195,24 @@ scripts/
     99-stop.sh                Stop vllm-prefill (optional --clean-shm).
   decode/                    Mirrors prefill/ for SMC2 (DECODE_* vars, kv_consumer role).
   target/
-    01-host-prep.sh          SMC3 storage-node prep (hugepages, kernel modules, firewall, memlock).
-    02-build-spdk-kv.sh       Clone/build the TARGET-side SPDK tree — the kv_spdk fork by default
-                             (SPDK_TARGET_FLAVOR=fork; bdev_kvmalloc + NVMe-KV opcode routing
-                             never landed upstream, see ARCHITECTURE.md §7 and cluster.env).
-    03-start-kv-target.sh     Start spdk_tgt and configure the NVMe-KV namespace via RPC.
-    04-verify-target.sh       Verify the target is up and correctly configured.
+    01-host-prep.sh          SMC3 storage-node prep (hugepages opt-in, kernel modules, firewall,
+                             memlock).
+    02-build-spdk-kv.sh       Clone upstream SPDK at SPDK_TARGET_REF and apply patches/spdk/'s
+                             0002/0003 (skipping any of the four already present by content) —
+                             see "SPDK and the NVMe-KV patches" above.
+    03-start-kv-target.sh     Generate the --json config (lib-kv-rpc.sh) and start nvmf_tgt —
+                             the whole configuration is applied atomically at startup, not via
+                             a separate rpc.py sequence.
+    04-verify-target.sh       Verify the target is up and correctly configured; HARD-checks
+                             max_io_qpairs_per_ctrlr and the chunk-size ceiling (05- below).
+    05-check-chunk-ceiling.sh Correctness guard: does one LMCache chunk fit in one NVMe-oF
+                             transfer for the current MODEL/TP_SIZE/LMCACHE_CHUNK_SIZE? See
+                             Configuration below.
     50-reset-namespace.sh     Drain and recreate the namespace (required after changing
-                             KV_MAX_VALUE_SIZE — see Configuration below).
+                             KV_MAX_VALUE_SIZE — see Configuration below) by restarting nvmf_tgt.
     99-stop.sh                Stop kv-target (optional --release-hugepages, --clean-config).
-    lib-kv-rpc.sh             Shared spdk_tgt RPC sequence used by 03- and 50- (kept in one
-                             place so "fresh start" and "reset" cannot drift apart).
+    lib-kv-rpc.sh             kv_target_gen_json_config() (the --json generator 03- uses) plus
+                             read-only rpc.py inspection helpers used only by 04-.
   proxy/
     disagg_proxy.py           Minimal async P/D router: primes prefill (max_tokens=1), then
                              streams the real request from decode. See its own docstring.
@@ -195,6 +237,15 @@ scripts/
     run-all.sh                install -> baseline -> prefix-cache -> concurrency -> summary.
     See docs/BENCHMARKING.md for what each measures and why.
 
+patches/spdk/
+  README.md                  Per-patch Gerrit status, Change-Ids, and apply order for the four
+                             upstream-bound NVMe-KV patches — see "SPDK and the NVMe-KV patches"
+                             above for the summary.
+  0001-spdk-nvme-recognize-kv-namespaces.patch / 0002-spdk-bdev-kvmalloc.patch /
+  0003-spdk-nvmf-kv-namespace.patch / 0004-spdk-nvme-kv-unit-tests.patch
+                             Applied by scripts/target/02-build-spdk-kv.sh; 0001/0004 are
+                             skipped automatically on trees where they're already merged.
+
 patches/lmcache/
   README.md                  Why/what/how of the LMCache NIXL-backend-allowlist patch, with an
                              explicit VERIFIED-vs-ASSUMED accounting.
@@ -202,12 +253,13 @@ patches/lmcache/
   _patch_engine.py            tokenize/ast-based source transformation the above invokes.
 
 plugins/
-  nvme-kv/                    SPDK_NVMe_KV NIXL plugin — NVMe-oF (TCP, PCIe linked always; RDMA
-                             linked opt-in via -Denable_rdma=true, default false, unvalidated) to
-                             the SMC3 target. Primary storage-leg backend.
+  nvme-kv/                    SPDK_NVMe_KV NIXL plugin — NVMe-oF (TCP, PCIe) to the SMC3 target.
+                             Primary storage-leg backend. No RDMA transport is linked — the
+                             storage leg is TCP by design, not a build-time option (see "SPDK and
+                             the NVMe-KV patches" above).
     spdk_nvme_kv_backend.h/.cpp, spdk_nvme_kv_plugin.cpp, meson.build, meson_options.txt
-    prepare-spdk-libs.sh      Generates the "_only" split static archives meson.build needs
-                             (including libspdk_nvme_rdma_only.a when the SPDK tree has it).
+    prepare-spdk-libs.sh      Generates the "_only" split static archives (TCP, PCIe, POSIX sock)
+                             meson.build needs.
   xnvme-kv/                    XNVME_KV NIXL plugin — io_uring_cmd against a locally-attached
                              KV-namespace char device (kernel `nvme` driver, no SPDK/DPDK/VFIO).
                              Not this cluster's storage-leg backend (that's remote NVMe-oF); kept
@@ -235,20 +287,21 @@ docs/
 This is the shortest path from bare nodes to a serving cluster. Every
 command below is also documented in full, with expected output and failure
 handling, in [`docs/BRINGUP.md`](docs/BRINGUP.md) — read that before running
-this for the first time on real hardware. `KV_SPDK_REPO` (the kv_spdk fork
-URL, needed only for the SMC3 target — see gap #2) and `HF_TOKEN` (the
-default `MODEL` is gated) must be supplied out of band; see Configuration
-below. `MODEL`'s bf16 weights are ~145 GB — pre-stage the download to
-`HF_HOME` before bring-up rather than discovering the wait during it (see
-`docs/BRINGUP.md` §0).
+this for the first time on real hardware. `HF_TOKEN` (the default `MODEL`
+is gated) must be supplied out of band; see Configuration below. `MODEL`'s
+bf16 weights are ~145 GB — pre-stage the download to `HF_HOME` before
+bring-up rather than discovering the wait during it (see `docs/BRINGUP.md`
+§0).
 
 ```bash
 # on SMC1, SMC2, AND SMC3 — read-only inventory, run first everywhere
 scripts/common/00-preflight.sh
 
-# on SMC3 (target) — builds the kv_spdk FORK (bdev_kvmalloc isn't upstream)
+# on SMC3 (target) — builds upstream SPDK + patches/spdk/'s 0002/0003
+# (bdev_kvmalloc + nvmf KV opcode routing aren't upstream yet — see
+# "SPDK and the NVMe-KV patches" above)
 scripts/target/01-host-prep.sh
-KV_SPDK_REPO=<fork-url> scripts/target/02-build-spdk-kv.sh
+scripts/target/02-build-spdk-kv.sh
 scripts/target/03-start-kv-target.sh
 scripts/target/04-verify-target.sh
 
@@ -289,17 +342,18 @@ variables an operator most commonly touches:
 | `TP_SIZE` | `8` | Tensor-parallel shard count; host-prep scripts hard-fail if fewer GPUs are visible. |
 | `MAX_MODEL_LEN` | `32768` | `Qwen2.5-72B-Instruct`'s native context. `131072` needs a YaRN `rope_scaling` override (via `VLLM_EXTRA_ARGS`) and materially more KV per sequence — a deliberate change, not a config bump alone. |
 | `KV_TRANSPORT` | `tcp` | **The** phase gate — `tcp` (Phase 1) or `rdma` (Phase 2); drives both NVMe-oF transport and `UCX_TLS`. See Status above. |
-| `KV_BDEV_SIZE_GB` | `64` | Size of the RAM-backed `bdev_kvmalloc` namespace on SMC3. |
-| `KV_MAX_VALUE_SIZE` | `524288` | Plugin's advertised per-STORE/RETRIEVE ceiling (NOT a device limit — see `docs/ARCHITECTURE.md`). Originally derived from the NVMe-oF/TCP transport's SGL ceiling, which is no longer the governing constraint on SPDK >=26.05 (see `docs/ARCHITECTURE.md` §7) — the default is unchanged regardless. Changing it requires draining the namespace first (`scripts/target/50-reset-namespace.sh`). |
+| `KV_BDEV_NAME` / `KV_BDEV_MAX_KEY_SIZE` / `KV_BDEV_VALUE_MAX` | `KvMalloc0` / `16` / `67108864` | `bdev_kvmalloc_create`'s `name`/`max_key_size`/`max_value_size` RPC params — an in-memory red-black tree with no separate total-size knob (there is no `KV_BDEV_SIZE_GB`; an earlier version of this file guessed a `-b/-s/--value-max-size` shape that `bdev_kvmalloc_create` does not accept). |
+| `KV_MAX_VALUE_SIZE` | `524288` | Plugin's advertised per-STORE/RETRIEVE ceiling (NOT a device limit — see `docs/ARCHITECTURE.md`). Changing it requires draining the namespace first (`scripts/target/50-reset-namespace.sh`). |
+| `NVMF_MAX_IO_SIZE` / `NVMF_LARGE_BUFSIZE` | `16777216` / `1048576` | The SGL ceiling `nvmf_tcp_create()` enforces is `max_io_size / large_bufsize <= 16` (`SPDK_NVMF_MAX_SGL_ENTRIES`) — note the denominator is `large_bufsize` (iobuf pool sizing), not `NVMF_IO_UNIT_SIZE`. Asserted arithmetically before `nvmf_tgt` even launches by `scripts/target/lib-kv-rpc.sh`'s `kv_target_check_sgl()`. Also the ceiling `scripts/target/05-check-chunk-ceiling.sh` checks one LMCache chunk against — see that script. |
+| `NVMF_MAX_IO_QPAIRS_PER_CTRLR` | `512` | **The exact RPC key** — SPDK silently ignores the older `max_qpairs_per_ctrlr` spelling and keeps its default of 127 qpairs on a single controller, which makes P+D against a shared target impossible (whichever role connects first takes the whole budget; the second's I/O queue is refused, invisibly — see `config/cluster.env`'s comment for the exact failure signature). `scripts/target/04-verify-target.sh` hard-checks this field actually took. |
+| `TARGET_HUGE_PAGES` | `0` | Opt-in on the target only. `0` (default) runs `nvmf_tgt --no-huge -s ${TARGET_MEM_MB}` (malloc-backed, no hugetlbfs dependency); `>0` allocates that many 2 MiB hugepages instead. SMC1/SMC2's `HUGEPAGE_COUNT` is separate and always-on (the plugin embeds SPDK/DPDK EAL). |
 | `NVMF_TRSVCID` | `4420` | NVMe-oF target TCP/RDMA port on SMC3. |
 | `PREFILL_PORT` / `DECODE_PORT` / `PROXY_PORT` | `8100` / `8200` / `8000` | vLLM and proxy HTTP ports. |
 | `NIXL_SIDE_CHANNEL_PORT` | `5557` | Direct P↔D NIXL/UCX handshake port (compute leg). |
-| `SPDK_VERSION` | `v26.05` | Upstream SPDK release both `05-build-spdk-initiator.sh` and (as a fallback flavor) `02-build-spdk-kv.sh` clone; this is the first release with the NVMe-KV initiator API upstream. |
-| `SPDK_INITIATOR_FLAVOR` | `upstream` | `upstream`\|`fork` — SMC1/SMC2's SPDK tree. `upstream` self-clones `SPDK_UPSTREAM_REPO`@`SPDK_VERSION`; `fork` expects the kv_spdk tree rsynced in from SMC3. See `docs/ARCHITECTURE.md` §7. |
-| `SPDK_TARGET_FLAVOR` | `fork` | `fork`\|`upstream` — SMC3's SPDK tree. `fork` (default) is required: stock upstream SPDK has no `bdev_kvmalloc` module. |
-| `KV_SPDK_REPO` | *(unset)* | kv_spdk fork git URL — **must be supplied for the SMC3 target**; not vendored in this repo. No longer needed on SMC1/SMC2 (default `SPDK_INITIATOR_FLAVOR=upstream`). See gap #2. |
-| `SPDK_WITH_RDMA` | `1` | Configures every SPDK tree (target and initiator) `--with-rdma` so RDMA is a relink, not a rebuild, later. Does not by itself enable RDMA in the plugin — that's `plugins/nvme-kv/meson.build`'s `-Denable_rdma` meson option (default `false`), see `docs/BRINGUP.md` §9.1. |
-| `NVMF_IOBUF_SMALL_CACHE_SIZE` / `NVMF_IOBUF_LARGE_CACHE_SIZE` | `128` / `32` (KiB) | SPDK >=26.05's iobuf-pool sizing for `nvmf_create_transport`, replacing the deprecated `io_unit_size`/`buf-cache-size`/`num-shared-buffers` knobs. |
+| `SPDK_VERSION` | `v26.05` | Upstream SPDK release `05-build-spdk-initiator.sh` clones for SMC1/SMC2; the first release with the NVMe-KV initiator API upstream. |
+| `SPDK_INITIATOR_FLAVOR` | `upstream` | `upstream`\|`fork` — SMC1/SMC2's SPDK tree. `upstream` self-clones `SPDK_UPSTREAM_REPO`@`SPDK_VERSION`; `fork` expects SMC3's built tree rsynced in, for ruling out version skew. |
+| `SPDK_TARGET_REF` | `master` | Git ref SMC3's SPDK tree is built from (`scripts/target/02-build-spdk-kv.sh`) before `patches/spdk/`'s `0002`/`0003` are applied on top. `master` already carries `0001`/`0004`; pin an explicit SHA for a reproducible build. |
+| `SPDK_PATCH_DIR` | `<repo>/patches/spdk` | Where `scripts/target/02-build-spdk-kv.sh` reads the four NVMe-KV `.patch` files from — see "SPDK and the NVMe-KV patches" above. |
 | `HF_TOKEN` | *(empty)* | HuggingFace token — required, `MODEL`'s default is gated. |
 | `HF_HOME` | `/data/hf` | Model weights cache directory; pre-stage ~145 GB for the default `MODEL`. |
 | `LMCACHE_CHUNK_SIZE` | `256` | LMCache KV page size in tokens; actual page bytes scale with the model's hidden size/layer count — see `docs/ARCHITECTURE.md` §2. |
@@ -351,49 +405,36 @@ negative result.
 
 ## Known gaps / open items
 
-1. **Phase 2 RDMA groundwork has landed but is unvalidated.**
-   `plugins/nvme-kv/prepare-spdk-libs.sh` splits `nvme_rdma.o` into
-   `libspdk_nvme_rdma_only.a` when the initiator's SPDK tree was configured
-   `--with-rdma`, and `meson.build`'s `-Denable_rdma` option (default
-   `false`, `meson_options.txt`) adds it to the `--whole-archive` group plus
-   `-lrdmacm -libverbs`. Nobody has rebuilt with `-Denable_rdma=true`, set
-   `KV_TRANSPORT=rdma`, or run the storage leg over an actual RoCE fabric
-   yet. See `docs/BRINGUP.md` §9.1 for exactly what's implemented vs. what
-   remains and how to prove RDMA is carrying traffic rather than TCP.
-2. **`KV_SPDK_REPO` is not vendored, and is needed only for the SMC3
-   target.** As of SPDK v26.05 the NVMe-KV **initiator** API
-   (`spdk_nvme_kv_store/retrieve/delete/exist/list()`) is upstream, so
-   SMC1/SMC2 build a stock SPDK tree (`scripts/common/05-build-spdk-
-   initiator.sh`, `SPDK_INITIATOR_FLAVOR=upstream`) and need no fork at all.
-   The **target** side (`bdev_kvmalloc`, and `lib/nvmf/ctrlr_bdev.c`'s KV
-   opcode routing) did not land upstream, so SMC3 still needs the kv_spdk
-   fork; its URL/ref must be supplied by the operator —
-   `scripts/target/02-build-spdk-kv.sh` fails loudly and explains this if
-   neither `KV_SPDK_REPO` nor a pre-built tree at `SPDK_TARGET_SRC` is
-   available. See `docs/ARCHITECTURE.md` §7 for why the boundary falls
-   exactly there.
-3. **The LMCache backend-allowlist patch is generated at apply time, not a
+1. **Gerrit 27889 (`0002`) and 28298 (`0003`) have not merged upstream yet.**
+   Both are review-complete (`CR+2`, mergeable, `hashtag 26.09`) but still
+   open as of 2026-09-14 — see `patches/spdk/README.md`. This repo carries
+   them as vendored `.patch` files applied by
+   `scripts/target/02-build-spdk-kv.sh`; once both merge into a released
+   v26.09, they can be dropped and `SPDK_TARGET_REF` pinned to that release
+   instead of `master`. Tracked at
+   [TODO.md §4.4](docs/TODO.md#4-open-items-known-limitations).
+2. **The LMCache backend-allowlist patch is generated at apply time, not a
    pinned diff.** `patches/lmcache/apply-patches.sh` scans and patches
    whatever LMCache version is actually installed, rather than applying a
    static `.patch` file — see `patches/lmcache/README.md`'s explicit
    VERIFIED-vs-ASSUMED section for exactly which parts of this are confirmed
    against real LMCache source and which are best-effort.
-4. **LMCache's config YAML key names are not a stable contract across
+3. **LMCache's config YAML key names are not a stable contract across
    versions.** `scripts/common/gen-lmcache-config.sh` targets `LMCACHE_VERSION=0.5.4`
    specifically; `scripts/common/25-validate-lmcache-config.sh` exists
    precisely because a config can load cleanly and still silently never
    reach the NIXL storage backend on a different installed version.
-5. **No restart-survival or cross-process value sharing for a caller that
+4. **No restart-survival or cross-process value sharing for a caller that
    never sets `metaInfo`** (i.e. any caller other than LMCache's
    `NixlDynamicStorageBackend` — see `plugins/nvme-kv/spdk_nvme_kv_backend.h`'s
    `make_key()` comment). This cluster's actual LMCache path always sets
    `metaInfo`, so this gap does not affect normal operation, but any custom
    tooling built against `kv_io.py`/`nixlbench`-style calls will hit it.
-6. **SMC3's Pollara serial console (`telnet REDACTED-ADDR 2022/2023`) refused
+5. **SMC3's Pollara serial console (`telnet REDACTED-ADDR 2022/2023`) refused
    the connection the last time it was tried.** Unresolved; out-of-band
    access to SMC3 in a wedged state currently depends on its BMC
    (`REDACTED-ADDR`) instead.
-7. **No geometry manifest for stored KV objects.** Nothing records the
+6. **No geometry manifest for stored KV objects.** Nothing records the
    `max_value_size` an object was split under; changing `KV_MAX_VALUE_SIZE`
    without draining the namespace first
    (`scripts/target/50-reset-namespace.sh`) silently reassembles half-stale

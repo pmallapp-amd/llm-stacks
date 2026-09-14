@@ -30,11 +30,19 @@ bring-up phase, not the destination.
 
 ## 2. Current state
 
-Ten commits on `main`, 59 files, clean tree. Everything is written and
-lint-clean; **nothing has run on hardware.** Treat every performance claim and
-every RPC argument name as unvalidated.
+Thirteen commits on `main`, 67 files, clean tree. The target-side
+configuration (§5, §6 below) now derives from a proven sibling deployment
+rather than inference — every RPC argument name, transport-sizing formula
+and startup flag traces to a working target with measured failure dates,
+not a guess. That does not mean it has run *here*: **nothing in this repo
+has run on the actual SMC1/SMC2/SMC3 hardware yet.** Treat every
+performance claim as unvalidated even where the configuration itself is
+now verified.
 
 ```
+2a78374  fix(target): rebuild SMC3 from the proven rocm-aic configuration
+e896a37  docs: fix two broken cross-doc anchors
+9913206  docs: add handoff and todo, flag the architecture correction
 c77daa5  docs: README, architecture, bring-up, troubleshooting, benchmarking
 275381e  feat(bench): llama-benchy prefix-cache benchmark harness
 efe2044  feat(verify): staged verification ladder
@@ -88,10 +96,15 @@ compute nodes, which is exactly where leg A runs.
    `LMCacheConnectorV1`. **The path carrying the acceptance criterion was never
    built.** This is the single biggest gap.
 
-2. **Twelve files carry storage-leg RDMA scaffolding** from the bad premise —
-   the `nvme_rdma.o` split archive, `-Denable_rdma`, `SPDK_WITH_RDMA`,
-   `NVMF_TRTYPE=RDMA`. To be deleted, not kept. Unvalidated opt-in code for a
-   requirement that does not exist will mislead the next reader.
+2. ~~Twelve files carried storage-leg RDMA scaffolding from the bad
+   premise~~ — **done.** The `nvme_rdma.o` split archive, `-Denable_rdma`,
+   `SPDK_WITH_RDMA`, and the `NVMF_TRTYPE=RDMA` branch have all been
+   removed (`plugins/nvme-kv/meson.build`, `meson_options.txt`,
+   `prepare-spdk-libs.sh`, `scripts/target/02-build-spdk-kv.sh`,
+   `scripts/common/05-build-spdk-initiator.sh`, `config/cluster.env`) as
+   part of rewriting the target from a proven configuration — see §5 and
+   TODO 5.11. Unvalidated opt-in code for a requirement that does not exist
+   would have misled the next reader; it no longer can.
 
 3. **`KV_TRANSPORT` conflates both legs** across 18 files. Needs splitting into
    `PD_TRANSPORT` (compute leg, the real acceptance gate) and a storage leg with
@@ -126,6 +139,24 @@ cross-request reuse and capacity spill. That is the recommended reading, but it
 needs an explicit decision before more code lands. See
 [TODO.md §0](TODO.md#0-blocking-decisions-need-an-answer-before-more-code-lands).
 
+This reading is now independently reinforced, not just recommended. A
+sibling project reached the same storage-mediated conclusion on its own and
+went further: it confirmed LMCache's own peer-to-peer path (`enable_pd` /
+`pd_role`, `lmcache/v1/storage_backend/pd_backend.py`) is **unusable** with
+this plugin — `pd_backend.py`'s `transfer_channel` requires a backend with
+`supportsRemote() == true`, and `spdk_nvme_kv_backend.h` declares
+`supportsRemote() { return false; }`. What that sibling project uses instead
+is `enable_nixl_storage` / `store_location` / `retrieve_locations`
+(`nixl_storage_backend.py`) — ordinary persistent L1→L2 storage, with two
+independent plugin instances against the same target and vLLM's own
+`kv_role` gating enforcing the P/D asymmetry (`vllm_v1_adapter.py` lines
+1050, 1141, 1661). That is disaggregation-via-shared-persistent-store, the
+same shape as this repo's current (pre-correction) path — it does **not**
+rule out vLLM's `NixlConnector` over the UCX backend for the RDMA compute
+leg, since UCX is a different NIXL backend that does support remote peers.
+It narrows the open question rather than closing it: LMCache's own p2p path
+is confirmed out; `NixlConnector` remains the candidate for leg A.
+
 ---
 
 ## 4. Repository map
@@ -134,12 +165,14 @@ needs an explicit decision before more code lands. See
 config/cluster.env          single source of truth — topology, transport, model, paths
 scripts/common/             lib.sh (shared vocabulary), preflight, build chain, venv,
                             LMCache config generation + validation, shared vLLM launcher
-scripts/target/             SMC3: SPDK build, spdk_tgt + bdev_kvmalloc, verify, ns reset
+scripts/target/             SMC3: SPDK build (upstream + patches/spdk/), nvmf_tgt +
+                            bdev_kvmalloc, verify (incl. chunk-ceiling check), ns reset
 scripts/prefill/            SMC1: host prep, vLLM as kv_producer
 scripts/decode/             SMC2: host prep, vLLM as kv_consumer
 scripts/proxy/              async disaggregation router
 scripts/verify/             10 network → 20 plugin → 30 KV roundtrip → 40 end-to-end
 scripts/bench/              llama-benchy harness + compare_runs.py
+patches/spdk/               four upstream-bound NVMe-KV patches (Gerrit, no private fork)
 patches/lmcache/            NIXL backend allowlist patch, generated at apply time
 plugins/                    vendored SPDK_NVMe_KV and XNVME_KV NIXL backends
 docs/                       ARCHITECTURE, BRINGUP, TROUBLESHOOTING, BENCHMARKING,
@@ -162,29 +195,48 @@ on the assumed items rather than guess silently — preserve that when editing.
 - SPDK **v26.05** (2026-05-29) carries NVIDIA's NVMe-KV **initiator** API
   upstream: `nvme_kv.h`, `lib/nvme/nvme_kv.c`, the full
   `spdk_nvme_kv_{store,retrieve,exist,delete,list}()` surface, opcodes and status
-  codes in `nvme_spec.h`. The compute nodes need no fork.
-- SPDK v26.05 did **not** upstream the target side — no `bdev_kvmalloc`, no KV
-  opcode routing in `lib/nvmf/ctrlr_bdev.c`. SMC3 still needs the fork.
-- SPDK v26.05 deprecated `io_unit_size` to a no-op. The
-  `max_io_size / io_unit_size ≤ 16` SGL rule that originally justified
-  `KV_MAX_VALUE_SIZE=524288` is no longer the governing constraint on ≥26.05.
+  codes in `nvme_spec.h`. The compute nodes need no fork — there is no fork at
+  all, see below.
+- **There is no private SPDK fork.** NVMe-KV support is four upstream-bound
+  patches by Ben Walker `<ben@nvidia.com>` on the public SPDK Gerrit queue
+  (`patches/spdk/README.md`): `0001` (recognize KV namespaces) and `0004`
+  (KV unit tests) merged upstream 2026-08-25; `0002` (`bdev/kvmalloc`) and
+  `0003` (nvmf KV namespace support) still open (Gerrit 27889/28298 —
+  CR+2, Verified+1, mergeable, hashtag `26.09`) as of 2026-09-14. SMC3
+  builds upstream SPDK at `SPDK_TARGET_REF` and applies `0002`/`0003` from
+  `patches/spdk/`; SMC1/SMC2 need none of the four.
+- **`bdev_kvmalloc_create`'s RPC argument names** — `name` / `max_key_size` /
+  `max_value_size` — taken from a working sibling deployment
+  (`rocm-aic/target.sh`), not guessed. There is no `-b/-s/--value-max-size`
+  form and no `KV_BDEV_CREATE_ARGS` escape hatch; both were removed.
+- **The chunk-size-vs-transfer-ceiling formula**
+  (`layers * chunk_size * (kv_heads/TP) * head_size * 2(K,V) * 2(bf16)`,
+  `scripts/target/05-check-chunk-ceiling.sh`), validated against two measured
+  points: TinyLlama TP=1 chunk=256 → 5.5 MiB (fits); Qwen2.5-72B TP=4
+  chunk=256 → 20 MiB (measured 2026-09-09, does **not** fit). This repo's
+  configuration (Qwen2.5-72B TP=8 chunk=256 → 10 MiB) fits with 37%
+  headroom.
+- SPDK v26.05 deprecated `io_unit_size` to a no-op. The governing SGL rule on
+  ≥26.05 is `max_io_size / large_bufsize ≤ 16` (note the denominator is
+  iobuf's `large_bufsize`, not `io_unit_size` — an earlier version of this
+  repo divided by the wrong one).
 - llama-benchy's CLI surface and JSON schema; `--enable-prefix-caching` runs a
   two-step context-load-then-inference protocol; it drives
   `/v1/chat/completions` only.
 
 ### Assumed (will need reconciling on first contact with hardware)
 
-- **`bdev_kvmalloc_create` RPC argument names.** The fork is not vendored here.
-  Scripts try one form, then print `--help` and die; override with
-  `KV_BDEV_CREATE_ARGS`.
 - **LMCache YAML key names and the allowlist patch sites.** Derived against
   v0.5.4 and validated only against a mock. `apply-patches.sh` fails loudly if it
   finds zero allowlist sites, because that means the assumption has gone stale.
 - **The NIXL Python API surface** used by the verify scripts — partially grounded,
   partially inferred. Failures surface as specific `AttributeError`s rather than
   silent false passes.
-- **`nvme_rdma.o` as the RDMA object name** inside `libspdk_nvme.a`. Moot if the
-  storage-leg RDMA scaffolding is removed as planned.
+- **That `patches/spdk/0002`/`0003` still apply cleanly to whatever
+  `SPDK_TARGET_REF` SHA ends up pinned.** They are known to apply to v26.05
+  and to a pre-`0002`/`0003` master; if master drifts far enough that the
+  surrounding code changes shape, that needs a manual rebase, not a blind
+  retry (`scripts/target/02-build-spdk-kv.sh` says so explicitly on failure).
 - **All benchmark numbers in `BENCHMARKING.md`** are order-of-magnitude
   estimates, explicitly labelled as such. Replace with measured values.
 
@@ -221,7 +273,26 @@ while doing the wrong thing. They are the reason several scripts refuse to start
 6. **`UCX_TLS` excludes `tcp` in RDMA mode.** Acceptance must fail loudly rather
    than quietly fall back to TCP and report a passing result.
 
-7. **Startup preconditions in `start-vllm.sh`** — target reachable, LMCache
+7. **`max_io_qpairs_per_ctrlr` is spelled exactly that, value 512** —
+   `config/cluster.env`'s `NVMF_MAX_IO_QPAIRS_PER_CTRLR`. SPDK silently
+   accepts the older `max_qpairs_per_ctrlr` spelling and keeps its default
+   of 127 in force, no error anywhere. One `SPDK_NVMe_KV` plugin instance
+   opens all of a controller's qpairs, so against a shared target whichever
+   role connects first takes the whole budget and the second is refused —
+   invisibly: the client logs `CQ transport error -6` and
+   `NIXL_ERR_BACKEND`, while LMCache still logs a successful store and HTTP
+   returns 200, with zero bytes reaching the device. Confirmed 2026-09-07.
+   `scripts/target/04-verify-target.sh` hard-checks this field actually took.
+
+8. **The chunk-size ceiling** — one LMCache chunk is one NIXL object, and
+   must fit under `NVMF_MAX_IO_SIZE`
+   (`scripts/target/05-check-chunk-ceiling.sh`). Exceeding it fails the
+   STORE with `NIXL_ERR_BACKEND` and takes the whole vLLM server down rather
+   than degrading. `chunk_size` is also part of the cache key, so both P/D
+   roles must use the same `LMCACHE_CHUNK_SIZE` or the receiver derives a
+   different key and silently re-prefills.
+
+9. **Startup preconditions in `start-vllm.sh`** — target reachable, LMCache
    config validated. Without them vLLM serves happily from local cache only and
    disaggregation does nothing while appearing correct.
 
@@ -229,13 +300,16 @@ while doing the wrong thing. They are the reason several scripts refuse to start
 
 ## 7. How to resume
 
-1. Answer the two blocking items in [TODO.md §0](TODO.md#0-blocking-decisions-need-an-answer-before-more-code-lands):
-   the SMC3 scoping decision, and the `KV_SPDK_REPO` fork URL.
+1. Answer the blocking item in [TODO.md §0](TODO.md#0-blocking-decisions-need-an-answer-before-more-code-lands):
+   the SMC3 scoping decision (0.1). The `KV_SPDK_REPO` fork blocker that used
+   to sit alongside it never described reality and has been removed — see §3
+   and §5.
 2. Re-run the aborted research on `NixlConnector` / `MultiConnector` / LMCache
-   nixl-p2p. Its scope depends on the scoping decision.
-3. Work [TODO.md §1](TODO.md#1-architecture-correction-in-flight) — split the
-   transport switch, delete the misplaced RDMA scaffolding, build leg A, fix the
-   proxy and the verifier.
+   nixl-p2p (TODO 1.1). Its scope depends on the scoping decision.
+3. Work [TODO.md §1](TODO.md#1-architecture-correction-compute-leg) — split the
+   transport switch, build leg A, fix the proxy and the verifier. The
+   misplaced storage-leg RDMA scaffolding this step used to also need to
+   delete is already gone (TODO 5.11).
 4. Only then go to hardware ([TODO.md §2](TODO.md#2-hardware-bring-up-phase-1-tcp))
    and follow [BRINGUP.md](BRINGUP.md).
 
