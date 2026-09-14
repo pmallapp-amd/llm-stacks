@@ -69,3 +69,8 @@ config/local.env
 
 # Per-setup identity and credentials. Never tracked.
 /creds/
+
+# NFS silly-rename artifacts. A stale copy of an open file, and one of
+# these once swept pre-scrub credentials into a commit via `git add -A`.
+.nfs*
+**/.nfs*
