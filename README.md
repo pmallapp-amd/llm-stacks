@@ -22,6 +22,17 @@ why.
 
 ## Status
 
+> **Architecture correction pending — read [`docs/HANDOFF.md`](docs/HANDOFF.md) first.**
+>
+> The Status table below, and parts of `ARCHITECTURE.md` / `BRINGUP.md` §9, describe
+> an incorrect model in which RDMA applies to the **storage** leg (SMC1/SMC2 → SMC3).
+> It does not. SMC3 is NVMe-oF/**TCP by design**. The RDMA acceptance criterion
+> applies to the **compute** leg — the direct SMC1 → SMC2 KV transfer over the DSC3
+> NICs — which is **not yet implemented in this repo**.
+>
+> Corrected model and full account: [`docs/HANDOFF.md` §3](docs/HANDOFF.md#3-the-correction).
+> Remaining work: [`docs/TODO.md` §1](docs/TODO.md#1-architecture-correction-in-flight).
+
 | Phase | Transport | State |
 |---|---|---|
 | **Phase 1 — bring-up** | NVMe-oF/TCP (storage leg) + UCX/TCP (compute leg) | Implemented in this repo (`KV_TRANSPORT=tcp`, the default in `config/cluster.env`). **Not yet run on the physical hardware** — every script has been written and reasoned through against the actual plugin/SPDK/LMCache source, but no end-to-end run on SMC1/SMC2/SMC3 has been recorded in this repo. |
@@ -205,6 +216,11 @@ plugins/
     xnvme_kv_backend.h/.cpp, xnvme_kv_plugin.cpp, meson.build, meson_options.txt
 
 docs/
+  HANDOFF.md                  START HERE. Project state, the architecture correction,
+                             verified-vs-assumed inventory, and the invariants that guard
+                             the silent failure modes.
+  TODO.md                     Working task list: blocking decisions, the in-flight
+                             architecture correction, hardware bring-up, acceptance.
   ARCHITECTURE.md             Design deep-dive: why storage-mediated, full KV lifecycle,
                              key-derivation scheme, memory tiers, threading/backpressure model,
                              plugin comparison, SPDK upstream-vs-fork split.
