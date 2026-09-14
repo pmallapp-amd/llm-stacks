@@ -199,11 +199,19 @@ summarises it, it does not duplicate it.
 ```
 config/
   cluster.env               Single source of truth for every tunable — see Configuration below.
+  creds.env.template         Tracked template of every variable a creds file can set — placeholder
+                             values only. See "Credentials / lab setup" above.
+
+creds/                      (untracked, gitignored — /creds/ in .gitignore — created by init-creds.sh)
+  active.env                 Symlink to whichever setup-N.env is the live lab.
+  setup-N.env                 Real per-lab credentials, mode 0600; one file per lab. Never committed.
 
 scripts/
   common/
     lib.sh                   Shared bash helpers: logging, retry/wait_for_*, start_bg/stop_bg,
                              setup_ucx_env / setup_nixl_kv_env, the check/checks_summary harness.
+    init-creds.sh             Scaffold creds/setup-N.env from config/creds.env.template and activate
+                             it. Run this before 00-preflight.sh on a fresh checkout.
     00-preflight.sh          Read-only inventory + go/no-go, any node.
     05-build-spdk-initiator.sh
                              Build the INITIATOR-side SPDK tree (SMC1/SMC2) — upstream v26.05 by
@@ -400,19 +408,38 @@ is.
 `config/cluster.env` is tracked and public, but it carries no addresses,
 usernames, passwords, or console endpoints — only safe `.invalid`-TLD
 (RFC 2606) placeholders such as `prefill.invalid`, `prefill-bmc.invalid`.
-Per-setup identity lives in `creds/`, which is entirely gitignored:
+Per-setup identity lives in `creds/`, which is entirely gitignored — the
+`.gitignore` rule is a bare `/creds/` with no negation exceptions, since a
+`!creds/...` carve-out is one typo away from tracking a real credentials
+file in a public repo. `config/creds.env.template` — the tracked,
+fully-commented template of every variable a creds file can set,
+placeholder values only — deliberately lives on the `config/` side of that
+boundary rather than inside `creds/`, so an accidental commit of real
+credentials is structurally impossible rather than merely unlikely.
 
-- `creds/setup-N.env` — one file per lab, holding the real
-  `PREFILL_HOST` / `PREFILL_NAME` / `PREFILL_USER` / `PREFILL_PASS` /
-  `PREFILL_BMC` / `PREFILL_BMC_USER` / `PREFILL_BMC_PASS` /
-  `PREFILL_CONSOLE` / `PREFILL_CONSOLE_ALT` (and the `DECODE_*` /
-  `TARGET_*` equivalents), plus `SSH_USER`. Never commit this file.
-- `creds/active.env` — a symlink to whichever `setup-N.env` is the
-  current lab. Repoint it (`ln -sfn setup-N.env creds/active.env`) to
-  switch labs without editing any tracked file.
-- `CREDS_FILE` — set this environment variable to override the symlink
-  entirely and point at any path, e.g. for CI or a one-off lab:
-  `CREDS_FILE=/path/to/other.env scripts/common/00-preflight.sh`.
+Bootstrap a lab from the template with `scripts/common/init-creds.sh`:
+
+```bash
+# any machine
+scripts/common/init-creds.sh 4     # -> creds/setup-4.env + active.env symlink
+$EDITOR creds/setup-4.env
+source config/cluster.env && echo "${PREFILL_HOST}"
+```
+
+- `scripts/common/init-creds.sh --show` reports which `setup-N.env` is
+  currently active, or that none is (in which case every address falls
+  back to its `.invalid` placeholder).
+- Run several labs side by side by keeping `creds/setup-1.env`,
+  `creds/setup-2.env`, ... and repointing the `active.env` symlink —
+  `scripts/common/init-creds.sh <N>` does this by default, or by hand:
+  `ln -sfn setup-N.env creds/active.env`.
+- `CREDS_FILE` overrides the symlink entirely, e.g. for CI or a one-off
+  lab: `CREDS_FILE=/path/to/other.env scripts/common/00-preflight.sh`.
+
+See `config/creds.env.template` for the authoritative, commented list of
+every variable a creds file can set (`PREFILL_*`/`DECODE_*`/`TARGET_*`
+hosts, BMCs, consoles, data-plane interfaces, `HF_TOKEN`, and more) — this
+section does not duplicate that list.
 
 `config/cluster.env` sources `${CREDS_FILE:-creds/active.env}` **first**, so
 every real value wins over its `.invalid` fallback when the file is

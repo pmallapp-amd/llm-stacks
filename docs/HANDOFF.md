@@ -187,7 +187,9 @@ is confirmed out; `NixlConnector` remains the candidate for leg A.
 
 ```
 config/cluster.env          single source of truth — topology, transport, model, paths
-scripts/common/             lib.sh (shared vocabulary), preflight, build chain, venv,
+config/creds.env.template   tracked template of every creds-file variable (placeholders only)
+creds/                      untracked, gitignored — per-setup identity; see scripts/common/init-creds.sh
+scripts/common/             lib.sh (shared vocabulary), init-creds.sh, preflight, build chain, venv,
                             LMCache config generation + validation, shared vLLM launcher
 scripts/target/             SMC3: SPDK build (upstream + patches/spdk/), nvmf_tgt +
                             bdev_kvmalloc, verify (incl. chunk-ceiling check), ns reset
@@ -202,6 +204,12 @@ plugins/                    vendored SPDK_NVMe_KV and XNVME_KV NIXL backends
 docs/                       ARCHITECTURE, BRINGUP, TROUBLESHOOTING, BENCHMARKING,
                             TODO, HANDOFF
 ```
+
+Per-setup identity is fully externalised from the tracked tree — a new
+person gets a working checkout running with
+`scripts/common/init-creds.sh <N>` (fill in the generated
+`creds/setup-N.env`), then `scripts/common/00-preflight.sh`; see the
+README's "Credentials / lab setup" section for the rest.
 
 ---
 

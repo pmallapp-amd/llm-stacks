@@ -17,6 +17,16 @@ reach. These variables come from `creds/active.env` — see the README's
 
 Gather before starting — nothing below can complete without these:
 
+- **A creds file.** §1's `source creds/active.env` and every
+  `${PREFILL_HOST}`-style reference below only work once one exists. Create
+  it now, before doing anything else:
+
+  ```bash
+  scripts/common/init-creds.sh <N>
+  ```
+
+  See the README's "Credentials / lab setup" section for the full
+  mechanism (multi-lab, `--show`, `CREDS_FILE`).
 - **`KV_SPDK_REPO`** — the git URL (and, if not `main`/default branch,
   `KV_SPDK_REF`) for the kv_spdk fork, needed **only for the SMC3 target**
   (`SPDK_TARGET_FLAVOR=fork`, the default — as of SPDK v26.05 the NVMe-KV
