@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# start-vllm.sh — shared body for launching the vLLM+LMCache server on either
+# role. Not meant to be invoked directly by an operator — exec'd by
+# scripts/prefill/03-start-prefill.sh and scripts/decode/03-start-decode.sh,
+# each of which pins its own required host first.
+#
+# Node:          SMC1 (prefill) or SMC2 (decode), selected by $1.
+# Prerequisites: scripts/common/20-build-vllm-lmcache.sh; SMC3's NVMe-oF
+#                target already listening on NVMF_TRSVCID (this script
+#                refuses to start otherwise — see the wait_for_port gate
+#                below).
+# Next step:     scripts/proxy/start-proxy.sh once both roles are up.
+#
+# usage: start-vllm.sh <prefill|decode> [--skip-validate]
+
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+ROLE="${1:-}"
+shift || true
+SKIP_VALIDATE=0
+for arg in "$@"; do
+    case "${arg}" in
+        --skip-validate) SKIP_VALIDATE=1 ;;
+        *) die "unknown argument: ${arg}" ;;
+    esac
+done
+
+case "${ROLE}" in
+    prefill)
+        PORT="${PREFILL_PORT}"
+        KV_ROLE="kv_producer"
+        ;;
+    decode)
+        PORT="${DECODE_PORT}"
+        KV_ROLE="kv_consumer"
+        ;;
+    *) die "start-vllm.sh: role must be prefill|decode, got '${ROLE}'" ;;
+esac
+
+step "Starting vLLM (role=${ROLE}, kv_role=${KV_ROLE}, port=${PORT})"
+banner_config
+
+# shellcheck source=/dev/null
+source "${STACK_ROOT}/etc/env.sh"
+
+setup_nixl_kv_env "${ROLE}"
+
+# The data-plane NIC for the P<->D UCX side channel and the RDMA device (only
+# meaningful for KV_TRANSPORT=rdma) are per-role, per-node values discovered
+# by 01-host-prep.sh and left for the operator to pin into cluster.env
+# (PREFILL_DATA_IF/DECODE_DATA_IF, PREFILL_RDMA_DEV/DECODE_RDMA_DEV) once
+# known — they cannot be safely re-autodetected here on every start, because
+# a route to a specific peer can change if the host briefly has an
+# alternate path (e.g. through a management NIC) during a network hiccup.
+case "${ROLE}" in
+    prefill) _NET_DEV="${PREFILL_DATA_IF}"; _RDMA_DEV="${PREFILL_RDMA_DEV}" ;;
+    decode)  _NET_DEV="${DECODE_DATA_IF}";  _RDMA_DEV="${DECODE_RDMA_DEV}"  ;;
+esac
+setup_ucx_env "${_RDMA_DEV}" "${_NET_DEV}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generate + validate the LMCache config for this role.
+# ─────────────────────────────────────────────────────────────────────────────
+LMCACHE_CFG="${STACK_ROOT}/etc/lmcache-${ROLE}.yaml"
+"${REPO_ROOT}/scripts/common/gen-lmcache-config.sh" "${ROLE}" "${LMCACHE_CFG}"
+
+if [ "${SKIP_VALIDATE}" -eq 1 ]; then
+    warn "LMCache config validation SKIPPED (--skip-validate) — you are" \
+         " trusting gen-lmcache-config.sh's assumptions with no proof the" \
+         " installed LMCache actually accepts them. Only use this for" \
+         " debugging the validator itself."
+else
+    "${REPO_ROOT}/scripts/common/25-validate-lmcache-config.sh" "${LMCACHE_CFG}" \
+        || die "LMCache config validation failed for ${LMCACHE_CFG}." \
+               " Fix the reported keys/backend-allowlist issue, or pass" \
+               " --skip-validate to override (NOT recommended — see this" \
+               " script's header comment on what that trades away)."
+fi
+export LMCACHE_CONFIG_FILE="${LMCACHE_CFG}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Refuse to start unless the remote KV target is actually reachable.
+#
+# WHY this is a hard gate, not a warning: LMCache's NIXL storage backend is
+# one of several storage tiers (local_cpu is another, and it's on by
+# default — see LMCACHE_LOCAL_CPU). If SMC3 is unreachable, LMCache does NOT
+# fail to start; it just never successfully constructs the NIXL backend
+# path, and every store/retrieve silently falls back to whatever local tiers
+# ARE configured. A vLLM server that starts fine, answers /health, and
+# serves every request perfectly looks IDENTICAL to a correctly wired P/D
+# deployment right up until someone benchmarks cross-node cache hit rate and
+# finds it's always zero. Refusing to start is the only failure mode that
+# can't be mistaken for success.
+# ─────────────────────────────────────────────────────────────────────────────
+info "checking NVMe-oF target reachability: ${TARGET_HOST}:${NVMF_TRSVCID}"
+if ! wait_for_port "${TARGET_HOST}" "${NVMF_TRSVCID}" 30; then
+    die "NVMe-oF target ${TARGET_HOST}:${NVMF_TRSVCID} is not reachable" \
+        " after 30s. Refusing to start: a silent fallback to local-only" \
+        " caching is the worst failure mode here (see this script's" \
+        " comment above) because the server would otherwise start" \
+        " successfully and LOOK like it works. Start the target first."
+fi
+ok "target reachable"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vLLM process environment.
+# ─────────────────────────────────────────────────────────────────────────────
+export VLLM_USE_V1=1
+export VLLM_ROCM_USE_AITER=1
+export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False"
+_HIP_IDS="$(seq -s, 0 $((TP_SIZE - 1)))"
+export HIP_VISIBLE_DEVICES="${_HIP_IDS}"
+export VLLM_ATTENTION_BACKEND
+export HF_HOME
+export HF_TOKEN
+
+KV_TRANSFER_CONFIG=$(cat <<JSON
+{"kv_connector":"LMCacheConnectorV1","kv_role":"${KV_ROLE}","kv_connector_extra_config":{}}
+JSON
+)
+
+log "kv-transfer-config: ${KV_TRANSFER_CONFIG}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Launch.
+# ─────────────────────────────────────────────────────────────────────────────
+# shellcheck disable=SC2086
+start_bg "vllm-${ROLE}" \
+    python -m vllm.entrypoints.openai.api_server \
+        --model "${MODEL}" \
+        --served-model-name "${SERVED_MODEL_NAME}" \
+        --host 0.0.0.0 \
+        --port "${PORT}" \
+        --tensor-parallel-size "${TP_SIZE}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+        --max-model-len "${MAX_MODEL_LEN}" \
+        --block-size "${BLOCK_SIZE}" \
+        --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --kv-transfer-config "${KV_TRANSFER_CONFIG}" \
+        ${VLLM_EXTRA_ARGS:-}
+
+# Model load on 8x MI300X (TP=8, weight sharding + warmup + CUDA/HIP-graph
+# capture with --enable-prefix-caching) routinely takes many minutes — 1800s
+# is a floor, not a target; raise it if MODEL is larger than an 8B-class
+# model or GPU_MEM_UTIL forces extra graph re-capture passes.
+LOGFILE="$(logfile_for "vllm-${ROLE}")"
+if wait_for_http "http://127.0.0.1:${PORT}/health" 1800; then
+    ok "vllm-${ROLE} healthy on port ${PORT}"
+    log "test with:"
+    log "  curl -s http://127.0.0.1:${PORT}/v1/models | python3 -m json.tool"
+else
+    err "vllm-${ROLE} did not become healthy within 1800s — last 60 log lines:"
+    tail -n 60 "${LOGFILE}" >&2
+    die "startup failed; see ${LOGFILE} for the full log"
+fi
