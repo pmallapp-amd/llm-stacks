@@ -22,21 +22,22 @@ why.
 
 ## Status
 
-> **Architecture correction pending — read [`docs/HANDOFF.md`](docs/HANDOFF.md) first.**
+> **Two independent legs — read [`docs/HANDOFF.md`](docs/HANDOFF.md) first.**
 >
-> The Status table below, and parts of `ARCHITECTURE.md` / `BRINGUP.md` §9, describe
-> an incorrect model in which RDMA applies to the **storage** leg (SMC1/SMC2 → SMC3).
-> It does not. SMC3 is NVMe-oF/**TCP by design**. The RDMA acceptance criterion
-> applies to the **compute** leg — the direct SMC1 → SMC2 KV transfer over the DSC3
-> NICs — which is **not yet implemented in this repo**.
+> The **P→D transfer** (prefill → decode, direct GPU-to-GPU over the DSC3 NICs)
+> is the leg the RDMA acceptance criterion applies to. It runs TCP today.
 >
-> Corrected model and full account: [`docs/HANDOFF.md` §3](docs/HANDOFF.md#3-the-correction).
-> Remaining work: [`docs/TODO.md` §1](docs/TODO.md#1-architecture-correction-compute-leg).
+> The **storage tier** (compute nodes → target over NVMe-oF) is **TCP by design,
+> permanently** — not a phase to be upgraded. An earlier pass conflated the two
+> and built RDMA groundwork on the storage leg; that has been removed.
+>
+> Both legs and the reasoning: [`docs/HANDOFF.md` §1](docs/HANDOFF.md#1-what-this-project-is).
+> Task list: [`docs/TODO.md`](docs/TODO.md).
 
 | Phase | Transport | State |
 |---|---|---|
 | **Phase 1 — bring-up** | NVMe-oF/TCP (storage leg) + UCX/TCP (compute leg) | Implemented in this repo (`KV_TRANSPORT=tcp`, the default in `config/cluster.env`). **Not yet run on the physical hardware** — every script has been written and reasoned through against the actual plugin/SPDK/LMCache source, but no end-to-end run on SMC1/SMC2/SMC3 has been recorded in this repo. |
-| **Phase 2 — acceptance** | UCX/RoCE (compute leg only — the storage leg is TCP by design, permanently; see [`docs/HANDOFF.md` §3](docs/HANDOFF.md#3-the-correction)) | **Not yet implemented.** The direct compute-leg transfer this criterion depends on does not exist in this repo yet — see [`docs/TODO.md` §1](docs/TODO.md#1-architecture-correction-compute-leg). A previous pass added *storage-leg* RDMA groundwork under the wrong premise (an `-Denable_rdma` meson option, an `nvme_rdma.o` split archive); both have been removed entirely — the proven target configuration this repo now follows never exercises NVMe-oF/RDMA. |
+| **Phase 2 — acceptance** | UCX/RoCE (compute leg only — the storage leg is TCP by design, permanently; see [`docs/HANDOFF.md` §3](docs/HANDOFF.md#1-what-this-project-is)) | **Implemented, unvalidated on hardware.** The direct compute-leg transfer is in place as `MultiConnector[NixlConnector, LMCacheMPConnector]`; flipping it to RDMA is [`docs/TODO.md` §3](docs/TODO.md#3-acceptance-phase-2-rdma-on-the-compute-leg). A previous pass added *storage-leg* RDMA groundwork under the wrong premise (an `-Denable_rdma` meson option, an `nvme_rdma.o` split archive); both have been removed entirely — the proven target configuration this repo now follows never exercises NVMe-oF/RDMA. |
 
 `KV_TRANSPORT=tcp|rdma` in `config/cluster.env` is the single switch that
 gates both legs of the datapath between these two phases (see that file's
@@ -189,7 +190,7 @@ target's default `SPDK_TARGET_REF`) already carries `0001`/`0004`; only
 `0002` and `0003` — the target-side pieces — still need to be applied, and
 both are review-complete (`CR+2`, mergeable) as of this writing. Re-check
 <https://review.spdk.io/q/topic:kv+status:open> periodically — see
-[TODO.md §4.4](docs/TODO.md#4-open-items-known-limitations). Full per-patch
+[TODO.md §4.4](docs/TODO.md#4-open-items-and-known-limitations). Full per-patch
 detail, Change-Ids and the apply order:
 [`patches/spdk/README.md`](patches/spdk/README.md) — this section
 summarises it, it does not duplicate it.
@@ -495,7 +496,7 @@ negative result.
    `scripts/target/02-build-spdk-kv.sh`; once both merge into a released
    v26.09, they can be dropped and `SPDK_TARGET_REF` pinned to that release
    instead of `master`. Tracked at
-   [TODO.md §4.4](docs/TODO.md#4-open-items-known-limitations).
+   [TODO.md §4.4](docs/TODO.md#4-open-items-and-known-limitations).
 2. **The LMCache backend-allowlist patch is generated at apply time, not a
    pinned diff.** `patches/lmcache/apply-patches.sh` scans and patches
    whatever LMCache version is actually installed, rather than applying a
