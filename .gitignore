@@ -1,0 +1,66 @@
+# kv-cache .gitignore
+#
+# NOTE: config/cluster.env IS tracked deliberately (this is a private repo —
+# see its own header comment and README.md's "private repo" note). Do not
+# add it or any config/local.env-style override here without reconsidering
+# that decision explicitly.
+
+# ---- Build directories -----------------------------------------------------
+build/
+build-*/
+*.ninja*
+meson-*/
+meson-info/
+meson-logs/
+meson-private/
+
+# kv_spdk / SPDK source trees are pulled in at build time (see
+# scripts/target/02-build-spdk-kv.sh, scripts/common/10-build-stack.sh) and
+# are never vendored into this repo.
+src/kv_spdk/
+src/ucx/
+src/nixl/
+
+# ---- Compiled artifacts -----------------------------------------------------
+*.o
+*.a
+*.so
+*.so.*
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Python virtual environments --------------------------------------------
+venv/
+.venv/
+*.egg-info/
+
+# ---- Logs -------------------------------------------------------------------
+*.log
+logs/
+
+# ---- Runtime state (PID files, sockets) -------------------------------------
+*.pid
+*.sock
+/run/
+
+# ---- Generated configs -------------------------------------------------------
+*.orig-kvstack
+patches/lmcache/applied-*.diff
+**/lmcache-prefill.yaml
+**/lmcache-decode.yaml
+etc/lmcache-*.yaml
+etc/kv-target-config.json
+etc/env.sh
+
+# ---- Local overrides ---------------------------------------------------------
+config/local.env
+.env
+
+# ---- Editor / OS files -------------------------------------------------------
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
