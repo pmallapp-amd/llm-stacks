@@ -82,29 +82,39 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # THE BACKEND-ALLOWLIST RISK (read this before assuming this file "works")
 # ═══════════════════════════════════════════════════════════════════════════
-# Stock LMCache v0.5.4's NixlStorageConfig.validate_nixl_backend() only
-# recognizes a fixed set of backend names: GDS/GDS_MT/OBJ (cpu or cuda) and
-# POSIX/HF3FS/AZURE_BLOB/DOCA_MEMOS (cpu only). "SPDK_NVMe_KV" is NOT in that
-# list. A stock install therefore raises
-# `AssertionError: Invalid NIXL backend & device combination` the first time
-# the NIXL storage backend is constructed — before a single byte reaches the
-# plugin. Separately, NixlDynamicStorageAgent decides its NIXL mem_type by a
-# SECOND hardcoded name list (backend in ("OBJ","AZURE_BLOB","DOCA_MEMOS") ->
-# OBJ, else FILE); "SPDK_NVMe_KV" falls into the FILE branch there too, which
-# would make LMCache open real POSIX files on the LOCAL filesystem at
-# `extra_config.nixl_path` per KV chunk — silently correct-looking, silently
-# wrong (it would never touch SMC3 at all).
+# Whether the installed LMCache accepts XNVME_KV / SPDK_NVMe_KV as backend
+# names depends on the build provenance:
 #
-# Getting SPDK_NVMe_KV working therefore requires BOTH name lists in the
-# installed LMCache to include "SPDK_NVMe_KV" mapped to the OBJ mem_type path
-# — i.e. an LMCache patch, matching the pattern referenced in this repo's own
-# plugin comments (plugins/nvme-kv/spdk_nvme_kv_plugin.cpp mentions
-# "stack/tracks/lmcache/patches/0002-*.patch", "0003-*.patch" for the
-# multipart-split and max_value_size wiring; the backend-allowlist patch is
-# the same family). scripts/common/25-validate-lmcache-config.sh greps the
-# INSTALLED LMCache's source for exactly these two name lists and FAILS
-# LOUDLY if SPDK_NVMe_KV is absent from either, instead of letting you
-# discover it as a silent local-file fallback during a live P/D test.
+#   FROM-SOURCE BUILD (pypi 0.5.4, this repo's default build path — see
+#   scripts/common/20-build-vllm-lmcache.sh):
+#   Stock LMCache v0.5.4's NixlStorageConfig.validate_nixl_backend() only
+#   recognizes GDS/GDS_MT/OBJ (cpu or cuda) and POSIX/HF3FS/AZURE_BLOB/
+#   DOCA_MEMOS (cpu only). "SPDK_NVMe_KV" / "XNVME_KV" are NOT in that list,
+#   so a stock install raises `AssertionError: Invalid NIXL backend & device
+#   combination` at backend-construction time. Separately,
+#   NixlDynamicStorageAgent decides its NIXL mem_type by a SECOND hardcoded
+#   name list (backend in ("OBJ","AZURE_BLOB","DOCA_MEMOS") -> OBJ, else
+#   FILE); our backends fall into the FILE branch, making LMCache open real
+#   POSIX files on the LOCAL filesystem — silently correct-looking, silently
+#   wrong. Getting our backends working from source therefore requires BOTH
+#   name lists patched, matching the pattern referenced in this repo's own
+#   plugin comments (plugins/nvme-kv/spdk_nvme_kv_plugin.cpp mentions
+#   "stack/tracks/lmcache/patches/0002-*.patch", "0003-*.patch"; the
+#   backend-allowlist patch in patches/lmcache/ is the same family).
+#
+#   ROCM-AIC CONTAINER IMAGE (vendored LMCache 0.5.3):
+#   The container ships a build where XNVME_KV and SPDK_NVMe_KV appear in
+#   ALL THREE hardcoded tuples (lmcache/v1/storage_backend/nixl_storage_backend.py
+#   :126 validate_nixl_backend, :670 mem_type selection, :1119 createPool),
+#   confirmed 2026-09-15 by reading the installed source in the rocm-aic
+#   image. No patch is required there.
+#
+# scripts/common/25-validate-lmcache-config.sh greps the INSTALLED LMCache's
+# source for exactly these two name lists and FAILS LOUDLY if our backends
+# are absent from either, instead of letting you discover it as a silent
+# local-file fallback during a live P/D test — this check catches BOTH the
+# unpatched-from-source case and any future regressions from a container
+# image upgrade that drops the vendor patches.
 #
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -149,6 +159,42 @@ _NIXL_BUFFER_SIZE="${LMCACHE_NIXL_BUFFER_SIZE:-1073741824}"
 # code (get_correct_device) only knows the "cpu"/"cuda" vocabulary — there is
 # no "rocm" or "hip" value to pass here.
 _NIXL_BUFFER_DEVICE="${LMCACHE_NIXL_BUFFER_DEVICE:-cuda}"
+
+# LMCache 0.5.3 (rocm-aic container) rejects nixl_buffer_size when the buffer
+# device is cpu (lmcache/v1/config.py:807-811 — the cpu path shares
+# LocalCPUBackend's pinned pool sized by max_local_cpu_size, so a separate
+# buffer size is meaningless there). Intercept the contradictory combination
+# early so the error names the env var at generation time rather than surfacing
+# as a ValueError from deep inside LMCache at engine start.
+case "${_NIXL_BUFFER_DEVICE}" in
+    cpu)
+        if [ -n "${LMCACHE_NIXL_BUFFER_SIZE+x}" ]; then
+            die "LMCACHE_NIXL_BUFFER_SIZE is set (${LMCACHE_NIXL_BUFFER_SIZE})" \
+                " but LMCACHE_NIXL_BUFFER_DEVICE=cpu. LMCache 0.5.3" \
+                " rejects nixl_buffer_size when nixl_buffer_device='cpu'" \
+                " (lmcache/v1/config.py:807-811) because the cpu path shares" \
+                " LocalCPUBackend's pinned pool sized by max_local_cpu_size." \
+                " Unset LMCACHE_NIXL_BUFFER_SIZE or change" \
+                " LMCACHE_NIXL_BUFFER_DEVICE to something other than cpu."
+        fi
+        if [ "${_MAX_LOCAL_CPU_SIZE}" -le 0 ] 2>/dev/null; then
+            die "LMCACHE_NIXL_BUFFER_DEVICE=cpu requires" \
+                " max_local_cpu_size > 0 (LMCache 0.5.3 asserts this at" \
+                " lmcache/v1/config.py:812-815), but" \
+                " LMCACHE_MAX_LOCAL_CPU_SIZE='${_MAX_LOCAL_CPU_SIZE}'." \
+                " Set LMCACHE_MAX_LOCAL_CPU_SIZE to a positive integer" \
+                " (GiB of host DRAM for the LocalCPUBackend pinned pool)."
+        fi
+        _NIXL_BUFFER_SIZE_LINE="# nixl_buffer_size omitted: nixl_buffer_device='cpu' uses"
+        _NIXL_BUFFER_SIZE_LINE+=$'\n'"# LocalCPUBackend's pinned pool (max_local_cpu_size)"
+        _NIXL_BUFFER_SIZE_LINE+=$'\n'"# instead of a separate staging buffer — LMCache 0.5.3"
+        _NIXL_BUFFER_SIZE_LINE+=$'\n'"# rejects nixl_buffer_size in this mode"
+        _NIXL_BUFFER_SIZE_LINE+=$'\n'"# (lmcache/v1/config.py:807-811)."
+        ;;
+    *)
+        _NIXL_BUFFER_SIZE_LINE="nixl_buffer_size: ${_NIXL_BUFFER_SIZE}"
+        ;;
+esac
 
 _NIXL_BACKEND="${LMCACHE_NIXL_BACKEND:-${KV_BACKEND}}"
 
@@ -259,7 +305,7 @@ save_unfull_chunk: ${_SAVE_UNFULL_CHUNK}
 # --- NIXL remote storage staging buffer (top-level fields; NOT under
 #     extra_config — these two ARE real LMCacheEngineConfig dataclass
 #     fields, unlike everything in the extra_config block below) ---
-nixl_buffer_size: ${_NIXL_BUFFER_SIZE}
+${_NIXL_BUFFER_SIZE_LINE}
 nixl_buffer_device: "${_NIXL_BUFFER_DEVICE}"
 
 extra_config:
@@ -273,8 +319,12 @@ extra_config:
 
   # The plugin name the NIXL create_backend() dlopens from ${NIXL_PLUGIN_DIR}
   # (see lib.sh setup_nixl_kv_env, which exports NIXL_PLUGIN_DIR).
-  # REQUIRES the LMCache backend-allowlist patch — see the header
-  # comment above.
+  # Allowlist note: the patch at patches/lmcache/ is required for a
+  # from-source LMCache build (e.g. pypi 0.5.4) whose validate_nixl_backend()
+  # and mem_type-selection tuples do not include XNVME_KV or SPDK_NVMe_KV.
+  # The rocm-aic container's vendored LMCache 0.5.3 carries both backends
+  # natively — verified 2026-09-15 by reading the three hardcoded tuples in
+  # lmcache/v1/storage_backend/nixl_storage_backend.py (:126, :670, :1119).
   nixl_backend: "${_NIXL_BACKEND}"
 
   # 0 = NixlDynamicStorageBackend (content-derived keys). See the

@@ -541,6 +541,13 @@ other directly today.
 
 ## 9. How to resume
 
+> **Before anything below: check `uptime` on `smc2`.** It rebooted five
+> times on 2026-09-15 and spent the end of that session cycling every
+> eight to ten minutes — shorter than the five or six minutes a 72B TP=8
+> load needs. §12.8 and TODO 6.20. Also check who owns the KV target on
+> `smc3` before relying on it (§12.5, TODO 6.18). Both of these will
+> otherwise present as a failure in whatever you were actually testing.
+
 ### The one live item — read this first, nothing else in §6 is more urgent
 
 Everything that used to gate §6 (deployment model, kernel/CSI-1, KV backend
@@ -1008,3 +1015,249 @@ NixlConnector, because it never performs step 1 of §11.1. This repo's own
 result above was measured through — `prefill_no_handoff: 0` across the
 run, which is the counter that would have caught the original defect had
 the repo's proxy been the one in front all along.
+
+---
+
+## 12. Fourth session: the 6.10 attempt — what was established, and what stopped it
+
+Leg A (§11) was the session's result. The storage-tier composition (TODO
+6.10) was then attempted and did **not** land. It is recorded here in
+detail because most of what was learned is durable and expensive to
+rediscover, and because one finding invalidates a design assumption this
+repo has carried since §1.
+
+### 12.1 `LMCacheMPConnector` cannot carry the KV tier at all — correct the architecture
+
+**This repo has described its composition as
+`MultiConnector[NixlConnector, LMCacheMPConnector]` since the beginning
+(§1, TODO 0.1, `gen-kv-transfer-config.sh`). That cannot work.** Read from
+the installed LMCache 0.5.3:
+
+- `nixl_storage_backend.py` — the only thing that can drive XNVME_KV — is
+  reachable from exactly one place in the entire package:
+  `storage_backend/__init__.py:205-213`'s `CreateStorageBackends`, called
+  only by the **in-process** `StorageManager` (`storage_manager.py:249`).
+- That path is configured by `LMCacheEngineConfig`. The MP connector and
+  its adapter never construct one — `grep -n "LMCacheEngineConfig" ` over
+  `lmcache/integration/vllm/{lmcache_mp_connector,vllm_multi_process_adapter}.py`
+  returns nothing at all. MP mode uses `lmcache/v1/distributed/` with a
+  separate `StorageManagerConfig` and an entirely different L2-adapter
+  schema.
+- So `extra_config{enable_nixl_storage, nixl_backend, nixl_backend_params}`
+  — the keys that select XNVME_KV and pass its `dev_uri` — are **silently
+  ignored** under `LMCacheMPConnector`. Not rejected. Ignored.
+- "MP" is **multi-process**: it requires a separately launched `lmcache
+  server` daemon reached over ZMQ (`mq.py:263-275` connects; nothing
+  spawns it). No such process runs on either node.
+
+**The correct child is `LMCacheConnectorV1`** — in-process, no daemon, and
+the only connector that reaches `nixl_storage_backend.py`. Verified
+end-to-end through `vllm_v1_adapter.py:498` → `lmcache_get_or_create_config()`
+→ `VllmServiceFactory` → `LMCacheEngineBuilder` → `StorageManager` →
+`CreateStorageBackends`.
+
+Two consequences worth stating plainly:
+
+- `MultiConnector` does **not** inspect or reconcile child `kv_role`s —
+  `grep -n kv_role multi_connector.py` returns nothing — so a
+  `NixlConnector` child at `kv_producer` beside an `LMCacheConnectorV1`
+  child at `kv_both` is accepted.
+- `kv_transfer_params` **survives** the wrapping in both directions: the
+  request object is passed to children by reference, and responses are
+  merged by `multi_connector.py:486-508`, which raises on a key clash.
+  `LMCacheConnectorV1` returns `(False, None)`, so it cannot clash with
+  NixlConnector's handoff payload. Leg A's §11 fix is safe under
+  composition.
+
+Ordering still matters, and now for a sharper reason than the repo
+recorded: `MultiConnector.get_num_new_matched_tokens` assigns the load to
+the **first** child reporting a non-zero match
+(`multi_connector.py:387-400`). On decode, if LMCache is listed first and
+hits, the NIXL remote-prefill pull is skipped entirely. **NixlConnector
+must be first on the decode side.**
+
+### 12.2 The LMCache allowlist patch is not needed on the container path
+
+TODO 2.7 and `patches/lmcache/` exist to widen an LMCache backend
+allowlist. **The vendored LMCache 0.5.3 in the `rocm-aic` image does not
+need it.** `XNVME_KV` and `SPDK_NVMe_KV` appear in all three hardcoded
+backend tuples — `nixl_storage_backend.py:126` (`validate_nixl_backend`),
+`:670` (mem_type selection, which correctly routes them to `OBJ` not
+`FILE`), and `:1119` (`createPool`). The repo's patch marker string
+appears nowhere in the installed tree. This is an AMD/ROCm vendor build
+that ships the support natively. The patch remains correct for the
+from-source path and has not been removed; its comment in
+`gen-lmcache-config.sh` has been corrected to stop claiming it is
+mandatory.
+
+### 12.3 `max_local_cpu_size` is PER TP WORKER, and getting it wrong took a node down
+
+`config/cluster.env` carries `LMCACHE_MAX_LOCAL_CPU_SIZE=80` with the
+comment "GiB of host DRAM (L1)". **That value is per worker process, not
+per node.** At TP=8 it asks for 8 × 80 = 640 GiB of *pinned* host memory
+(`hipHostMalloc`), on top of the ~1.38 TiB the engines already had
+resident.
+
+What happened, in order: every worker on prefill failed
+`RuntimeError: hipHostMalloc failed: 2` out of
+`mixed_memory_allocator.py:60`; the decode node stopped answering SSH
+mid-configuration, kept answering ICMP for several minutes, and then
+**rebooted** — losing its GPUs (`modprobe.blacklist=amdgpu`, TODO 0.4) and
+its `nvme connect` (TODO 6.9) with it.
+
+This is not a tuning nit. **An oversized LMCache L1 on this hardware is a
+node-availability hazard**, and nothing in the config surface says so. A
+value of 5 GiB per worker (40 GiB across TP=8) is ample for a correctness
+proof: at a 10 MiB page that is ~512 chunks, ~131k tokens of L1 per
+worker. `gen-lmcache-config.sh` should multiply by TP and sanity-check
+against `MemAvailable`; it does not yet, and that is the first thing to
+add before retrying 6.10.
+
+### 12.4 Also fixed while here: the generator emitted a key LMCache rejects
+
+`gen-lmcache-config.sh` emitted `nixl_buffer_size` unconditionally.
+LMCache 0.5.3 **raises** if it is set while `nixl_buffer_device: "cpu"`
+(`config.py:805`), because CPU mode shares `LocalCPUBackend`'s pinned pool
+and sizes it from `max_local_cpu_size` instead. It is conversely
+*required* for any non-cpu device. The generator now emits it
+conditionally and dies on the contradictory combination rather than
+producing a config that cannot load.
+
+`cpu` is the right buffer device here, not the generator's previous `cuda`
+default: XNVME_KV reaches the device through kernel `pread`/`pwrite` on a
+char device, so the staging buffer has to be host memory.
+
+### 12.5 The blocker that stopped 6.10: the target is a shared resource, and it moved
+
+Mid-session the KV target stopped matching anything this repo expects.
+`nvmf_get_subsystems` on `smc3` now reports:
+
+```
+NQN: nqn.2016-06.io.spdk:cnode1
+   listener: {'trtype': 'TCP', 'traddr': '1.1.0.2', 'trsvcid': '4420'}
+   ns: dev1_ns1 1
+```
+
+The subsystem this repo uses — `nqn.2024-01.io.nixl:kv0`, namespace
+`KvMalloc0`, listening on the management IP — **no longer exists**, and
+`nvme connect` from decode fails `Connection refused`. The `nvmf_tgt`
+process was restarted by someone else against the lab reference config
+(`target_scale_kv_spdk.sh`, which hardcodes the `1.1.0.2` listener). The
+node itself has not rebooted in three days.
+
+**`smc3` is shared, and this session was not the only thing using it.**
+No attempt was made to reclaim it — restarting another party's target
+mid-experiment is not a move this repo should make unilaterally. 6.10
+resumes by re-establishing the `nqn.2024-01.io.nixl:kv0` subsystem, after
+checking who else is on the box.
+
+### 12.6 A blocker that has silently LIFTED: the 200G links are up
+
+Recorded here because it contradicts a standing entry and nobody would
+think to re-check it. HANDOFF §8 and TODO 6.16 state that both of the
+target's 200G data-plane NICs report `Link detected: no`, with "no known
+fix", bounding the storage leg to 1 Gb/s.
+
+Measured this session: **`enp132s0` and `enp100s0` both report `Link
+detected: yes`**, and `enp132s0` holds `1.1.0.2/24`. Something changed
+physically. The compute nodes still have no address on `1.1.0.x`, so
+there is still no route — but the premise of 6.16 ("needs someone with
+physical hardware access; not actionable from a terminal") no longer
+holds. What remains is an addressing/routing question, which *is*
+actionable. Re-check before treating 6.16 as blocked.
+
+### 12.7 Where 6.10 now stands
+
+Everything except the target is worked out. The recipe to resume with,
+each element established above rather than guessed:
+
+```
+--kv-transfer-config '{"kv_connector":"MultiConnector","kv_role":"<kv_producer|kv_consumer>",
+  "kv_connector_extra_config":{"connectors":[
+    {"kv_connector":"NixlConnector","kv_role":"<same>","kv_buffer_device":"cpu",
+     "kv_connector_extra_config":{"hostname":"<own IP>","port":14579}},
+    {"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}]}}'
+```
+
+with `LMCACHE_CONFIG_FILE` pointing at a YAML carrying `chunk_size: 256`,
+`local_cpu: true`, `max_local_cpu_size: 5` (**per worker** — §12.3),
+`save_unfull_chunk: false`, `nixl_buffer_device: "cpu"`, **no**
+`nixl_buffer_size`, and `extra_config: {enable_nixl_storage: true,
+nixl_backend: "XNVME_KV", nixl_pool_size: 0, nixl_backend_params:
+{dev_uri: <resolved by NQN>}}`. Note `LMCACHE_*` env vars only exist for
+top-level fields; everything under `extra_config` must come from the YAML
+or a single `LMCACHE_EXTRA_CONFIG` JSON blob.
+
+Known unknown, not yet tested because the target went away: **a 10 MiB
+LMCache page against XNVME_KV's 32 KiB per-value ceiling.** The plugin
+splits multipart (proven in 6.12 — 98304 bytes became three 32 KiB
+parts), so a 10 MiB page implies ~320 parts against the device's
+`novg=4096`. Plausible, unverified. If stores fail, reduce `chunk_size`
+before suspecting anything else — and remember `chunk_size` is part of the
+cache key, so both roles must change together or the receiver silently
+re-prefills (§7 invariant 8).
+
+### 12.8 `smc2` (decode) became reboot-unstable during this session — read before planning any long run
+
+Recorded prominently because it invalidates the assumption every
+multi-minute step in this repo makes: that a compute node stays up long
+enough to finish.
+
+`journalctl --list-boots` on `smc2`, 2026-09-15:
+
+```
+-4  03:56:58 -> 05:17:01
+-3  05:30:26 -> 07:49:35
+-2  07:52:37 -> 12:04:43     <- the 4h window in which leg A was proven
+-1  12:13:55 -> 12:22:24     <- ~8 minutes
+ 0  12:28:26 -> (current)
+```
+
+Five boots in one day, and after 12:04 it is cycling roughly every eight
+to ten minutes — not long enough to load a 72B model at TP=8, which takes
+five or six.
+
+The 12:04 reboot has a plausible cause: the 640 GiB pinned-memory request
+described in §12.3. **The 12:22 one does not.** It happened with the
+engine idle, minutes after `Application startup complete`, with the
+container exiting 255 because the host went away underneath it. Nothing
+in `journalctl -b -1 -p err` names a cause — no panic, no MCE, no OOM
+kill, no thermal event. The only errors are benign boot-time noise
+(`ionic_N: Couldn't open port 1`, a networkd wait-online timeout).
+
+So this is not explained, and it should not be assumed to be a
+consequence of §12.3 just because that came first. TODO 0.4 already
+recorded "both compute nodes rebooted unexpectedly this session (cause
+unknown)" in an earlier session, so this is the **second** independent
+occurrence of unexplained reboots on this hardware. Treat it as a
+standing hazard, tracked at TODO 6.20.
+
+Two practical consequences:
+
+- **Every reboot silently undoes three things** — `modprobe amdgpu`
+  (0.4), the KV target session, and `nvme connect` (6.9) — so a node that
+  reboots mid-run does not come back broken-looking, it comes back
+  *quietly unequipped*, which on this stack is worse.
+- **Check uptime before starting anything that takes minutes.** If `smc2`
+  has been up less than the time your step needs, you are going to lose
+  the run, and the failure will look like something else.
+
+`smc1` (prefill) has shown none of this and was stable throughout.
+
+### 12.9 State the cluster was left in
+
+- `smc1` / prefill: `rocm-aic:latest` container `vllm-pd-prefill` running
+  the **proven leg-A configuration** (NixlConnector only, `UCX_NET_DEVICES=ens51f0`),
+  `/health` 200, side channel bound `10.30.75.198:5600`. GPUs up.
+- `smc2` / decode: rebooted 12:28, `modprobe amdgpu` re-run (8 GPUs,
+  `/dev/kfd` present). **No vLLM container running** — not worth
+  relaunching into a node cycling every ten minutes. `nvme connect` NOT
+  re-established (the target no longer offers the subsystem anyway,
+  §12.5).
+- `smc3` / target: running, but serving **another party's**
+  configuration (§12.5). Not touched.
+- No proxy running.
+
+To get back to the proven leg-A state once `smc2` is stable: relaunch both
+roles and the proxy, then re-run the §11 measurement. Nothing about the
+leg-A fix depends on the storage target.

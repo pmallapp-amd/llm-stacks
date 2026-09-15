@@ -20,10 +20,20 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 6 | 0 | 0 |
 | 4 | Open items and known limitations | 6 | 0 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 17 | 12 | 4 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 20 | 12 | 6 |
 
-**Next action: 6.10 — compose the XNVME_KV storage tier under the now-working
-P/D pair.** This is the last live item in §6. Everything else is decided,
+**Next action: 6.20 — get `smc2` stable, because nothing else can be measured
+until it is.** It rebooted five times on 2026-09-15 and is cycling every
+~8-10 minutes, which is shorter than a 72B TP=8 model load. Then **6.18** —
+establish ownership of the shared KV target on `smc3` — and only then resume
+6.10. 6.10 was attempted in session 4 and did not land, but
+not for any reason inside this repo: the target was reconfigured by another
+party mid-session and `nqn.2024-01.io.nixl:kv0` no longer exists (6.18).
+Everything else 6.10 needed is now worked out — including the discovery that
+`LMCacheMPConnector`, the connector this repo's architecture has named since
+day one, **cannot carry the KV tier at all** and must be `LMCacheConnectorV1`
+(HANDOFF §12.1). The exact resume recipe is at HANDOFF §12.7. Also re-check
+6.19: the target's 200G links, recorded as permanently down, are now up. Everything else is decided,
 resolved, or proven: the deployment model is the container path (6.1); the
 kernel/CSI-1 gap is closed by the 24.04.5/6.8.0-139 OS upgrade (6.5–6.8); the
 KV backend decision is XNVME_KV over kernel nvme-of (6.3); leg B is proven
@@ -595,6 +605,74 @@ otherwise.*
       adding LMCache** — if composing the tier breaks leg A, that baseline
       is the only thing that will tell you so, since both legs fail
       silently rather than erroring. This is now the last live item in §6.*
+
+      **ATTEMPTED 2026-09-15 (session 4), NOT LANDED — but most of the
+      unknowns are now closed. Full account: HANDOFF §12.** Four things
+      were established, one design assumption was invalidated, and one
+      external blocker stopped the run:
+
+      1. **`LMCacheMPConnector` cannot carry this tier — the composition
+         named in HANDOFF §1, TODO 0.1 and `gen-kv-transfer-config.sh`
+         since the beginning is wrong.** `nixl_storage_backend.py` is
+         reachable only from the in-process `StorageManager` path, which
+         is configured by `LMCacheEngineConfig`; the MP connector and its
+         adapter never construct one (`grep LMCacheEngineConfig` over
+         both returns nothing) and use a separate `StorageManagerConfig`
+         with a different L2-adapter schema. `extra_config`'s
+         `enable_nixl_storage` / `nixl_backend` / `nixl_backend_params`
+         are **silently ignored** under MP mode — not rejected, ignored.
+         "MP" is multi-process: it also needs a separately launched
+         `lmcache server` daemon that runs nowhere on this cluster. **Use
+         `LMCacheConnectorV1`** — in-process, no daemon, and the only
+         connector that reaches the NIXL storage backend.
+      2. **`MultiConnector` is safe to wrap leg A in.** It never inspects
+         child `kv_role`s, passes the request object to children by
+         reference, and merges response `kv_transfer_params` with a
+         clash check (`multi_connector.py:486-508`); `LMCacheConnectorV1`
+         returns `(False, None)` so it cannot clash with NIXL's handoff.
+         **Order matters on decode specifically:** the first child
+         reporting a non-zero match wins the load
+         (`multi_connector.py:387-400`), so if LMCache is listed first and
+         hits, the NIXL pull is skipped. NixlConnector first.
+      3. **The allowlist patch is not needed on the container path.**
+         `XNVME_KV` and `SPDK_NVMe_KV` are in all three backend tuples of
+         the vendored 0.5.3 (`nixl_storage_backend.py:126`, `:670`,
+         `:1119`). This closes the container half of 2.7. The patch
+         remains correct for a from-source build; its comment in
+         `gen-lmcache-config.sh` no longer claims otherwise.
+      4. **`max_local_cpu_size` is PER TP WORKER, and getting it wrong is
+         a node-availability hazard, not a tuning nit.** `cluster.env`'s
+         `LMCACHE_MAX_LOCAL_CPU_SIZE=80` means 8 × 80 = 640 GiB of pinned
+         host memory at TP=8. Every prefill worker died
+         `hipHostMalloc failed: 2`, and **the decode node rebooted**,
+         losing its GPUs (0.4) and its `nvme connect` (6.9). Use ~5 GiB
+         per worker. `gen-lmcache-config.sh` should multiply by TP and
+         check `MemAvailable` before emitting — it does not yet, and that
+         is the first thing to add before retrying.
+
+      Also fixed while here: `gen-lmcache-config.sh` emitted
+      `nixl_buffer_size` unconditionally, which LMCache **raises** on when
+      `nixl_buffer_device: "cpu"` (`config.py:805`) and *requires* for any
+      other device. Now conditional, and dies on the contradiction. `cpu`
+      is the correct device: XNVME_KV reaches the KV namespace through
+      kernel `pread`/`pwrite` on a char device, so the staging buffer must
+      be host memory.
+
+      **What actually stopped the run (see 6.18):** the KV target is a
+      shared resource and was reconfigured out from under this work.
+      `nqn.2024-01.io.nixl:kv0` / `KvMalloc0` no longer exists on `smc3`;
+      it now serves `nqn.2016-06.io.spdk:cnode1` on the `1.1.0.2`
+      listener. `nvme connect` fails `Connection refused`.
+
+      **Still untested, and the most likely next surprise:** a 10 MiB
+      LMCache page against XNVME_KV's 32 KiB per-value ceiling (6.4). The
+      plugin splits multipart, so this implies ~320 parts against the
+      device's `novg=4096` — plausible, unproven. If stores fail, reduce
+      `chunk_size` first, and change it on **both** roles (it is part of
+      the cache key — invariant 8).
+
+      The exact resume recipe, with every element established rather than
+      guessed, is written out at **HANDOFF §12.7**.
 - [x] **6.11** ✅ **DONE 2026-09-15 (session 4) — leg A carries KV.** Prove
       leg A: a direct P→D NIXL transfer, following the rixl-bench pattern —
       `NixlConnector` only, `kv_role` kv_producer/kv_consumer,
@@ -877,3 +955,69 @@ otherwise.*
       confirmed as the sole, verified bind-mount source (37/37 shards,
       145.4 GB, index-matched) — 135 GB reclaimed per node. `smc1` now has
       336 GB free, `smc2` 253 GB. Qwen3-8B and TinyLlama left intact.
+- [!] **6.18** **The KV target on `smc3` is a SHARED resource and was
+      reconfigured mid-session by another party, 2026-09-15 (session 4).**
+      This is what stopped 6.10, and it is not a fault in anything this
+      repo controls. `nvmf_get_subsystems` now reports
+      `nqn.2016-06.io.spdk:cnode1` with namespace `dev1_ns1`, listening on
+      `1.1.0.2:4420` — the lab reference config from
+      `target_scale_kv_spdk.sh`. The subsystem every storage-leg step in
+      this repo depends on — `nqn.2024-01.io.nixl:kv0`, namespace
+      `KvMalloc0`, on the management IP — **is gone**, and `nvme connect`
+      from the compute nodes fails `Connection refused`. The node itself
+      has not rebooted (uptime 3 days); the `nvmf_tgt` process was
+      restarted against a different config.
+
+      No attempt was made to reclaim it. Restarting someone else's target
+      mid-experiment is not a unilateral call, and the failure mode if two
+      parties fight over it is worse than the delay.
+
+      **Before resuming 6.10:** find out who else is using `smc3`, agree
+      on ownership, and only then re-establish
+      `nqn.2024-01.io.nixl:kv0`. Note this also means the per-boot ritual
+      (HANDOFF §9) is now insufficient on its own — "restart the KV
+      target" assumed nobody else had claimed it. *Blocks 6.10.*
+- [ ] **6.19** **Re-check 6.16 — the target's 200G links are UP now.**
+      Measured 2026-09-15 (session 4): `enp132s0` and `enp100s0` both
+      report `Link detected: yes`, and `enp132s0` holds `1.1.0.2/24`.
+      6.16 and HANDOFF §8 both record these as `Link detected: no` with
+      "no known fix", and 6.16 is classified `[!]` blocked on someone with
+      physical hardware access. **That premise no longer holds** —
+      something changed physically, and the remaining gap is addressing
+      and routing, which is actionable from a terminal.
+
+      What is still missing: neither compute node has an address on
+      `1.1.0.x`, so there is still no route to that listener. Recorded as
+      a separate item rather than edited into 6.16 because the useful
+      record is that a blocker marked "not actionable" silently lifted and
+      nobody would have thought to re-check it. Re-verify before trusting
+      either entry.
+- [!] **6.20** **`smc2` (decode) is reboot-unstable — 5 boots on
+      2026-09-15, cycling every ~8-10 minutes after 12:04.** This is now
+      the top operational blocker: a 72B TP=8 load takes 5-6 minutes, so
+      the node does not reliably stay up long enough to start an engine,
+      let alone finish a measurement. Boot table and analysis in HANDOFF
+      §12.8.
+
+      The 12:04 reboot is plausibly explained by 6.10's 640 GiB pinned
+      allocation. **The 12:22 one is not** — it happened with the engine
+      idle, minutes after startup completed, and `journalctl -b -1 -p err`
+      shows no panic, no MCE, no OOM kill and no thermal event. Do not
+      assume the two share a cause just because one followed the other.
+
+      This is the **second** independent occurrence of unexplained reboots
+      on this hardware — TODO 0.4 records the first, in an earlier session,
+      affecting both compute nodes. `smc1` has been stable throughout this
+      session.
+
+      Remember what a reboot silently undoes: `modprobe amdgpu` (0.4), the
+      KV target, and `nvme connect` (6.9). A node that reboots mid-run
+      comes back quietly unequipped rather than obviously broken — the
+      failure then presents as whatever step next touches a GPU or the KV
+      device. **Check `uptime` before starting anything that takes
+      minutes.**
+
+      Not diagnosable from a terminal alone if it is power/thermal/firmware
+      — the BMC (`DECODE_BMC` in the creds file) and its event log are the
+      next place to look. *Blocks any long-running work on decode,
+      including 6.10 and all of §3.*
