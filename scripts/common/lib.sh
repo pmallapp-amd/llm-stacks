@@ -255,8 +255,14 @@ setup_ucx_env() {
     local role="${1:-}"
     local ucx_net_dev tcp_net_dev
     case "${role}" in
-        prefill) ucx_net_dev="${PREFILL_UCX_NET_DEVICES}"; tcp_net_dev="${PREFILL_DATA_IF}" ;;
-        decode)  ucx_net_dev="${DECODE_UCX_NET_DEVICES}";  tcp_net_dev="${DECODE_DATA_IF}"  ;;
+        # tcp_net_dev prefers *_PD_IF (the compute-leg NIC that actually has
+        # a route to the PEER) over *_DATA_IF (the storage-leg NIC to the
+        # target). These are different interfaces on this cluster and
+        # conflating them is what left leg A unable to hand off — see
+        # config/cluster.env's PREFILL_PD_IF comment for the measured
+        # failure.
+        prefill) ucx_net_dev="${PREFILL_UCX_NET_DEVICES}"; tcp_net_dev="${PREFILL_PD_IF:-${PREFILL_DATA_IF}}" ;;
+        decode)  ucx_net_dev="${DECODE_UCX_NET_DEVICES}";  tcp_net_dev="${DECODE_PD_IF:-${DECODE_DATA_IF}}"  ;;
         *) die "setup_ucx_env: role must be prefill|decode, got '${role}'" ;;
     esac
 
@@ -271,16 +277,25 @@ setup_ucx_env() {
             # from an earlier call can't leak into a TCP-mode child process.
             export -n UCX_IB_GID_INDEX UCX_IB_ROCE_LOCAL_SUBNET \
                       UCX_IB_ROCE_SUBNET_PREFIX_LEN NCCL_CUMEM_ENABLE 2>/dev/null || true
-            if [ -n "${tcp_net_dev}" ]; then
-                export UCX_NET_DEVICES="${tcp_net_dev}"
-            else
-                # UCX_NET_DEVICES (unlike the RoCE knobs above) has no
-                # cluster.env default of its own — this function is the
-                # only place that ever sets it — so unsetting it outright
-                # is safe here.
-                unset UCX_NET_DEVICES 2>/dev/null || true
-            fi
-            log "UCX: TCP mode (UCX_TLS=${UCX_TLS} UCX_NET_DEVICES=${UCX_NET_DEVICES:-<auto>})"
+            # NOT optional, and NOT safe to leave to UCX's autodetection.
+            # This used to fall through to `unset UCX_NET_DEVICES` and log
+            # "<auto>". Measured 2026-09-15: "<auto>" makes UCX advertise
+            # the first TCP interface it enumerates, which on the prefill
+            # node is a fabric NIC (30.1.1.1) that the decode node cannot
+            # route to. The peer then blocks ~133 s in connect() and fails
+            # loadRemoteMD() with NIXL_ERR_BACKEND, taking every request
+            # down with a 500. Dying here with the reason is strictly
+            # better than a two-minute stall and a backend error that names
+            # neither the interface nor the route.
+            [ -n "${tcp_net_dev}" ] || die \
+                "KV_TRANSPORT=tcp but no compute-leg interface resolved for role=${role}." \
+                " Set PREFILL_PD_IF/DECODE_PD_IF (preferred) or PREFILL_DATA_IF/DECODE_DATA_IF" \
+                " in creds/active.env to the interface that has a route to the PEER node." \
+                " Leaving this to UCX autodetection is not a fallback: UCX will advertise the" \
+                " first TCP device it enumerates, which on this cluster is an unroutable" \
+                " fabric NIC — see config/cluster.env's PREFILL_PD_IF comment."
+            export UCX_NET_DEVICES="${tcp_net_dev}"
+            log "UCX: TCP mode (UCX_TLS=${UCX_TLS} UCX_NET_DEVICES=${UCX_NET_DEVICES})"
             ;;
         rdma)
             [ -n "${ucx_net_dev}" ] || die "KV_TRANSPORT=rdma but no UCX_NET_DEVICES resolved for" \

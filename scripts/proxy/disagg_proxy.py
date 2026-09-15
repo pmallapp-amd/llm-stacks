@@ -24,20 +24,39 @@ there would be no P/D split happening at all, just two idle-most-of-the-time
 servers. Sending a max_tokens=1 "priming" request to the prefill node first
 is what makes prefill actually run the prompt forward pass.
 
-THREADING kv_transfer_params (F1's NixlConnector handoff): a max_tokens=1
-priming request alone populates the LMCache L2 tier, but it does NOT, on
-its own, trigger a direct NixlConnector transfer — that requires the
-handoff metadata NixlConnector returns in the PRODUCER's (prefill's)
-response to be threaded into the CONSUMER's (decode's) request body. This
-proxy extracts that field (name configurable via PD_HANDOFF_FIELD, default
-"kv_transfer_params" — see Config.pd_handoff_field's own comment for why
-this is configurable rather than hardcoded) from prefill's JSON response
-and merges it into the request forwarded to decode. Without this step, the
-direct P->D leg silently never fires even with PD_ENABLED=1 on both roles
-— requests still succeed (LMCache/recompute cover the miss), which is
-exactly the kind of "looks fine, isn't" failure this repo has hit before.
+THREADING kv_transfer_params (NixlConnector's XpYd handoff) is a THREE-step
+handshake, not two. Measured against the installed vLLM 0.26.0+rocm on
+2026-09-15, reference implementation
+`/app/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py`:
+
+  1. REQUEST the handoff from prefill. The priming request must carry
+     kv_transfer_params={"do_remote_decode": True, "do_remote_prefill":
+     False, remote_* : None}. This is what tells NixlConnector's scheduler
+     that this request's KV is destined for a remote decode, so it must
+     stage the blocks and report where they are.
+  2. EXTRACT kv_transfer_params from prefill's JSON response — it comes
+     back inverted (do_remote_prefill=True) and populated with
+     remote_engine_id / remote_block_ids / remote_host / remote_port /
+     remote_request_id / tp_size / remote_num_tokens.
+  3. THREAD that object into decode's request body, which is what makes
+     decode PULL the KV over the side channel instead of re-prefilling.
+
+Step 1 is the one that is easy to miss and was in fact missing here until
+2026-09-15: without it prefill answers perfectly normally and simply
+returns NO kv_transfer_params at all, so there is nothing to thread, and
+decode silently re-prefills the entire prompt. Every request still
+succeeds. The pipeline serves correct text at correct latency while doing
+no disaggregation whatsoever — exactly the "looks fine, isn't" failure
+this repo's invariants exist to catch. Do not read a missing handoff as
+"this deployment doesn't use one"; read it as step 1 not happening.
+
 The Stats.prefill_no_handoff counter (surfaced at /status) exists to catch
 this: a nonzero value there is the signature of a misconfigured direct leg.
+
+TRANSPORT PREREQUISITE (separate failure, same symptom class): even with
+all three steps correct, decode's loadRemoteMD() will fail
+NIXL_ERR_BACKEND unless UCX advertises an address decode can actually
+reach — see config/cluster.env's UCX_NET_DEVICES and docs/HANDOFF.md §2.
 
 Degraded-mode philosophy: a prefill failure must not become a client-visible
 failure. Worst case without a working prefill leg, decode just does its own
@@ -121,13 +140,13 @@ class Config:
         self.health_timeout_sec = float(os.environ.get("PROXY_HEALTH_TIMEOUT_SEC", "5"))
 
         # The field name vLLM's NixlConnector uses to carry P->D handoff
-        # metadata (memory descriptors etc.) in a completion response, and
-        # the field decode's request body must carry it back under to
-        # trigger a direct load (F1). This could not be independently
-        # verified against a specific installed vLLM version at the time
-        # this was written, so rather than hardcode a guessed name and fail
-        # silently if it's wrong, it is a configurable env var — see
-        # config/cluster.env's PD_HANDOFF_FIELD, which this default matches.
+        # metadata in a completion response, and the field decode's request
+        # body must carry it back under to trigger a direct load.
+        # VERIFIED 2026-09-15 against the installed vLLM 0.26.0+rocm: the
+        # name is "kv_transfer_params" on both the request and the response
+        # side. Kept configurable because this is the single point where a
+        # vLLM rename would silently disable disaggregation rather than
+        # error — see config/cluster.env's PD_HANDOFF_FIELD.
         self.pd_handoff_field = os.environ.get("PD_HANDOFF_FIELD", "kv_transfer_params")
 
     @property
@@ -190,12 +209,12 @@ async def _prime_prefill(
     req_id: str,
 ) -> Any | None:
     """Best-effort: send a max_tokens=1, stream=false copy of the request to
-    the prefill node so it runs the prompt forward pass and populates the
-    shared LMCache/NIXL KV store. Never raises — a prefill failure is
+    the prefill node so it runs the prompt forward pass and stages its KV
+    blocks for a remote decode. Never raises — a prefill failure is
     logged and counted, not propagated, per this module's docstring.
 
     Returns the value of cfg.pd_handoff_field from prefill's JSON response
-    (NixlConnector's P->D handoff metadata, F1), or None if prefill failed,
+    (NixlConnector's P->D handoff metadata), or None if prefill failed,
     returned unparseable JSON, or the field was simply absent. The caller
     threads a non-None return value into decode's request body — that is
     what actually triggers a direct NixlConnector load rather than just a
@@ -209,6 +228,34 @@ async def _prime_prefill(
     # under either name rather than silently doing a full-length generation
     # on the prefill node too.
     primed["max_completion_tokens"] = 1
+
+    # STEP 1 of the XpYd handshake — ASK for the handoff. Without this
+    # block prefill runs the prompt perfectly well and returns no
+    # kv_transfer_params at all, leaving nothing to thread and making
+    # decode re-prefill the whole prompt in silence. The remote_* keys are
+    # sent explicitly as None rather than omitted, matching vLLM's own
+    # toy_proxy_server.py: this is the producer-side shape of the field,
+    # and the response comes back with the same keys populated and the two
+    # booleans inverted.
+    primed[cfg.pd_handoff_field] = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "remote_block_ids": None,
+        "remote_host": None,
+        "remote_port": None,
+    }
+
+    # Sampling controls the producer cannot honour under max_tokens=1.
+    # vLLM rejects min_tokens > max_tokens outright, so a client that sets
+    # min_tokens would turn every priming request into an HTTP 400 and
+    # disable disaggregation for exactly the long-generation requests that
+    # benefit from it most. Dropped from the PRIMING copy only — `body`
+    # itself is untouched, so decode still receives them.
+    primed.pop("min_tokens", None)
+    primed.pop("min_completion_tokens", None)
+    # stream=False with stream_options set is a schema error in vLLM.
+    primed.pop("stream_options", None)
 
     timeout = ClientTimeout(total=cfg.prefill_timeout_sec)
     try:
@@ -245,15 +292,23 @@ async def _prime_prefill(
                 return None
 
             handoff = data.get(cfg.pd_handoff_field) if isinstance(data, dict) else None
-            if handoff is None:
+            # Falsy, not just None: vLLM returns an empty dict when the
+            # connector declined to stage anything (e.g. a prompt shorter
+            # than one block). An empty dict threaded into decode's request
+            # is worse than none — it looks like a handoff to this proxy's
+            # counters while carrying no block ids at all.
+            if not handoff:
                 stats.prefill_no_handoff += 1
                 log.warning(
-                    "[%s] prefill response has no '%s' field — this is the "
-                    "signature of a misconfigured direct P->D leg (check "
-                    "PD_ENABLED / gen-kv-transfer-config.sh's output, or "
-                    "override PD_HANDOFF_FIELD if this installed vLLM names "
-                    "the field differently); decode will fall back to its "
-                    "own LMCache lookup/recompute for this request",
+                    "[%s] prefill response carried no usable '%s' — decode "
+                    "will re-prefill this prompt itself. Checked in order: "
+                    "(1) is NixlConnector actually in prefill's "
+                    "--kv-transfer-config with kv_role=kv_producer; (2) is "
+                    "the prompt at least one block long (a short prompt "
+                    "legitimately stages nothing); (3) does this vLLM name "
+                    "the field something other than PD_HANDOFF_FIELD. Note "
+                    "the request DID succeed — a silently non-disaggregating "
+                    "pipeline is the failure mode here, not an error",
                     req_id,
                     cfg.pd_handoff_field,
                 )

@@ -151,16 +151,25 @@ numbered list:
    is still on the 24.04 cmdline, so `modprobe amdgpu` is still required
    every boot on both nodes, confirmed again this session (TODO 0.4).
 
-**The new top blocker, this session: the container image on `smc1` cannot
-run P/D at all.** vLLM on ROCm imports the `rixl` package, not `nixl`
-(`vllm/distributed/nixl_utils.py`); the image used to launch P/D
-(`rocm-aic:latest`) has `nixl` but not `rixl`, so both engines died on
-startup. The two images that do have `rixl`
-(`kv-mppd`/`kv-mppd-assertfix`) exist only on `smc2` — moving one to `smc1`
-is now the single next action. Full detail and the launch parameters
-already worked out at **TODO 6.11**; composing the now-proven storage tier
-underneath that P/D deployment is **TODO 6.10**. These are the only two
-live items in TODO §6 — see §9 below.
+4. **RESOLVED, fourth session, 2026-09-15: leg A now actually carries KV.**
+   The two blockers that stood here in turn — the `rixl` package gap, and
+   then session 3's "P/D serves but no KV crosses" finding — are both
+   closed. Measured through this repo's own proxy, on a 4033-token prompt:
+
+   | engine | avg prompt throughput | external prefix cache hit rate |
+   |---|---|---|
+   | prefill | 403.3 tokens/s | 0.0% |
+   | decode  | **0.0 tokens/s** | **100.0%** |
+
+   Decode does no prefill work at all. That is precisely the acceptance
+   signal TODO 6.11 specified, and which it explicitly refused to accept a
+   successful completion in place of. **Two independent defects had to be
+   fixed, and both of them presented identically: a pipeline that served
+   correct text, at plausible latency, while transferring zero KV.** The
+   full account is §11.
+
+   With leg A proven, exactly **one** live item remains: **TODO 6.10**,
+   composing the storage tier underneath this now-working P/D pair.
 
 ---
 
@@ -532,28 +541,34 @@ other directly today.
 
 ## 9. How to resume
 
-### The two live items — read this first, nothing else in §6 is more urgent
+### The one live item — read this first, nothing else in §6 is more urgent
 
 Everything that used to gate §6 (deployment model, kernel/CSI-1, KV backend
-choice) is now decided, resolved, or proven — see §6/§10 above. **Exactly
-two actionable items remain:**
+choice, and as of the fourth session leg A itself) is now decided, resolved,
+or proven — see §6/§10/§11 above. **Exactly one actionable item remains:**
 
-- **(A) [TODO 6.11](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier) —
-  get P/D + proxy actually serving.** Move a `rixl`-capable image
-  (`kv-mppd-assertfix` or `kv-mppd`, currently only on `smc2`) onto `smc1`,
-  relaunch prefill+decode with the parameters already worked out this
-  session, confirm both answer `/health`, confirm the side channel binds
-  the routable IP (`ss -ltn | grep 5600`), then start `disagg_proxy_demo.py`
-  and confirm `/status` plus a completion through it.
-- **(B) [TODO 6.10](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier) —
+- **[TODO 6.10](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier) —
   compose the storage tier under P/D.** `MultiConnector[NixlConnector,
   LMCacheMPConnector]` with LMCache's `nixl_backend = XNVME_KV` and
   `dev_uri` from `resolve_xnvme_kv_dev()`. New integration — prove both legs
   independently, with a cross-instance or post-eviction reuse number so
-  vLLM's own prefix cache can't fake the result (§8). Blocked by (A).
+  vLLM's own prefix cache can't fake the result (§8).
 
-Everything else in TODO §6 is done or explicitly parked behind these two —
+  The leg-A half of that proof is now available as a known-good baseline
+  rather than a hope: bring the pair up with
+  `scripts/common/start-vllm-container.sh {prefill,decode}`, front it with
+  `scripts/proxy/disagg_proxy.py`, and confirm decode's `Avg prompt
+  throughput` sits at 0.0 with `External prefix cache hit rate` at 100%
+  BEFORE adding LMCache. If composing the tier breaks that, you know
+  which change did it.
+
+Everything else in TODO §6 is done or explicitly parked behind it —
 see each item's status there.
+
+**One standing warning, earned twice now (§11):** on this stack a correct
+completion is not evidence of anything. Both defects that hid leg A
+produced perfect output at plausible latency. Read the two engine
+throughput counters, or you have measured nothing.
 
 ### The per-boot ritual — none of this survives a reboot
 
@@ -592,13 +607,14 @@ resuming either live item above:
    (container path, XNVME_KV, kernel `nvme-of`) — go straight to 6.11 then
    6.10, per the section above.
 
-The first things likely to bite, in order: the container-image `rixl` gap
-(6.11, above); the LMCache allowlist patch against whatever version actually
-installs (2.7); and, once P/D is up, reconciling XNVME_KV's real 32768-byte
-value ceiling against the config (6.4/6.13, folded into 6.10). The amdgpu
-blacklist and the P→D RDMA route are both known, both still require the
-same manual steps as before — see the per-boot ritual and TODO 3.6
-respectively.
+The first things likely to bite, in order: the LMCache allowlist patch
+against whatever version actually installs (2.7, folded into 6.10); and
+reconciling XNVME_KV's real 32768-byte value ceiling against the config
+(6.4/6.13, also folded into 6.10). The amdgpu blacklist and the P→D RDMA
+route are both known, both still require the same manual steps as before —
+see the per-boot ritual and TODO 3.6 respectively. The container-image
+`rixl` gap and the KV-transfer gap that sat here in previous sessions are
+both closed — §11.
 
 ---
 
@@ -838,3 +854,157 @@ Everything in this subsection was measured on live hardware after the
   `/var/tmp/hf`, verified 37/37 shards and 145.4 GB matching the index).
   `smc1` now 336 GB free, `smc2` 253 GB. Qwen3-8B and TinyLlama left
   intact. TODO 6.17.
+
+---
+
+## 11. Fourth session, 2026-09-15: leg A proven, and the two defects that hid it
+
+Session 3 left the pipeline in the most dangerous state this repo has a
+name for: **every HTTP check green, every completion correct, and zero KV
+crossing the wire.** Both engines answered `/health` 200, the side
+channels bound routable IPs, the proxy's `/status` listed both nodes, and
+a request through it returned coherent text with `finish_reason: stop` in
+about three seconds. None of that was evidence of anything. Decode was
+re-prefilling the entire prompt every time.
+
+Two independent defects were responsible. Neither produced an error
+message until it was looked for directly. They are recorded separately
+because they fail in different layers and either one alone is enough to
+silently disable disaggregation.
+
+### 11.1 Defect one — the proxy never ASKED for the handoff
+
+**The XpYd handshake is three steps, not two.** This repo, and session
+3's notes, had it as two: prime prefill, then thread whatever
+`kv_transfer_params` comes back into decode. The missing first step is
+that prefill only *produces* that field if the request asks it to.
+
+Reference implementation, read from inside the running image at
+`/app/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py`
+(vLLM 0.26.0+rocm):
+
+1. **Request** the handoff. The priming request must carry
+   `kv_transfer_params = {"do_remote_decode": true, "do_remote_prefill":
+   false, "remote_engine_id": null, "remote_block_ids": null,
+   "remote_host": null, "remote_port": null}` alongside `max_tokens=1`
+   and `stream=false`.
+2. **Extract** `kv_transfer_params` from prefill's JSON response. It
+   returns with the booleans inverted and the rest populated.
+3. **Thread** that object into decode's request body.
+
+Confirmed live against the prefill engine — step 1 added, and prefill
+answers with:
+
+```json
+{"do_remote_prefill": true, "do_remote_decode": false,
+ "remote_block_ids": [[...]], "remote_engine_id": "3bd4ce1b-...",
+ "remote_request_id": "cmpl-...", "remote_host": "10.30.75.198",
+ "remote_port": 5600, "tp_size": 8, "remote_num_tokens": 3001}
+```
+
+Without step 1 the same request succeeds and simply returns **no**
+`kv_transfer_params` at all. Fixed in `scripts/proxy/disagg_proxy.py`.
+
+> **This is the second time this exact inference has been made and been
+> wrong, so it is worth naming the pattern rather than just the fact.**
+> An earlier pass observed that the vendored `disagg_proxy_demo.py`
+> threads no handoff field, and concluded `PD_HANDOFF_FIELD` was
+> "settled and unused". Session 3 corrected that to "the proxy is missing
+> something". Both readings treated the vendored demo proxy as evidence
+> about the protocol. It is not: it implements a *different connector's*
+> protocol, and pointing it at NixlConnector produces exactly the silent
+> non-disaggregating pipeline described above. **An absence in a
+> reference implementation is evidence about that implementation, not
+> about the interface.** The authoritative artifact was
+> `toy_proxy_server.py`, in the same image, the whole time.
+
+`PD_HANDOFF_FIELD` is now **verified**, not assumed: the name is
+`kv_transfer_params`, on both the request and the response side.
+
+### 11.2 Defect two — UCX advertised a NIC the peer cannot route to
+
+With the handoff threaded, decode got far enough to attempt the transfer
+and then failed every request with an HTTP 500. The engine log shows the
+handshake genuinely working — `NIXL compatibility check passed`,
+`Transfer plan: TransferTopology(tp_ratio=1, num_kv_heads=8, local_tp=8,
+remote_tp=8, ...)` — and then dying in `add_remote_agent` →
+`loadRemoteMD` with `NIXL_ERR_BACKEND`.
+
+Isolated with a standalone two-process probe rather than by restarting
+72B engines (~6 minutes a cycle): a producer calls `get_agent_metadata()`,
+a consumer calls `add_remote_agent()` on it. That reproduced the failure
+in seconds and named it:
+
+```
+connect(fd=33, dest_addr=30.1.1.1:55385) failed: Connection timed out
+Unexpected UCX error: Destination is unreachable
+UCX endpoint create failed: failed to create ep
+loadRemoteMD: error loading connection info for backend 'UCX'
+```
+
+**Cause:** with `UCX_NET_DEVICES` unset, UCX enumerates every TCP-capable
+interface in the host network namespace and advertises the first. On
+`smc1` that is `benic1p1` — `30.1.1.1`, a fabric NIC on a `/24` the decode
+node has no route to (the long-standing TODO 3.6 gap). Decode spent ~133
+seconds in `connect()` per attempt before failing.
+
+The asymmetry is worth stating because it is not obvious from either node
+alone: prefill's container enumerates **ten** TCP devices
+(`benic1p1`..`benic8p1`, `ens51f0`, `lo`); decode's enumerates **two**
+(`ens51f0`, `lo`), because `smc2`'s `benic` interfaces currently carry no
+IPv4 at all. Neither container has `/dev/infiniband`, so UCX inside them
+is TCP-only regardless — RDMA is not available to these processes today
+and `UCX_TLS` excluding `tcp` would leave them with no transport at all.
+
+**Fix:** pin both roles to the shared management interface. New
+`PREFILL_PD_IF`/`DECODE_PD_IF` in `config/cluster.env`, deliberately
+separate from `*_DATA_IF` (which names the *storage*-leg NIC to the
+target — conflating the two is what allowed this). `setup_ucx_env` now
+**dies** in TCP mode if neither resolves, rather than falling through to
+its previous `unset UCX_NET_DEVICES` / `<auto>` branch. `<auto>` was not a
+safe default; it was the bug.
+
+> **Caveat that must not be lost: this path is the 1 GbE management NIC.**
+> Leg A is functionally proven and is *not* transport-benchmarked. The
+> 13.8 s decode latency observed on a 4035-token prompt is consistent with
+> moving roughly 1.3 GiB of KV over 1 Gb/s, which is corroborating
+> evidence that the transfer is real — and simultaneously a statement that
+> no throughput number taken here means anything. The fabric NICs remain
+> unrouted (TODO 3.6) and are Phase 2's problem.
+
+### 11.3 Also found: `create_backend()` cannot fail
+
+`nixl_rocm._api.create_backend()` has **no return statement** — it is
+always `None`, on success and on failure alike. Any caller that checks its
+return value has written a test incapable of failing. This is the same
+defect class HANDOFF §6 already records for this repo's verify scripts,
+but this instance is upstream, in the vendored NIXL Python API itself.
+Check `agent.backends[<name>]` instead.
+
+### 11.4 What is now codified in the repo
+
+- `scripts/proxy/disagg_proxy.py` — sends the request-side
+  `kv_transfer_params`; drops `min_tokens`/`min_completion_tokens`/
+  `stream_options` from the priming copy only (vLLM rejects
+  `min_tokens > max_tokens`, which would have turned every long-generation
+  request into a 400 and disabled disaggregation for exactly the requests
+  that benefit most); treats a falsy handoff as absent, since an empty
+  dict threaded into decode looks like success to the counters while
+  carrying no block ids.
+- `config/cluster.env` — `PREFILL_PD_IF`/`DECODE_PD_IF`; `PD_HANDOFF_FIELD`
+  re-documented as verified rather than guessed.
+- `scripts/common/lib.sh` — `setup_ucx_env` prefers `*_PD_IF` over
+  `*_DATA_IF` and dies rather than autodetecting.
+- `scripts/common/start-vllm-container.sh` — **new**; the container launch
+  path (TODO 6.1's decision) as a real script instead of shell history,
+  with the guards that would have caught both defects above.
+
+### 11.5 The router question, reopened and settled the other way
+
+TODO 6.14 settled on the vendored `disagg_proxy_demo.py` as this stack's
+router. **That is now reversed, with evidence:** that proxy cannot drive
+NixlConnector, because it never performs step 1 of §11.1. This repo's own
+`scripts/proxy/disagg_proxy.py` is the router, and it is the one the
+result above was measured through — `prefill_no_handoff: 0` across the
+run, which is the counter that would have caught the original defect had
+the repo's proxy been the one in front all along.

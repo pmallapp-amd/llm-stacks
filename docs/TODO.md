@@ -20,23 +20,22 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 6 | 0 | 0 |
 | 4 | Open items and known limitations | 6 | 0 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 17 | 11 | 4 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 17 | 12 | 4 |
 
-**Next action: 6.11 — move a `rixl`-capable image to `smc1` and get P/D +
-proxy actually serving.** Everything that was gating §6 is now decided or
-resolved: the deployment model is the container path (6.1); the kernel/CSI-1
-gap that blocked kernel `nvme-of` + XNVME_KV is closed by the 24.04.5/6.8.0-139
-OS upgrade (6.5–6.8, correcting HANDOFF §6's DISPROVEN entry); the KV backend
-decision is XNVME_KV, kernel nvme-of (6.3); leg B (the storage backend itself)
-is proven end-to-end (6.12); the proxy/router and handoff-field questions are
-settled (6.14); housekeeping is done (6.17). §6 now has **exactly two live
-items**: **6.11** (get P/D + proxy serving — swap the container image, fix the
-side-channel bind, confirm the proxy) and, once that lands, **6.10** (compose
-the storage tier — XNVME_KV as an LMCache tier under that same P/D
-deployment). Everything else in §6 is done or explicitly parked behind those
-two (6.2, 6.13, 6.15, 6.16 — see each item's status). §§1–5 are untouched by
-this session; their own next actions (2.3, 3.6) stand independently and are
-not part of the two live items above.
+**Next action: 6.10 — compose the XNVME_KV storage tier under the now-working
+P/D pair.** This is the last live item in §6. Everything else is decided,
+resolved, or proven: the deployment model is the container path (6.1); the
+kernel/CSI-1 gap is closed by the 24.04.5/6.8.0-139 OS upgrade (6.5–6.8); the
+KV backend decision is XNVME_KV over kernel nvme-of (6.3); leg B is proven
+end-to-end at the plugin level (6.12); housekeeping is done (6.17); and as of
+session 4, **leg A actually transfers KV** — decode at 0.0 tokens/s prompt
+throughput with a 100% external prefix cache hit rate, measured through this
+repo's own proxy (6.11, now closed). Two defects had to be fixed to get
+there, both of which presented as a pipeline serving correct text while
+moving zero KV — see HANDOFF §11, and note that 6.14's router decision is
+**reversed** by it. Everything else in §6 is done or explicitly parked behind
+6.10 (6.2, 6.13, 6.15, 6.16 — see each item's status). §§1–5 are largely
+untouched; their own next actions (2.3, 3.6) stand independently.
 
 ---
 
@@ -360,6 +359,14 @@ otherwise.*
 > 6.11** (get P/D + proxy actually serving — blocked on a container image
 > swap) **and 6.10** (compose the storage tier under that P/D deployment,
 > once 6.11 lands). Read those two first.
+>
+> **Session 4, same day (2026-09-15): 6.11 is now DONE and leg A
+> verifiably transfers KV** — decode 0.0 tokens/s prompt throughput, 100%
+> external prefix cache hit rate. Two defects had to be fixed, both of
+> which produced a pipeline that served correct text while moving zero KV;
+> see 6.11's resolution and HANDOFF §11. This also **reverses 6.14's
+> router decision** in favour of this repo's own proxy. **Exactly one item
+> remains live: 6.10.**
 
 - [x] **6.1** Decide the deployment model: this repo's from-source build
       chain (`scripts/common/{05-build-spdk-initiator,10-build-stack,
@@ -538,7 +545,7 @@ otherwise.*
       work resumes. Automating this (systemd unit, or folding into
       host-prep) is real remaining work, but it is not one of the two live
       items in this section — do it opportunistically once 6.10/6.11 land.
-- [ ] **6.10** 🔴 **LIVE ITEM B — compose the storage tier under P/D.**
+- [ ] **6.10** 🔴 **THE LIVE ITEM — compose the storage tier under P/D.**
       Compose `MultiConnector[NixlConnector, LMCacheMPConnector]` with the
       chosen KV backend as the **live** LMCache storage tier underneath a
       real P/D deployment: LMCache's `nixl_backend = XNVME_KV` (per 6.3),
@@ -579,9 +586,16 @@ otherwise.*
       the `need to load:`/hit-rate log signal above for proof, not
       `query_memory()`.
 
-      *Blocked by 6.11 — this needs P/D actually serving before the tier can
-      be composed underneath it.*
-- [ ] **6.11** 🔴 **LIVE ITEM A — get P/D + proxy actually serving.** Prove
+      *UNBLOCKED 2026-09-15 (session 4): 6.11 is done and leg A verifiably
+      transfers KV, so the substrate this tier composes onto now exists and
+      is known-good. Bring the pair up with
+      `scripts/common/start-vllm-container.sh {prefill,decode}` fronted by
+      `scripts/proxy/disagg_proxy.py`, and **record the leg-A baseline
+      (decode 0.0 tokens/s prompt throughput, 100% external hit) BEFORE
+      adding LMCache** — if composing the tier breaks leg A, that baseline
+      is the only thing that will tell you so, since both legs fail
+      silently rather than erroring. This is now the last live item in §6.*
+- [x] **6.11** ✅ **DONE 2026-09-15 (session 4) — leg A carries KV.** Prove
       leg A: a direct P→D NIXL transfer, following the rixl-bench pattern —
       `NixlConnector` only, `kv_role` kv_producer/kv_consumer,
       `kv_buffer_device cpu`, `extra_config {hostname, port: 14579}`,
@@ -686,6 +700,59 @@ otherwise.*
       long prompt while prefill's does not, and/or a non-zero
       `External prefix cache hit rate` on decode.
 
+      ---
+
+      **RESOLVED 2026-09-15, session 4. The evidence this item demanded,
+      measured through this repo's own `scripts/proxy/disagg_proxy.py` on
+      a 4033-token prompt with a per-run nonce:**
+
+      | engine | avg prompt throughput | external prefix cache hit rate |
+      |---|---|---|
+      | prefill | 403.3 tokens/s | 0.0% |
+      | decode  | **0.0 tokens/s** | **100.0%** |
+
+      Decode performed no prefill work whatsoever, and the proxy reported
+      `prefill_no_handoff: 0`. Corroborating: decode's wall time was 13.8 s
+      on a 4035-token prompt, consistent with moving ~1.3 GiB of KV over
+      the 1 GbE management path — the transfer is real, and equally, no
+      throughput figure from this path is meaningful (see 3.6 / 6.16).
+
+      **Two independent defects, each sufficient on its own to produce
+      session 3's "serves perfectly, transfers nothing" symptom.** Full
+      account in HANDOFF §11; in brief:
+
+      1. **The proxy never asked for the handoff.** The XpYd handshake is
+         three steps, not two: the priming request must itself carry
+         `kv_transfer_params={"do_remote_decode": true, ...}`, or prefill
+         returns no handoff at all and there is nothing to thread.
+         Reference implementation is
+         `/app/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py`,
+         present inside the image the whole time. Fixed in
+         `scripts/proxy/disagg_proxy.py`. `PD_HANDOFF_FIELD` is now
+         **verified** as `kv_transfer_params` on both request and
+         response sides, not assumed.
+      2. **UCX advertised an unroutable NIC.** With `UCX_NET_DEVICES`
+         unset, UCX advertises the first TCP interface it enumerates —
+         `benic1p1`/`30.1.1.1` on `smc1`, which `smc2` cannot route to.
+         Decode blocked ~133 s in `connect()` then failed
+         `loadRemoteMD` → `NIXL_ERR_BACKEND`, 500-ing every request.
+         Fixed by new `PREFILL_PD_IF`/`DECODE_PD_IF` (deliberately
+         distinct from the storage-leg `*_DATA_IF`); `setup_ucx_env` now
+         **dies** in TCP mode rather than falling back to autodetection,
+         because `<auto>` was not a default, it was the bug.
+
+      Also codified: `scripts/common/start-vllm-container.sh`, the
+      container launch path (6.1's decision) as an actual script with
+      guards, rather than the shell history it had been.
+
+      Also found, worth carrying forward: `nixl_rocm._api.create_backend()`
+      has no return statement and is always `None` — any check of its
+      return value is incapable of failing. Check `agent.backends[name]`.
+
+      **Note what this does NOT close:** RDMA (3.1–3.6) is untouched —
+      this is TCP over 1 GbE management. Neither container has
+      `/dev/infiniband` at all, so UCX inside them is TCP-only today.
+
       **Watch for:** "stream ended without a finish reason" from the proxy
       means a vLLM 400 dressed up as a 200 SSE stream — read the **vLLM
       container logs**, not the proxy's, when this happens.
@@ -755,6 +822,25 @@ otherwise.*
       against a running prefill+decode, because P/D itself has never come
       up. Actually launching it end-to-end is folded into 6.11, not tracked
       separately here.
+
+      > **REVERSED 2026-09-15, session 4 — both halves of this item were
+      > wrong, and wrongly for the same reason.** The router is **this
+      > repo's `scripts/proxy/disagg_proxy.py`**, not the vendored
+      > `disagg_proxy_demo.py`. The demo proxy implements a *different
+      > connector's* protocol and cannot drive NixlConnector at all: it
+      > never sends the request-side `kv_transfer_params` that makes
+      > prefill stage its blocks, so with it in front the pipeline serves
+      > correct text and transfers zero KV. And `PD_HANDOFF_FIELD` is not
+      > "unused on this proxy" — it is load-bearing, and now verified as
+      > `kv_transfer_params` on both the request and the response side.
+      >
+      > The reasoning error is worth naming, because this file has now
+      > made it twice about this same field: an absence in a reference
+      > implementation was read as evidence about the *interface*. It was
+      > only ever evidence about that implementation. The authoritative
+      > artifact —
+      > `/app/vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py`
+      > — was inside the image from the start. See HANDOFF §11.1.
 - [!] **6.15** Cross-instance reuse measurement, not confounded by vLLM's
       own prefix cache (HANDOFF §8) or by same-endpoint repeats — ties to
       existing 1.13 and to the storage-tier hit proven in 6.12. This is the
