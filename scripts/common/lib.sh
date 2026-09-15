@@ -652,12 +652,73 @@ _setup_nixl_kv_env_spdk() {
 # caller's metaInfo is set (the LMCache OBJ-mode path), and never reads a
 # per-role offset even on the metaInfo-less fallback path. There is
 # therefore nothing role-specific left to export for this backend.
+# Resolve the KV namespace char device by SUBSYSTEM NQN rather than by path.
+#
+# Pinning a literal /dev/ngCnN in config is wrong here for two measured
+# reasons, both seen on this cluster 2026-09-15 after the 24.04/6.8 upgrade:
+#
+#   1. The correct node is NOT the same on both hosts. The kernel numbers
+#      controllers in attach order, so the same fabric target landed on
+#      /dev/ng1n1 on prefill but /dev/ng2n1 on decode. One shared creds file
+#      cannot carry one correct literal path for both roles.
+#   2. The lowest-numbered char-only device is NOT necessarily ours. Decode
+#      also has a LOCAL Pensando DSC KV controller (pcie 0000:36:00.0,
+#      nqn.2019-08.com.pensando:...) presenting /dev/ng1n1 with no block
+#      device. The plugin's own discover_kv_device() picks the lowest such
+#      node, so autodiscovery there selects the local DSC — not the NVMe-oF
+#      target this deployment is storing KV in. Nothing downstream would
+#      report that; it would simply be the wrong device, written successfully.
+#
+# The subsystem NQN is the thing that actually identifies our target, so match
+# on it. Ambiguity is fatal rather than resolved by picking one: two devices
+# answering to the same NQN means something is genuinely wrong (a duplicate
+# connect, a stale session) and guessing would hide it.
+resolve_xnvme_kv_dev() {
+    local want="${1:-${NVMF_SUBNQN}}" ng s ctrl nqn blk
+    local -a matches=()
+    for ng in /dev/ng*n*; do
+        [ -e "${ng}" ] || continue
+        s="${ng#/dev/ng}"; ctrl="${s%%n*}"
+        nqn="$(cat "/sys/class/nvme/nvme${ctrl}/subsysnqn" 2>/dev/null || true)"
+        [ "${nqn}" = "${want}" ] || continue
+        # A real KV namespace has no block device (the kernel cannot build one
+        # for a non-NVM command set). Enforced again here so an NQN match on an
+        # ordinary namespace can never be returned.
+        blk="/dev/nvme${s}"
+        [ -e "${blk}" ] && continue
+        matches+=("${ng}")
+    done
+    case "${#matches[@]}" in
+        1) printf '%s\n' "${matches[0]}"; return 0 ;;
+        0) return 1 ;;
+        *) err "resolve_xnvme_kv_dev: ${#matches[@]} char devices claim NQN" \
+               " '${want}': ${matches[*]}. Refusing to pick one — this is a" \
+               " duplicate or stale nvme-of session, not a choice to make."
+           return 2 ;;
+    esac
+}
+
 _setup_nixl_kv_env_xnvme() {
     local role="$1"
     : "${role}"
     unset NIXL_KV_TRID NIXL_KV_NUM_QPAIRS NIXL_KV_QUERY_TIMEOUT_MS \
           NIXL_KV_ENOMEM_TIMEOUT_SEC NIXL_KV_BACKPRESSURE_LOG_SEC \
           NIXL_KV_SLOT_OFFSET
+
+    # An explicit XNVME_DEV always wins; otherwise resolve by NQN (above),
+    # which is correct per-host without per-host configuration. Only if BOTH
+    # fail do we reach the empty-value die below.
+    if [ -z "${XNVME_DEV}" ]; then
+        local _auto _rc
+        _auto="$(resolve_xnvme_kv_dev "${NVMF_SUBNQN}")" && _rc=0 || _rc=$?
+        if [ "${_rc}" = "0" ] && [ -n "${_auto}" ]; then
+            XNVME_DEV="${_auto}"
+            ok "XNVME_DEV resolved by NQN '${NVMF_SUBNQN}' -> ${XNVME_DEV}"
+        elif [ "${_rc}" = "2" ]; then
+            die "setup_nixl_kv_env: ambiguous KV device (see above). Set" \
+                " XNVME_DEV explicitly to disambiguate."
+        fi
+    fi
 
     # FAIL LOUDLY rather than let an empty XNVME_DEV reach the plugin: an
     # empty NIXL_XNVME_DEV falls through to the plugin's OWN /dev

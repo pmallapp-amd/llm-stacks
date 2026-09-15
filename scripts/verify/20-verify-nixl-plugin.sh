@@ -194,14 +194,23 @@ if reported_mvs_int != expected_max_value_size:
           f"expected={expected_max_value_size}")
     sys.exit(1)
 
+# create_backend() has NO return statement in nixl._api.nixl_agent — it
+# ALWAYS implicitly returns None, on total success exactly as much as on
+# failure (confirmed 2026-09-15 by reading its source on a live container:
+# it just populates self.backends[backend]/self.backend_mems/
+# self.backend_options and returns nothing). The "if backend is None: fail"
+# check that used to be here was measured to ALWAYS trigger — even a
+# successful connect to XNVME_KV on /dev/ng1n1 (backend genuinely opened,
+# "Backend XNVME_KV was instantiated" logged, device format queried
+# correctly) prints `backend: None` and would have failed this check on
+# every single passing run. Success is proven by NOT raising in the try
+# block below — that IS the API's only success signal — so the None-check
+# is deleted rather than "fixed" into some other guess at what a truthy
+# return might look like.
 try:
-    backend = agent.create_backend(backend_name, {connect_key: connect_value})
+    agent.create_backend(backend_name, {connect_key: connect_value})
 except Exception as exc:  # noqa: BLE001
     print(f"RESULT:CREATE_BACKEND_FAIL:{type(exc).__name__}: {exc}")
-    sys.exit(1)
-
-if backend is None:
-    print("RESULT:CREATE_BACKEND_RETURNED_NONE")
     sys.exit(1)
 
 print("RESULT:OK")

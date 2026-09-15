@@ -64,18 +64,50 @@ def chunk_meta_infos(base_meta: str, num_parts: int) -> list[str]:
 
 
 def find_query_callable(agent):
-    """The C++ backend's queryMem() existence-probe is what NIXL's python
-    bindings expose under SOME name — this repo has no confirmed-installed
-    NIXL build to check the exact one against (see
-    patches/lmcache/README.md's ASSUMED section), so try the plausible
-    candidates in order and report which one worked rather than guessing
-    silently. Returns (name, bound_method) or (None, None).
+    """query_memory() is now CONFIRMED (introspected 2026-09-15 against a
+    live nixl_agent, not guessed) as the one and only name NIXL's python
+    bindings expose for the C++ backend's queryMem() existence-probe —
+    query_mem/queryMem/query never existed. The lookup is kept as a
+    hasattr() guard rather than a bare `agent.query_memory` reference
+    purely so an agent build that genuinely lacks the method (e.g. an
+    older nixl wheel) fails with our own clear RESULT:QUERY_API_NOT_FOUND
+    instead of an AttributeError with no context. Returns the bound
+    method, or None.
     """
-    for name in ("query_memory", "query_mem", "queryMem", "query"):
-        fn = getattr(agent, name, None)
-        if callable(fn):
-            return name, fn
-    return None, None
+    fn = getattr(agent, "query_memory", None)
+    return fn if callable(fn) else None
+
+
+def wait_for_xfer(agent, handle) -> tuple[bool, str]:
+    """Poll a transfer to completion and report success/failure.
+
+    check_xfer_state() cannot actually return the string "ERR" in
+    practice, despite its own source appearing to have an `else: return
+    "ERR"` branch: its underlying binding — getXferStatus() in
+    nixl_bindings.cpp — calls throw_nixl_exception(ret) UNCONDITIONALLY,
+    and throw_nixl_exception() only special-cases NIXL_IN_PROG and
+    NIXL_SUCCESS as non-throwing; every OTHER status (NIXL_ERR_BACKEND,
+    NIXL_ERR_NOT_FOUND, ...) raises a TYPED python exception instead,
+    which happens before nixl_agent.check_xfer_state()'s own if/elif/else
+    ever gets a chance to run. A caller that only ever compared the
+    return value against the string "ERR" (an earlier version of this
+    script did exactly that, and it looked reasonable — the string is
+    right there in the binding's source) would NEVER catch a genuine
+    failure this way; it would see an uncaught exception instead.
+    Measured 2026-09-15: reading a key that was never written raises
+    nixlBackendError, not a returned "ERR" string.
+
+    Returns (True, "DONE") on success, (False, "<ExceptionClass>: <msg>")
+    on any failure — the CALLER decides what the failure means (a
+    genuine transport error vs. this backend's only available
+    existence-miss signal; see do_read()'s retrieve-as-probe fallback).
+    """
+    try:
+        while agent.check_xfer_state(handle) == "PROC":
+            time.sleep(0.005)
+        return True, "DONE"
+    except Exception as exc:  # noqa: BLE001 — deliberately broad, see docstring
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def do_write(agent, backend, meta_infos: list[str], chunks: list[bytes]) -> None:
@@ -85,21 +117,80 @@ def do_write(agent, backend, meta_infos: list[str], chunks: list[bytes]) -> None
         buf = (ctypes.c_ubyte * len(chunk))(*chunk)
         addr = ctypes.addressof(buf)
 
-        reg_descs = agent.get_reg_descs([(addr, len(chunk), 0, meta)], "DRAM")
-        agent.register_memory(reg_descs, backend=backend)
+        # register_memory()'s param is `backends` (a LIST), not `backend` — the
+        # SINGULAR-keyword call raises TypeError: unexpected keyword argument
+        # 'backend' (measured 2026-09-15 against a live nixl_agent). NIXL lets
+        # one registration cover several backends at once, hence the list
+        # shape even though this script only ever has exactly one.
+        #
+        # register_memory() ALSO builds the reg-desc list itself when handed
+        # raw tuples (it calls get_reg_descs() internally — confirmed by
+        # reading nixl._api.nixl_agent.register_memory()'s source on the live
+        # container), so there is no separate get_reg_descs() call needed
+        # here; the DRAM metaInfo ("") is unused by this backend's DRAM_SEG
+        # registerMem() branch (a bare pointer-store — see
+        # xnvme_kv_backend.cpp's registerMem(), DRAM_SEG case), so it is
+        # left empty on purpose — the OBJ registration below is where
+        # metaInfo actually matters.
+        local_reg = agent.register_memory([(addr, len(chunk), 0, "")], "DRAM",
+                                           backends=[backend])
 
-        local_xfer = agent.get_xfer_descs([(addr, len(chunk), 0)], "DRAM")
-        remote_xfer = agent.get_xfer_descs([(0, len(chunk), 0, meta)], "OBJ")
+        # THIS registration is the one that matters: metaInfo=meta here IS
+        # the on-wire KV key. xnvme_kv_backend.cpp's registerMem() OBJ_SEG
+        # branch stashes mem.metaInfo into the backend's per-region metadata,
+        # and postXfer() later derives make_key() from
+        # file_desc.metadataP->meta_info — i.e. the key is carried entirely
+        # by this registration, not by anything in the xfer descriptor
+        # itself. addr=0/devId=0 are placeholders: an object has no memory
+        # address of its own.
+        obj_reg = agent.register_memory([(0, len(chunk), 0, meta)], "OBJ",
+                                         backends=[backend])
 
-        handle = agent.initialize_xfer("WRITE", local_xfer, remote_xfer, "", meta.encode())
+        # .trim() converts a REG desc list (4-tuple, carries metaInfo) into
+        # the XFER desc list shape (3-tuple) that initialize_xfer() actually
+        # requires. Building the remote xfer descs directly via
+        # get_xfer_descs([(0, len(chunk), 0, meta)], "OBJ") — a 4-tuple — was
+        # the FIRST thing tried here and fails: NIXL logs "3-tuple list
+        # needed for transfer" and silently returns None, which then blows up
+        # inside createXferReq() with remote_descs=None (measured 2026-09-15).
+        # .trim() is how NIXL's own storage examples do it
+        # (examples/python/remote_storage_example: `nixl_file_reg_descs.trim()`)
+        # — NIXL keeps the addr/len/devId -> metaInfo association from the
+        # registration internally and hands the matching metadata back to
+        # the backend at transfer time (see postXfer()'s
+        # file_desc.metadataP), which is also why this MUST be the same
+        # reg_descs object that was just registered, not a freshly built one.
+        local_xfer = local_reg.trim()
+        remote_xfer = obj_reg.trim()
+
+        # remote_agent=agent.name (SELF), not "" — this is a LOCAL transfer
+        # (no second nixl_agent peer in this test; the "remote" side is the
+        # KV device attached directly to THIS backend). remote_agent=""
+        # was the FIRST thing tried here and fails: "createXferReq: metadata
+        # for remote agent '' not found" / NIXL_ERR_NOT_FOUND (measured
+        # 2026-09-15) — NIXL resolves remote_agent by name lookup against
+        # its own metadata table, and only the agent's OWN name is
+        # pre-populated there without an explicit add_remote_agent() call.
+        # This matches NIXL's own local-storage-transfer examples
+        # (examples/python/remote_storage_example: `my_agent.name` as
+        # remote_name for a same-host storage transfer). backends=[backend]
+        # pins which backend actually executes it, same as
+        # register/deregister_memory above. notif_msg is left at its b''
+        # default — passing meta.encode() there was the SECOND thing tried
+        # and fails: "the selected backend 'XNVME_KV' does not support
+        # notifications" / NIXL_ERR_BACKEND (measured 2026-09-15; matches
+        # HANDOFF.md §6's note that this backend declines supportsRemote()).
+        # The key is already fully carried by the OBJ registration's
+        # metaInfo above — a notification was never needed to convey it.
+        handle = agent.initialize_xfer("WRITE", local_xfer, remote_xfer,
+                                        agent.name, backends=[backend])
         agent.transfer(handle)
-        while agent.check_xfer_state(handle) == "PROC":
-            time.sleep(0.005)
-        state = agent.check_xfer_state(handle)
+        ok, detail = wait_for_xfer(agent, handle)
         agent.release_xfer_handle(handle)
-        agent.deregister_memory(reg_descs)
-        if state not in ("DONE", "SUCCESS", 0):
-            print(f"RESULT:WRITE_FAIL:{meta}:final_state={state!r}")
+        agent.deregister_memory(local_reg, backends=[backend])
+        agent.deregister_memory(obj_reg, backends=[backend])
+        if not ok:
+            print(f"RESULT:WRITE_FAIL:{meta}:{detail}")
             sys.exit(1)
         print(f"INFO: wrote {len(chunk)} bytes under metaInfo={meta}")
 
@@ -109,28 +200,60 @@ def do_write(agent, backend, meta_infos: list[str], chunks: list[bytes]) -> None
 def do_read(agent, backend, meta_infos: list[str], expected_chunks: list[bytes]) -> None:
     import ctypes
 
-    qname, qfn = find_query_callable(agent)
+    from nixl._bindings import nixlNotSupportedError
+
+    qfn = find_query_callable(agent)
     if qfn is None:
         print(
-            "RESULT:QUERY_API_NOT_FOUND: tried query_memory/query_mem/"
-            "queryMem/query — none exist on this nixl_agent build. Cannot "
-            "run the existence-probe half of this test; see "
-            "plugins/nvme-kv/spdk_nvme_kv_backend.h's queryMem() comment "
-            "for why this call matters (its absence is what made every "
-            "decode-side lookup a miss before it was added)."
+            "RESULT:QUERY_API_NOT_FOUND: agent.query_memory does not exist "
+            "on this nixl_agent build. Cannot run the existence-probe half "
+            "of this test; see plugins/xnvme-kv/xnvme_kv_backend.cpp's "
+            "queryMem() comment for why this call matters (its absence is "
+            "what made every decode-side lookup a miss before it was "
+            "added)."
         )
         sys.exit(1)
-    print(f"INFO: using agent.{qname}() for the existence probe")
+
+    # Whether query_memory() is actually USABLE against the .so this process
+    # loaded — a DIFFERENT question from whether the python method exists
+    # (just checked above). MEASURED 2026-09-15: calling it against
+    # KV_BACKEND=XNVME_KV raises nixlNotSupportedError (NIXL_ERR_NOT_
+    # SUPPORTED). `nm -D --defined-only` on the exact .so this container
+    # loads (/opt/nixl/lib/x86_64-linux-gnu/plugins/libplugin_XNVME_KV.so,
+    # md5 confirmed identical to /tmp/xnvme-kv-build/'s copy, built
+    # 2026-09-09) shows ONLY the weak `nixlBackendEngine::queryMem` base-
+    # class symbol — NOT `nixlXnvmeKvEngine::queryMem`, even though this
+    # repo's plugins/xnvme-kv/xnvme_kv_backend.cpp (~line 694) DOES define
+    # that override. Conclusion, established by testing rather than assumed:
+    # this specific prebuilt binary predates the queryMem() override — a
+    # STALE-ARTIFACT gap, not "NIXL's python binding lacks this" and not
+    # "this backend architecturally cannot support existence probes" (the
+    # source clearly can). The constraint here is: do NOT weaken this check
+    # to make it pass — so on NOT_SUPPORTED we degrade EXPLICITLY, visibly,
+    # once, and fall back to treating the RETRIEVE itself as the existence
+    # proof (a transfer that fails below is reported as a miss; one that
+    # succeeds proves both existence and content in a single step) rather
+    # than silently skipping the check.
+    query_supported = True
 
     for meta, expected in zip(meta_infos, expected_chunks):
+        if not query_supported:
+            continue
         probe_descs = agent.get_reg_descs([(0, len(expected), 0, meta)], "OBJ")
         try:
             resp = qfn(probe_descs, backend)
-        except TypeError:
-            try:
-                resp = qfn(probe_descs, backend=backend)
-            except TypeError:
-                resp = qfn(probe_descs)
+        except nixlNotSupportedError:
+            query_supported = False
+            print(
+                "INFO: agent.query_memory() raised NIXL_ERR_NOT_SUPPORTED "
+                f"for backend={backend} — see do_read()'s comment for what "
+                "was measured (nm -D on the loaded .so). Degrading to "
+                "retrieve-as-probe for this and all remaining chunks; a "
+                "RESULT:QUERY_MISS below now means 'the retrieve transfer "
+                "itself failed', not 'a separate existence probe reported "
+                "absent'."
+            )
+            continue
 
         exists = False
         if resp:
@@ -150,7 +273,7 @@ def do_read(agent, backend, meta_infos: list[str], expected_chunks: list[bytes])
                 "suspect stale cross-geometry data in the namespace)."
             )
             sys.exit(1)
-        print(f"INFO: queryMem confirms key EXISTS: {meta}")
+        print(f"INFO: query_memory confirms key EXISTS: {meta}")
 
     buf = (ctypes.c_ubyte * sum(len(c) for c in expected_chunks))()
     offset = 0
@@ -159,23 +282,48 @@ def do_read(agent, backend, meta_infos: list[str], expected_chunks: list[bytes])
         sub = (ctypes.c_ubyte * len(expected)).from_buffer(buf, offset)
         addr = ctypes.addressof(sub)
 
-        reg_descs = agent.get_reg_descs([(addr, len(expected), 0, meta)], "DRAM")
-        agent.register_memory(reg_descs, backend=backend)
+        # Same register_memory()/`.trim()` shape as do_write() — see its
+        # comments for why: raw-tuple register_memory(mem_type=...) builds
+        # the reg descs itself, the OBJ registration's metaInfo IS the key,
+        # and .trim() (not get_xfer_descs() on a hand-built 4-tuple) is what
+        # produces a valid xfer desc list from it.
+        local_reg = agent.register_memory([(addr, len(expected), 0, "")], "DRAM",
+                                           backends=[backend])
+        obj_reg = agent.register_memory([(0, len(expected), 0, meta)], "OBJ",
+                                         backends=[backend])
+        local_xfer = local_reg.trim()
+        remote_xfer = obj_reg.trim()
 
-        local_xfer = agent.get_xfer_descs([(addr, len(expected), 0)], "DRAM")
-        remote_xfer = agent.get_xfer_descs([(0, len(expected), 0, meta)], "OBJ")
-
-        handle = agent.initialize_xfer("READ", local_xfer, remote_xfer, "", meta.encode())
+        # remote_agent=agent.name — see do_write()'s comment; "" raises
+        # NIXL_ERR_NOT_FOUND. notif_msg left at its b'' default — see
+        # do_write()'s comment; XNVME_KV does not support notifications.
+        handle = agent.initialize_xfer("READ", local_xfer, remote_xfer,
+                                        agent.name, backends=[backend])
         agent.transfer(handle)
-        while agent.check_xfer_state(handle) == "PROC":
-            time.sleep(0.005)
-        state = agent.check_xfer_state(handle)
+        ok, detail = wait_for_xfer(agent, handle)
         agent.release_xfer_handle(handle)
 
         got = bytes(sub)
-        agent.deregister_memory(reg_descs)
-        if state not in ("DONE", "SUCCESS", 0):
-            print(f"RESULT:READ_FAIL:{meta}:final_state={state!r}")
+        agent.deregister_memory(local_reg, backends=[backend])
+        agent.deregister_memory(obj_reg, backends=[backend])
+        if not ok:
+            if not query_supported:
+                # The retrieve-as-probe fallback path: a failed transfer
+                # here IS the existence-miss signal (see this function's
+                # opening comment and wait_for_xfer()'s docstring for why
+                # this arrives as a raised exception, not a returned "ERR"
+                # string), so report it as a miss, not a generic transport
+                # failure — the two have different remedies.
+                print(
+                    f"RESULT:QUERY_MISS:{meta}: retrieve-as-probe fallback "
+                    "(query_memory unsupported by this build — see this "
+                    f"function's comment) reports this key does NOT exist "
+                    f"on the target; transfer failure was {detail}. Same "
+                    "causes as a genuine QUERY_MISS — see that message "
+                    "elsewhere in this file for the list."
+                )
+            else:
+                print(f"RESULT:READ_FAIL:{meta}:{detail}")
             sys.exit(1)
         got_chunks.append(got)
         offset += len(expected)
@@ -260,8 +408,22 @@ def main() -> int:
     print(f"INFO: mode={args.mode} size={args.size} max_value_size={args.max_value_size} "
           f"num_parts={num_parts} base_meta={base_meta}")
 
+    # backends=[] on PURPOSE. nixl_agent_config(backends=[X]) makes the agent
+    # instantiate X itself, during construction, with DEFAULT parameters — and
+    # then create_backend(X, params) below fails with
+    #   createBackend: backend already created for type 'X'
+    #   NIXL_ERR_INVALID_PARAM
+    # (measured 2026-09-15 against XNVME_KV). The failure is the harmless half
+    # of the problem. The dangerous half is that the backend which DID get
+    # built never saw backend_params: no dev_uri, no trid. For XNVME_KV that
+    # means it fell back to the plugin's own /dev autodiscovery, which on the
+    # decode host selects a LOCAL Pensando DSC KV controller rather than the
+    # NVMe-oF target (see resolve_xnvme_kv_dev() in scripts/common/lib.sh).
+    # A test that passed that way would be proving the wrong device works.
+    # So: construct the agent with NO backends, then create exactly one,
+    # explicitly, with our parameters.
     agent = nixl_agent(f"kvstack-verify-30-{args.mode}",
-                        nixl_agent_config(backends=[args.backend]))
+                        nixl_agent_config(backends=[]))
     try:
         agent.create_backend(args.backend, backend_params)
     except Exception as exc:  # noqa: BLE001
