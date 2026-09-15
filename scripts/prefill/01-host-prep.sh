@@ -50,6 +50,16 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# amdgpu autoload override (see ensure_amdgpu_loaded() in lib.sh) — MUST run
+# before the ROCm/GPU verification below. This node boots with
+# modprobe.blacklist=amdgpu on its kernel cmdline (2026-09-14), which blocks
+# only AUTOload, not an explicit `modprobe amdgpu` by name — so this loads it
+# every run, and the rocminfo `die` right after this step is the fallback for
+# when that genuinely didn't work.
+# ─────────────────────────────────────────────────────────────────────────────
+ensure_amdgpu_loaded
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ROCm / GPU verification — hard gate, this node needs TP_SIZE working GPUs.
 # ─────────────────────────────────────────────────────────────────────────────
 step "ROCm / GPU verification (need >= TP_SIZE=${TP_SIZE} GPUs, arch ${ROCM_ARCH})"

@@ -304,6 +304,128 @@ setup_ucx_env() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# amdgpu autoload override — see docs/HANDOFF.md §2 and TODO 0.4.
+#
+# Both compute nodes boot with `modprobe.blacklist=amdgpu` on the kernel
+# command line. Measured 2026-09-14: that flag suppresses AUTOLOAD only —
+# alias/`-b` resolution, the path udev/hotplug use (`modprobe -n -v -b
+# amdgpu` does nothing) — it does NOT block an explicit `modprobe amdgpu` by
+# module name (`modprobe -n -v amdgpu` resolves the full 8-module chain and
+# exits 0). There is no `install amdgpu /bin/false`-style hard block anywhere
+# under /etc|/lib|/run/modprobe.d; the kernel cmdline is the only source.
+# Because the blacklist only stops AUTOload, this does NOT survive a reboot:
+# every boot, amdgpu comes back unloaded until something explicitly
+# modprobes it — which is exactly what this function does, every run.
+#
+# ensure_amdgpu_loaded — idempotent, safe to call twice in a row:
+#   - already loaded (lsmod)          -> ok, no-op.
+#   - not loaded, AMDGPU_AUTOLOAD=0    -> warn and return; the caller's own
+#     hard GPU gate (e.g. the rocminfo check in 01-host-prep.sh) is the
+#     fallback that actually fails the script if amdgpu stays unloaded.
+#   - not loaded, AMDGPU_AUTOLOAD=1 (default) -> modprobe amdgpu, then
+#     VERIFY THE RESULT rather than trusting modprobe's exit code (this
+#     repo's §7 invariants are all about not trusting a success code that
+#     didn't actually do the thing): /dev/kfd must exist AND rocminfo must
+#     report at least TP_SIZE gfx agents. `die` with a diagnostic otherwise.
+#
+# AMDGPU_AUTOLOAD defaults to 1 (override the blacklist) rather than 0,
+# because a compute node silently serving with zero usable GPUs is worse
+# than a LOGGED, defeatable override of what may be deliberate lab policy.
+# Set AMDGPU_AUTOLOAD=0 to keep that policy in force and require an operator
+# to run `modprobe amdgpu` by hand before host-prep will proceed.
+# ─────────────────────────────────────────────────────────────────────────────
+ensure_amdgpu_loaded() {
+    step "amdgpu kernel module"
+
+    # Capture lsmod's output into a variable FIRST, then grep a herestring —
+    # do NOT do `lsmod | grep -q ...` directly. amdgpu (most recently
+    # loaded) sorts near the TOP of lsmod's listing, so `grep -q` matches
+    # and closes its end of the pipe almost immediately; lsmod's next
+    # write() into the now-closed pipe then dies with SIGPIPE (exit 141),
+    # and under this file's `set -o pipefail`, THAT becomes the exit status
+    # of the whole `if lsmod | grep -q ...` test — a spurious "not loaded"
+    # even though it plainly is. Measured on this lab's compute nodes: this
+    # is not theoretical, it reproduces every time. Same species of bug as
+    # TODO 2.13's `rocminfo | grep` pipefail failure, opposite direction
+    # (there the FIRST command failed; here it's the SECOND command's early
+    # exit that kills the first). A herestring isn't a live pipe between
+    # two processes, so there is nothing left running to receive SIGPIPE.
+    local _lsmod_out
+    _lsmod_out="$(lsmod)"
+    if grep -q '^amdgpu ' <<<"${_lsmod_out}"; then
+        ok "amdgpu already loaded"
+        return 0
+    fi
+
+    local _bl_pattern='modprobe\.blacklist=([[:alnum:],_-]*,)?amdgpu([,[:space:]]|$)'
+    if grep -qE "${_bl_pattern}" /proc/cmdline 2>/dev/null; then
+        warn "amdgpu is NOT loaded, and modprobe.blacklist=amdgpu IS present" \
+             " on /proc/cmdline. That flag only suppresses AUTOLOAD" \
+             " (alias/'-b' resolution — what udev uses); it does NOT block" \
+             " an explicit 'modprobe amdgpu' by name (verified 2026-09-14:" \
+             " 'modprobe -n -v -b amdgpu' does nothing, 'modprobe -n -v" \
+             " amdgpu' resolves the full 8-module chain and exits 0). This" \
+             " host cannot serve as a GPU node with amdgpu unloaded, so" \
+             " this script overrides the blacklist by loading it" \
+             " explicitly — and because the blacklist itself is left" \
+             " untouched, this override must happen again after EVERY" \
+             " reboot; that is why it lives here, in host-prep, rather" \
+             " than as a one-time fix."
+    else
+        info "amdgpu is not loaded (no modprobe.blacklist=amdgpu on" \
+             " /proc/cmdline — looks like a plain first load, not a" \
+             " deliberate block)"
+    fi
+
+    if [ "${AMDGPU_AUTOLOAD:-1}" != "1" ]; then
+        warn "AMDGPU_AUTOLOAD=0 — refusing to modprobe amdgpu on this" \
+             " host's behalf. A boot-time blacklist may be deliberate lab" \
+             " policy, so the override above is opt-out, not forced: load" \
+             " it yourself ('modprobe amdgpu') and re-run, or unset" \
+             " AMDGPU_AUTOLOAD to let this script do it. Either way, this" \
+             " script will not silently serve with zero GPUs — whatever" \
+             " GPU verification step runs right after this one will" \
+             " hard-fail if amdgpu still isn't loaded."
+        return 0
+    fi
+
+    info "loading amdgpu (modprobe amdgpu)"
+    modprobe amdgpu 2>&1 | while IFS= read -r _mp_line; do log "  ${_mp_line}"; done || true
+
+    # Verify the RESULT, not modprobe's exit code — see the function comment.
+    local _gfx_count=0
+    if [ -e /dev/kfd ] && command -v rocminfo >/dev/null 2>&1; then
+        local _rocminfo_out
+        _rocminfo_out="$(rocminfo 2>/dev/null || true)"
+        _gfx_count="$(printf '%s\n' "${_rocminfo_out}" \
+            | grep -cE 'Name:[[:space:]]+gfx[0-9a-zA-Z]*' || true)"
+    fi
+
+    if [ -e /dev/kfd ] && [ "${_gfx_count}" -ge "${TP_SIZE}" ]; then
+        ok "amdgpu loaded: /dev/kfd present, rocminfo reports ${_gfx_count}" \
+           " gfx agent(s) (>= TP_SIZE=${TP_SIZE})"
+        return 0
+    fi
+
+    die "amdgpu still not usable after 'modprobe amdgpu'" \
+        " (/dev/kfd $([ -e /dev/kfd ] && echo present || echo ABSENT)," \
+        " rocminfo gfx agents=${_gfx_count}, need >= TP_SIZE=${TP_SIZE})." \
+        " Likely causes: (1) a HARD block — an 'install amdgpu /bin/false'" \
+        " style override under /etc/modprobe.d, /lib/modprobe.d or" \
+        " /run/modprobe.d (none were present on 2026-09-14, but re-check:" \
+        " grep -r amdgpu /etc/modprobe.d /lib/modprobe.d /run/modprobe.d);" \
+        " (2) the amdgpu DKMS module is missing/mismatched for THIS" \
+        " running kernel (dkms status | grep amdgpu; uname -r); (3) PCIe" \
+        " BARs not (re)assigned by firmware for these GPUs (dmesg for" \
+        " 'BAR ... no space' around the amdgpu probe — pci=realloc=off on" \
+        " this cmdline means the kernel will not fix that itself on its" \
+        " own); (4) the GPU's PCI device is bound to vfio-pci instead of" \
+        " amdgpu (lspci -k -d 1002:74a1, check 'Kernel driver in use')." \
+        " Check dmesg for the actual amdgpu probe failure first: dmesg |" \
+        " grep -i amdgpu | tail -50."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NIXL side channel (F2) — the out-of-band handshake letting the two vLLM
 # engines exchange memory descriptors BEFORE any RDMA happens. NOT the data
 # path itself (that's UCX over the fabric, setup_ucx_env above) — but it
