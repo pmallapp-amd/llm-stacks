@@ -81,8 +81,10 @@ with **zero usable GPUs still passes** — see blocker 1 below. Preflight means
 script has run anywhere yet. Treat the first invocation as bring-up, not a
 benchmark.
 
-One blocker from today is now **RESOLVED**; one remains and is now the top
-blocker:
+Two of the three items below are now **RESOLVED**; the RDMA fabric route
+remains open but is no longer the practical top blocker — a new one
+(a container-image gap) took that spot this session, described after the
+numbered list:
 
 1. ~~The GPUs are unusable~~ **RESOLVED 2026-09-14.** All 16 MI300X (8 per
    compute node) are now up on both nodes: `rocminfo` reports 10 agents each
@@ -112,15 +114,8 @@ blocker:
    ROCm is 7.13.0 / hsa-rocr 7.2.0. `rocminfo` still correctly identifies
    `gfx942` and vLLM uses ROCr, not libdrm device names — see TODO 4.6.
 
-Also new this session (2026-09-15), not yet folded into a numbered blocker
-above because each is an open decision rather than something broken: the
-lab's actual working deployment is containerised, not built from source
-(§10.1); a KV backend can only ever be an LMCache tier, never
-`NixlConnector`'s transport (§1, §10.3); and the compute nodes' kernel
-cannot yield a `/dev/ngXnY` device for a KV namespace at all (§10.4). See
-TODO §6 for the plan this drives.
-
-2. **The P→D fabric (leg A) has no route yet — now the top blocker.**
+2. **The P→D fabric (leg A) has no RDMA route yet — still open, but no
+   longer the practical top blocker (see below).**
    `smc1`'s data-plane addresses are `30.1.N.1/24`; `smc2`'s are
    `30.2.N.1/24` — different `/24`s, differing in the second octet — and
    `smc1` has no route to `smc2` at all (falls back to the management
@@ -128,7 +123,44 @@ TODO §6 for the plan this drives.
    `config/cluster.env` (§6); the `UCX_IB_ROCE_SUBNET_PREFIX_LEN=16`
    workaround would not bridge `30.1.x` to `30.2.x` either, since they differ
    inside the first 16 bits (TODO 3.6). Leg B (storage) is unaffected for
-   bring-up — see the measurement caveat added to §8.
+   bring-up — see the measurement caveat added to §8. This is a Phase 2/3
+   (RDMA acceptance) blocker, not a Phase 1 one — leg A works today over the
+   two nodes' shared management `/24` on TCP, which is what this session's
+   P/D attempt used (see the new blocker below).
+
+3. **RESOLVED, second session, 2026-09-15: the kernel could not yield a KV
+   namespace device node at all — this is now false, on the current
+   kernel.** The compute nodes were upgraded to **Ubuntu 24.04.5, kernel
+   6.8.0-139**. Re-running the exact CSI-1 test that failed on 5.15: where
+   5.15 logged `unknown csi 1 for nsid 1` and created **no** namespace
+   device node at all, 6.8 logs `nvme nvme1: block device for nsid 1 not
+   supported (csi 1)` and **does** create the generic char device (correctly,
+   no block device beside it — a KV namespace has no block semantics). This
+   is verbatim the string quoted in
+   `plugins/xnvme-kv/xnvme_kv_backend.h:244-251`. **That header's claim,
+   which the previous pass in this doc marked DISPROVEN, is therefore more
+   precisely KERNEL-DEPENDENT: false on 5.15, true on 6.8** — see the
+   corrected §6 entry, which is left in place rather than deleted, because
+   the correction of a correction is the useful record here.
+
+   With that gap closed, the storage backend decision (TODO 6.3) is now
+   **XNVME_KV over kernel `nvme-of`**, and it has been proven end-to-end
+   for the first time this session — see the new §6 Verified entry and
+   §10 for the full test. **The GPU blacklist requirement (blocker 1
+   above) is unaffected by this OS upgrade** — `modprobe.blacklist=amdgpu`
+   is still on the 24.04 cmdline, so `modprobe amdgpu` is still required
+   every boot on both nodes, confirmed again this session (TODO 0.4).
+
+**The new top blocker, this session: the container image on `smc1` cannot
+run P/D at all.** vLLM on ROCm imports the `rixl` package, not `nixl`
+(`vllm/distributed/nixl_utils.py`); the image used to launch P/D
+(`rocm-aic:latest`) has `nixl` but not `rixl`, so both engines died on
+startup. The two images that do have `rixl`
+(`kv-mppd`/`kv-mppd-assertfix`) exist only on `smc2` — moving one to `smc1`
+is now the single next action. Full detail and the launch parameters
+already worked out at **TODO 6.11**; composing the now-proven storage tier
+underneath that P/D deployment is **TODO 6.10**. These are the only two
+live items in TODO §6 — see §9 below.
 
 ---
 
@@ -267,42 +299,129 @@ when editing.
   namespace `KvMalloc0`, subsystem `nqn.2024-01.io.nixl:kv0`, listener on
   the management IP port 4420, `max_io_qpairs_per_ctrlr: 512` confirmed (§7
   invariant 7 holds). Also measured: `max_io_size: 131072` (128 KiB), **not**
-  the 16 MiB invariant 8 assumes — flagged, unresolved, see TODO 6.4.
-- **Kernel `nvme connect` against the KV namespace, 2026-09-15**: controller
-  attach succeeds (`/dev/nvme2`, correct `subsysnqn`, live state, "creating
-  128 I/O queues", `nvme list-ns` reports `[0]:0x1`, admin passthru works),
-  but **no namespace device node is created at all** — no
-  `/dev/nvme2n1` block device and no `/dev/ng2n1` char device — because the
-  kernel logs `unknown csi 1 for nsid 1` and has no fallback for a
-  Key-Value-command-set namespace. Same result for the local Pensando DSC KV
-  device (`nvme1`) — a kernel limitation, not a fabric one. Full detail and
-  its consequence for the plugin's own assumption at §10.4.
+  the 16 MiB invariant 8 assumes — reconciled, see the plugin-log detail
+  below and TODO 6.4. **Does not survive a reboot** — it had to be
+  restarted from scratch on a later reboot within this same session; this
+  is now part of the documented per-boot ritual (§9).
+- **Kernel `nvme connect` against the KV namespace, on `5.15.0-191-generic`,
+  2026-09-14**: controller attach succeeds (`/dev/nvme2`, correct
+  `subsysnqn`, live state, "creating 128 I/O queues", `nvme list-ns` reports
+  `[0]:0x1`, admin passthru works), but **no namespace device node is
+  created at all** — no `/dev/nvme2n1` block device and no `/dev/ng2n1`
+  char device — because the kernel logs `unknown csi 1 for nsid 1` and has
+  no fallback for a Key-Value-command-set namespace. Same result for the
+  local Pensando DSC KV device (`nvme1`) — a kernel limitation, not a
+  fabric one. **Superseded on 6.8 — see the corrected entry below and
+  §10.4.**
+- **The CSI-1 kernel gap is CLOSED on 6.8 — measured 2026-09-15, second
+  session, both compute nodes upgraded to Ubuntu 24.04.5 / kernel
+  6.8.0-139.** Re-ran the identical test: 6.8 logs `nvme nvme1: block
+  device for nsid 1 not supported (csi 1)` and **does** create the generic
+  char device (correctly, no block device beside it). This confirms the
+  plugin header's original claim
+  (`plugins/xnvme-kv/xnvme_kv_backend.h:244-251`) is **kernel-dependent**,
+  not simply wrong — see the corrected Assumed entry below, left in place
+  rather than deleted. With this closed, the KV-backend decision (TODO
+  6.3) is XNVME_KV over kernel `nvme-of`.
+- **The XNVME_KV storage path is PROVEN end-to-end over kernel `nvme-of`,
+  2026-09-15, second session — the session's headline result.**
+  Cross-process test on the prefill node, two separate `docker run`
+  invocations so the reader process never saw the writer's memory:
+  process 1 stored three 32 KiB parts (98304 bytes, multipart split
+  exercised), process 2 independently derived the same keys and retrieved
+  identical bytes. `RESULT:OK` both phases, reproducible. Negative control
+  verified: a nonce never written returns `RESULT:QUERY_MISS` and exit 1,
+  not a false pass. Plugin startup line observed: `device KV format 0:
+  value_max=131072 key_max=16 novg=4096 (compiled-in default 32768)` — this
+  is the real per-value ceiling (32768 bytes), distinct from the
+  transport's `max_io_size` (131072) and from invariant 8's assumed 16 MiB
+  — see TODO 6.4.
+- **The KV device must be resolved by subsystem NQN, not by path** —
+  measured 2026-09-15, second session. The kernel numbers controllers in
+  attach order, so the same target is `/dev/ng1n1` on prefill but
+  `/dev/ng2n1` on decode — a shared creds file cannot carry one correct
+  literal. Worse: decode also has a **local** Pensando DSC KV controller
+  (PCIe `0000:36:00.0`, `nqn.2019-08.com.pensando:nvm-subsystem-sn-8001-0-0`)
+  presenting a char-only `/dev/ng1n1`; the plugin's own
+  `discover_kv_device()` picks the **lowest** such node, so autodiscovery
+  on decode silently selects the local DSC — a real, writable KV device,
+  and entirely the wrong one, with nothing downstream reporting it.
+  `resolve_xnvme_kv_dev()` now matches on `NVMF_SUBNQN` and dies on
+  ambiguity instead. Verified live: prefill → `/dev/ng1n1`, decode →
+  `/dev/ng2n1`, correctly skipping the Pensando node.
+- **The container's XNVME_KV plugin is a stale artifact**, measured
+  2026-09-15: `query_memory()` returns `NIXL_ERR_NOT_SUPPORTED`, and `nm -D`
+  on `/opt/nixl/.../libplugin_XNVME_KV.so` shows only the weak base-class
+  `queryMem` symbol — the prebuilt `.so` predates the `queryMem` override
+  that exists in this repo's `plugins/xnvme-kv` source. Not an
+  architectural limit — the roundtrip above degrades to retrieve-as-probe
+  with a visible INFO line. Recorded as a known limitation (TODO 6.10).
+- **The `kv_transfer_params` field name question is settled: there isn't
+  one.** Measured 2026-09-15 against vLLM's actual vendored
+  `disagg_proxy_demo.py`: the proxy sends the request to prefill with
+  `max_tokens=1`, then sends the original request to decode; KV moves
+  out-of-band over the NixlConnector side channel. There is no
+  `kv_transfer_params` in the body at all. `PD_HANDOFF_FIELD` is therefore
+  **unused** on this proxy — not wrong, just moot. Proxy facts for next
+  session: runs in the same image, `--network host`, args `--model
+  --prefill HOST:PORT --decode HOST:PORT --port`, health endpoint
+  `/status` (not `/health`), endpoint discovery is static CLI args. Lives
+  at `/root/rixl-bench/bench/pd-disaggregation/disagg_proxy_demo.py`.
+- **The NIXL Python API surface, reconciled against the real bindings**,
+  2026-09-15 — the verify scripts' inferred version was wrong on several
+  points: `register_memory` takes `backends` as a **list**, not `backend`;
+  OBJ transfer descriptors must come from `register_memory(...).trim()` — a
+  4-tuple to `get_xfer_descs` is rejected ("3-tuple list needed for
+  transfer") and returns `None`; `remote_agent` must be the agent's own
+  name for a local storage transfer, not `""`; `notif_msg` must stay empty
+  because XNVME_KV does not support notifications;
+  `nixl_agent_config(backends=[X])` auto-instantiates `X` with **default**
+  params, so a later `create_backend(X, params)` fails "already created"
+  **and** the params (`dev_uri`) never apply — for XNVME_KV this means
+  silent fallback to the wrong-device autodiscovery described above. Two
+  checks in the verify scripts were incapable of failing and are now fixed:
+  `create_backend()` had no return statement (always `None`, success or
+  failure), and `check_xfer_state()`'s `"ERR"` branch was dead because the
+  binding raises a typed exception instead.
 
 ### Assumed — reconcile on first contact with hardware
 
 - **`plugins/xnvme-kv/xnvme_kv_backend.h:244-251`'s claim that a KV
   namespace always appears as `/dev/ngXnY` with no matching
   `/dev/nvmeXnY`, "Verified both ways on the Austin prefill node
-  2026-09-10" — DISPROVEN on these hosts, 2026-09-15.** Measured: the
-  kernel logs `unknown csi 1 for nsid 1` and creates **neither** device node
-  for a KV namespace on `5.15.0-191-generic` (both compute nodes) — not the
-  block device, and not the char device either. The plugin's own
-  `discover_kv_device()` heuristic therefore finds nothing on these hosts.
-  The 2026-09-10 verification must have run on a different kernel — the
-  **target** node here runs `6.8.0-38-generic` while both **compute** nodes
-  run `5.15.0-191-generic`. See §10.4. Remedy is the paused kernel-upgrade
-  sub-plan at TODO 6.5–6.8, itself unverified to actually fix this.
+  2026-09-10" — DISPROVEN on these hosts, 2026-09-15 [first session].**
+  Measured: the kernel logs `unknown csi 1 for nsid 1` and creates
+  **neither** device node for a KV namespace on `5.15.0-191-generic` (both
+  compute nodes) — not the block device, and not the char device either.
+  The plugin's own `discover_kv_device()` heuristic therefore finds nothing
+  on these hosts. The 2026-09-10 verification must have run on a different
+  kernel — the **target** node here runs `6.8.0-38-generic` while both
+  **compute** nodes run `5.15.0-191-generic`. See §10.4. Remedy was the
+  paused kernel-upgrade sub-plan at TODO 6.5–6.8, itself unverified to
+  actually fix this.
+
+  > **Correction, second session, same day, 2026-09-15: the finding above
+  > was real but incomplete — "DISPROVEN" is not quite the right word.**
+  > The compute nodes were upgraded to Ubuntu 24.04.5 / kernel 6.8.0-139,
+  > and the identical test was re-run: 6.8 logs `nvme nvme1: block device
+  > for nsid 1 not supported (csi 1)` and **does** create the generic char
+  > device, with no block device beside it. So the plugin header's claim is
+  > **KERNEL-DEPENDENT**: false on 5.15, **true** on 6.8. Neither this
+  > entry's original finding nor the header's original claim was wrong in
+  > isolation — they were each true of a different kernel. Left in place
+  > rather than deleted, because the correction of a correction is the
+  > useful record. Now tracked as Verified above and at TODO 6.3/6.8, not
+  > as an open assumption.
 - **LMCache YAML key names and the allowlist patch sites.** Derived against
   v0.5.4, validated only against a mock. `apply-patches.sh` fails loudly if it
   finds zero allowlist sites, because that means the assumption is stale.
-- **The `kv_transfer_params` field name** the proxy threads from prefill to
-  decode. Could not be confirmed against an installed vLLM; made configurable
-  via `PD_HANDOFF_FIELD` rather than guessed silently.
-- **The NIXL Python API surface** used by the verify scripts — partially
-  grounded, partially inferred. Failures surface as `AttributeError`, not as
-  silent passes.
 - **All benchmark numbers** in `BENCHMARKING.md` are order-of-magnitude
   estimates, labelled as such.
+
+Two items formerly here are now **settled, moved to Verified above**: the
+`kv_transfer_params` field name (this proxy doesn't thread one at all —
+`PD_HANDOFF_FIELD` is unused, see above) and the NIXL Python API surface
+(reconciled against the real bindings, see above).
 
 ---
 
@@ -403,6 +522,46 @@ other directly today.
 
 ## 9. How to resume
 
+### The two live items — read this first, nothing else in §6 is more urgent
+
+Everything that used to gate §6 (deployment model, kernel/CSI-1, KV backend
+choice) is now decided, resolved, or proven — see §6/§10 above. **Exactly
+two actionable items remain:**
+
+- **(A) [TODO 6.11](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier) —
+  get P/D + proxy actually serving.** Move a `rixl`-capable image
+  (`kv-mppd-assertfix` or `kv-mppd`, currently only on `smc2`) onto `smc1`,
+  relaunch prefill+decode with the parameters already worked out this
+  session, confirm both answer `/health`, confirm the side channel binds
+  the routable IP (`ss -ltn | grep 5600`), then start `disagg_proxy_demo.py`
+  and confirm `/status` plus a completion through it.
+- **(B) [TODO 6.10](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier) —
+  compose the storage tier under P/D.** `MultiConnector[NixlConnector,
+  LMCacheMPConnector]` with LMCache's `nixl_backend = XNVME_KV` and
+  `dev_uri` from `resolve_xnvme_kv_dev()`. New integration — prove both legs
+  independently, with a cross-instance or post-eviction reuse number so
+  vLLM's own prefix cache can't fake the result (§8). Blocked by (A).
+
+Everything else in TODO §6 is done or explicitly parked behind these two —
+see each item's status there.
+
+### The per-boot ritual — none of this survives a reboot
+
+Confirmed again this session (both after the amdgpu recurrence and after
+the OS upgrade): **none** of the following persist across a reboot of
+either compute node or the target, and all three are prerequisites before
+resuming either live item above:
+
+1. `modprobe amdgpu` on both compute nodes (`modprobe.blacklist=amdgpu` is
+   still on the 24.04 cmdline; `01-host-prep.sh` does this automatically,
+   opt-out `AMDGPU_AUTOLOAD=0` — TODO 0.4).
+2. Restart the KV target from `/root/kv_spdk` (it does not survive a
+   reboot either — this session had to redo it).
+3. Re-run `nvme connect` on both compute nodes (no `--persistent` flag, no
+   systemd unit — TODO 6.9).
+
+### Standing resume steps (unchanged in substance since first hardware contact)
+
 1. `scripts/common/deploy.sh` to push the repo (and creds) onto each node —
    none of the three has a shared filesystem, NFS, or the repo already on it;
    this has to run before anything else can. SSH key auth is **not**
@@ -414,22 +573,22 @@ other directly today.
    2026-09-14 — TODO 2.1.)*
 3. Work [TODO.md §2](TODO.md) — hardware bring-up. The architecture correction
    (§1) is complete; the GPU blocker is resolved (TODO 0.4, both nodes up via
-   `modprobe amdgpu`, redone automatically by host-prep every run); the
-   single biggest open blocker is now the P→D fabric having no route (TODO
-   3.6).
+   `modprobe amdgpu`, redone automatically by host-prep every run); the P→D
+   **RDMA** fabric still has no route (TODO 3.6) but this is a Phase 2/3
+   acceptance concern, not what's blocking the two live items above, which
+   run on TCP over the shared management `/24`.
 4. Follow [BRINGUP.md](BRINGUP.md).
-5. Before touching the storage tier specifically, read §10 below and
-   [TODO.md §6](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier)
-   in full, and make the 6.1/6.2/6.3 decisions (deployment model, SPDK build
-   route, KV backend) before doing anything else in that section — none of
-   §6's later items mean much until those are settled.
+5. For the storage tier specifically, §6.1–6.3's decisions are now made
+   (container path, XNVME_KV, kernel `nvme-of`) — go straight to 6.11 then
+   6.10, per the section above.
 
-The first things likely to bite, in order: the P→D fabric having no route
-(3.6); the LMCache allowlist patch against whatever version actually
-installs; and the `kv_transfer_params` field name. (The amdgpu blacklist,
-formerly first on this list, is resolved — TODO 0.4 — but remember it must be
-redone after every reboot of either compute node, and this session confirmed
-that recurrence in practice, not just in theory.)
+The first things likely to bite, in order: the container-image `rixl` gap
+(6.11, above); the LMCache allowlist patch against whatever version actually
+installs (2.7); and, once P/D is up, reconciling XNVME_KV's real 32768-byte
+value ceiling against the config (6.4/6.13, folded into 6.10). The amdgpu
+blacklist and the P→D RDMA route are both known, both still require the
+same manual steps as before — see the per-boot ritual and TODO 3.6
+respectively.
 
 ---
 
@@ -460,8 +619,14 @@ nodes:
 
 This makes the entire from-source build chain redundant for bring-up as
 measured today. Whether the repo adopts the container path, keeps the
-from-source path, or supports both is an **open decision with tradeoffs, not
-made here** — see TODO 6.1.
+from-source path, or supports both was an open decision with tradeoffs, not
+made here.
+
+> **Decided, second session, 2026-09-15: the container path.** Not by
+> declaration — by what actually moved this session: the target came up
+> from a prebuilt binary, leg B was proven from a container, and the P/D
+> launch attempt ran entirely from `rocm-aic` images (§10.4, TODO 6.1/6.11).
+> The from-source path is deprioritized, not abandoned — see TODO 6.2.
 
 ### 10.2 Reference deployment tooling: `/root/rixl-bench`
 
@@ -519,8 +684,14 @@ XNVME_KV/SPDK_NVMe_KV) — exactly this repo's leg-B design, composed via
 The consequence: the lab has run (a) NixlConnector P/D over UCX and (b) raw
 KV backends via `nixlbench` — but has **never** run (c) a KV backend as an
 LMCache tier underneath a live P/D deployment. That combination is **new
-integration**, not reproduction of a proven setup. Planned as such at
-TODO §6, with the unknowns named there.
+integration**, not reproduction of a proven setup.
+
+**Status, second session, 2026-09-15:** (b) is now proven for XNVME_KV
+specifically (see the new §6 Verified entry and §10.4/§10.5 below) — but
+(c), the composition itself, is still unrun and remains **TODO 6.10**, one
+of the two live items in this handoff. (a) also remains unproven on this
+hardware — the current blocker is a container-image gap, **TODO 6.11**, the
+other live item.
 
 ### 10.4 Kernel blocker for the XNVME_KV path — measured, definitive
 
@@ -564,6 +735,22 @@ only for 5.15.x), staged single-node reboots, and re-handling
 amdgpu DKMS 6.16.13/6.18.4 work on 6.8. Nothing was installed this session —
 the installer script never transferred to either node.
 
+> **Resolved, second session, same day, 2026-09-15 — but by a different
+> route than planned above.** The compute nodes were upgraded wholesale to
+> **Ubuntu 24.04.5 / kernel 6.8.0-139** (not the in-place HWE kernel
+> package this remedy path describes) — same practical outcome, different
+> mechanism, recorded so the discrepancy is visible (see TODO 6.5–6.7 for
+> the corrected status of each planned step). amdgpu DKMS is confirmed
+> built for 6.8.0-139 on both nodes post-upgrade (TODO 6.6). Re-running the
+> exact CSI-1 test above on 6.8: the kernel now logs `nvme nvme1: block
+> device for nsid 1 not supported (csi 1)` and **does** create the generic
+> char device (no block device beside it, as expected). **This closes the
+> CSI-1 gap** — TODO 6.8's re-test, passed. The plugin header's claim at
+> `xnvme_kv_backend.h:244-251` is therefore not simply disproven, it is
+> **kernel-dependent**: false on 5.15, true on 6.8 — see the corrected §6
+> entry. With the path open, XNVME_KV was then proven end-to-end — see
+> §10.5 below and TODO 6.12.
+
 ### 10.5 Also this session
 
 - **`nvme connect` does not persist across reboot** (no `--persistent` flag,
@@ -580,3 +767,64 @@ the installer script never transferred to either node.
   layers, 64 heads, 8 kv_heads, hidden 8192, bfloat16), intended as the
   container's `/hf` bind-mount. The hub-cache copy is now redundant
   (~136 GB/node); `smc2` is down to ~118 GB free. TODO 6.17.
+
+### 10.6 Second session, same day (2026-09-15): the OS upgrade, the leg-B proof, and the new P/D blocker
+
+Everything in this subsection was measured on live hardware after the
+24.04.5/6.8.0-139 upgrade described in §10.4's correction.
+
+- **Everything survived the OS upgrade.** Verified present: model weights at
+  `/var/tmp/hf/Qwen2.5-72B-Instruct` (37/37 shards, 136 GB), all `rocm-aic`
+  docker images, `/root/kv-cache`, `/root/rixl-bench`, nvme-cli 2.8, 8
+  `ionic` RDMA devices per node, ROCm 7.13.0. amdgpu DKMS is now built for
+  6.8.0-139 on both nodes (previously 5.15-only).
+- **GPUs work on 6.8, but the blacklist requirement is unchanged.**
+  `modprobe.blacklist=amdgpu` is still on the 24.04 cmdline, so GPUs still
+  do not autoload. One `modprobe amdgpu` per node brought up 8× gfx942, 192
+  GiB VRAM each (206141652992 bytes), zero dmesg errors, on both hosts. TODO
+  0.4's every-boot requirement is unchanged by the upgrade.
+- **The KV target runs from the prebuilt `/root/kv_spdk`.** Restarted
+  cleanly after the reboot: `nqn.2024-01.io.nixl:kv0` on the management IP:
+  4420, bdev `KvMalloc0`, `max_io_qpairs_per_ctrlr: 512` confirmed,
+  `max_io_size: 131072` (still not the 16 MiB invariant 8 assumes — TODO
+  6.4). Does **not** survive a reboot; it had to be restarted this session.
+- **The XNVME_KV storage path is proven end-to-end over kernel `nvme-of`**
+  — see the new §6 Verified entry for the full test; this is leg B working
+  for the first time.
+- **The KV device must be resolved by subsystem NQN, not by path** — see
+  the new §6 Verified entry; `resolve_xnvme_kv_dev()` now does this,
+  verified live on both roles.
+- **The NIXL Python API used by the verify scripts was inferred and wrong;
+  reconciled against the real one** — see the new §6 Verified entry for the
+  full list of corrections (backends-as-list, `.trim()`, `remote_agent`,
+  `notif_msg`, the `nixl_agent_config` pre-instantiation gotcha, and two
+  checks that were incapable of failing).
+- **The container's XNVME_KV plugin is a stale artifact** —
+  `query_memory()` returns `NIXL_ERR_NOT_SUPPORTED`; the prebuilt `.so`
+  predates the `queryMem` override in this repo's plugin source. Known
+  limitation, not architectural — see the new §6 Verified entry.
+- **The current blocker: vLLM on ROCm imports `rixl`, not `nixl`.**
+  P/D was launched with `rocm-aic:latest`, which has `nixl` but not `rixl`,
+  so every worker died with `Worker failed with error 'NIXL is not
+  available'` and both engines exited 1. Surveyed all six `rocm-aic`
+  images (all six carry the same plugin set — AIS_MT, POSIX, SPDK_NVMe_KV,
+  UCX, XNVME_KV): `kv-mppd-assertfix` and `kv-mppd` have `rixl`; `mp-pd`,
+  `pr4467`, `kv-planefix`, and `latest` do not. The two `rixl`-capable
+  images exist **only on `smc2` (decode)** — `smc1` (prefill) has none of
+  them. Both roles must run the same image, so it must be moved to `smc1`
+  (`docker save | ssh | docker load`, or a registry) before P/D can start.
+  This is **TODO 6.11**, the first of the two live items.
+- **The proxy does not thread a handoff field.** vLLM's vendored
+  `disagg_proxy_demo.py` sends the request to prefill with `max_tokens=1`,
+  then sends the original request to decode; KV moves out-of-band over the
+  NixlConnector side channel. This settles the `PD_HANDOFF_FIELD`
+  assumption — see the new §6 Verified entry.
+- **P/D launch parameters already worked out** — the containers started
+  and loaded weights before dying on the `rixl` import, so these are
+  confirmed as far as they got; full list at TODO 6.11, so next session
+  does not re-derive them.
+- **Housekeeping done**: 135 GB reclaimed per node by deleting the
+  redundant `Qwen2.5-72B-Instruct` hub-cache copy (weights now solely at
+  `/var/tmp/hf`, verified 37/37 shards and 145.4 GB matching the index).
+  `smc1` now 336 GB free, `smc2` 253 GB. Qwen3-8B and TinyLlama left
+  intact. TODO 6.17.
