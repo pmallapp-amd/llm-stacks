@@ -97,15 +97,37 @@ if [ -d "${ROCM_PATH}" ]; then
     [ -r "${ROCM_PATH}/.info/version" ] && _rocm_ver="$(cat "${ROCM_PATH}/.info/version")"
     log "ROCm found at ${ROCM_PATH}, version: ${_rocm_ver}"
     if command -v rocm-smi >/dev/null 2>&1; then
-        _gpu_count="$(rocm-smi --showid 2>/dev/null | grep -cE '^GPU\[[0-9]+\]' || true)"
+        # Count DISTINCT GPU indices, not matching lines. `rocm-smi --showid`
+        # prints SIX lines per GPU (Device Name, Device ID, Device Rev,
+        # Subsystem ID, GUID, ...), each prefixed "GPU[n]", so a plain `grep -c`
+        # reports 6x the true count — measured 2026-09-14 on smc1: 48 lines for
+        # 8 physical MI300X. That inflated number still satisfied
+        # `[ 48 -ge 8 ]`, so the check PASSED while reporting a fabricated
+        # figure, and would have kept passing with only 8 GPUs present even if
+        # TP_SIZE were raised to 16 or 32. A check that cannot fail for the
+        # reason it exists is worse than no check — see §7 in docs/HANDOFF.md.
+        # Cross-checked against `rocminfo`, which independently reports 8
+        # gfx942 agents.
+        _gpu_count="$(rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | sort -u | wc -l || true)"
         log "rocm-smi reports ${_gpu_count} GPU(s)"
-        check_soft "8 GPUs visible to rocm-smi (TP_SIZE=${TP_SIZE})" \
+        check_soft "${TP_SIZE} GPUs visible to rocm-smi (TP_SIZE=${TP_SIZE})" \
             bash -c "[ ${_gpu_count} -ge ${TP_SIZE} ]"
     else
         warn "ROCm present but rocm-smi not on PATH"
     fi
     if command -v rocminfo >/dev/null 2>&1; then
-        _gfx="$(rocminfo 2>/dev/null | grep -o 'gfx[0-9a-zA-Z]*' | sort -u | tr '\n' ' ')"
+        if ! _rocminfo_out="$(rocminfo 2>/dev/null)"; then
+            warn "rocminfo present but FAILED (amdgpu driver not loaded) —" \
+                 " check /proc/cmdline for 'modprobe.blacklist=amdgpu' and" \
+                 " whether /dev/kfd exists. REMEDY: 'modprobe amdgpu' (that" \
+                 " flag only blocks AUTOload, not an explicit modprobe by" \
+                 " name — no reboot or GRUB edit needed); 01-host-prep.sh" \
+                 " now does this automatically via ensure_amdgpu_loaded()." \
+                 " This script stays read-only/advisory and does not load" \
+                 " the module itself."
+            _rocminfo_out=""
+        fi
+        _gfx="$(echo "${_rocminfo_out}" | grep -o 'gfx[0-9a-zA-Z]*' | sort -u | tr '\n' ' ' || true)"
         log "rocminfo gfx targets: ${_gfx:-<none found>}"
         check_soft "expected arch ${ROCM_ARCH} present in rocminfo" \
             bash -c "echo '${_gfx}' | grep -q '${ROCM_ARCH}'"
@@ -146,7 +168,7 @@ for _ifpath in /sys/class/net/*; do
     fi
     _driver="unknown"
     if command -v ethtool >/dev/null 2>&1; then
-        _driver="$(ethtool -i "${_if}" 2>/dev/null | awk -F': ' '/^driver:/{print $2}')"
+        _driver="$(ethtool -i "${_if}" 2>/dev/null | awk -F': ' '/^driver:/{print $2}' || true)"
     fi
     log "  ${_if}: mtu=${_mtu} speed=${_speed} driver=${_driver:-unknown}"
 done

@@ -159,7 +159,7 @@ for _if in "${_if_prefill}" "${_if_decode}"; do
     _mtu="$(cat "/sys/class/net/${_if}/mtu" 2>/dev/null || echo '?')"
     _speed="unknown"
     [ -r "/sys/class/net/${_if}/speed" ] && _speed="$(cat "/sys/class/net/${_if}/speed" 2>/dev/null)Mb/s"
-    _driver="$(ethtool -i "${_if}" 2>/dev/null | awk -F': ' '/^driver:/{print $2}')"
+    _driver="$(ethtool -i "${_if}" 2>/dev/null | awk -F': ' '/^driver:/{print $2}' || true)"
     log "  ${_if}: mtu=${_mtu} speed=${_speed} driver=${_driver:-unknown}"
     if [ "${_mtu}" != "9000" ] && [ "${_mtu}" != "?" ]; then
         # NOT applied automatically: this is the interface an existing SSH

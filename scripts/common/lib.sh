@@ -456,7 +456,7 @@ setup_pd_env() {
 
     local host="${host_override}"
     if [ -z "${host}" ]; then
-        host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        host="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     fi
 
     case "${host}" in

@@ -70,7 +70,13 @@ log "rocm-smi reports ${_gpu_count} GPU(s)"
     || die "only ${_gpu_count} GPUs visible, need >= TP_SIZE=${TP_SIZE}." \
            " vLLM's tensor-parallel launch will hang or crash trying to" \
            " shard across GPUs that don't exist; fix this before continuing."
-_gfx="$(rocminfo 2>/dev/null | grep -o 'gfx[0-9a-zA-Z]*' | sort -u | tr '\n' ' ')"
+if ! _rocminfo_out="$(rocminfo 2>/dev/null)"; then
+    die "rocminfo FAILED — amdgpu driver not loaded on this GPU node." \
+        " 01-host-prep.sh cannot verify arch or GPU count without it." \
+        " Check /proc/cmdline for 'modprobe.blacklist=amdgpu' and" \
+        " /dev/kfd presence."
+fi
+_gfx="$(echo "${_rocminfo_out}" | grep -o 'gfx[0-9a-zA-Z]*' | sort -u | tr '\n' ' ')"
 log "rocminfo gfx targets: ${_gfx}"
 echo "${_gfx}" | grep -q "${ROCM_ARCH}" \
     || die "expected arch ${ROCM_ARCH} not found in rocminfo output (${_gfx})." \
@@ -112,7 +118,7 @@ for _if in "${_if_storage}" "${_if_compute}"; do
     _mtu="$(cat "/sys/class/net/${_if}/mtu" 2>/dev/null || echo '?')"
     _speed="unknown"
     [ -r "/sys/class/net/${_if}/speed" ] && _speed="$(cat "/sys/class/net/${_if}/speed" 2>/dev/null)Mb/s"
-    _driver="$(ethtool -i "${_if}" 2>/dev/null | awk -F': ' '/^driver:/{print $2}')"
+    _driver="$(ethtool -i "${_if}" 2>/dev/null | awk -F': ' '/^driver:/{print $2}' || true)"
     log "  ${_if}: mtu=${_mtu} speed=${_speed} driver=${_driver:-unknown}"
 done
 if [ -z "${PREFILL_DATA_IF}" ]; then
