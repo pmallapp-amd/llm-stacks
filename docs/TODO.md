@@ -228,9 +228,12 @@ rework.
       **Superseded 2026-09-15 by 6.11** (bring-up) and **6.10** (proving a
       direct NIXL transfer distinct from an LMCache hit) — the live items now
       carry this work against the container path. The
-      `kv_transfer_params`/`PD_HANDOFF_FIELD` half is **settled and needs no
-      action**: the vendored `disagg_proxy_demo.py` threads no handoff field at
-      all, so `PD_HANDOFF_FIELD` is unused on this proxy (HANDOFF §6).
+      `kv_transfer_params`/`PD_HANDOFF_FIELD` half is **NOT settled** — an
+      earlier note here claimed it was "unused and moot" because the vendored
+      proxy threads no handoff field. Measured since: that absence is exactly
+      why **no KV transfers** (6.11). The field names something the proxy is
+      missing, not something the design does without. See HANDOFF §6's
+      correction block.
 - [ ] **2.11** Fix `00-preflight.sh`'s PCIe inventory section — it greps
       `lspci -d 1dd8:` and its header claims that covers "GPUs + data-plane
       NICs". Measured 2026-09-14: it covers **zero** GPUs, because the MI300X
@@ -606,9 +609,20 @@ otherwise.*
 
       Critically, the two `rixl`-capable images exist **only on `smc2`
       (decode)**. `smc1` (prefill) has `latest`/`mp-pd`/`pr4467`/
-      `kv-planefix` — none of them. Both roles must run the **same** image,
-      so a `rixl`-capable image must be moved to `smc1` first (`docker save
-      | ssh | docker load`, or a registry) before P/D can start at all.
+      `kv-planefix` — none of them.
+
+      > **RESOLVED 2026-09-15, session 3 — no image move needed.** The
+      > `rixl` requirement is gone. vLLM was asking the wrong question:
+      > it picked the package from the platform rather than from what is
+      > installed, and the `rocm-aic` `nixl` build *is* the ROCm-patched
+      > one. `scripts/common/patch-vllm-nixl-pkg.sh` rewrites both
+      > selection sites to probe for the installed package, and is applied
+      > by bind-mounting the patched `nixl_utils.py` over vLLM's own at
+      > launch. Verified on both nodes with `rocm-aic:latest`: resolved
+      > package `nixl`, `is_nixl_available` True, `NIXL is available` in
+      > the engine log. **Both roles now start, reach `/health` 200, and
+      > report 3,754,160-token GPU KV caches.** The remaining work in this
+      > item is no longer bring-up — see the KV-transfer gap below.
 
       **Once the image is on both nodes, relaunch with the parameters
       already worked out this session** (the containers started and loaded
@@ -633,19 +647,44 @@ otherwise.*
       `enable_prefix_caching=True` before the `rixl` failure — this matters
       for 6.10/6.15's measurement trap.
 
-      **Then:** confirm both roles answer `/health`; confirm the side
-      channel binds the **routable** IP, not loopback (`ss -ltn | grep
-      5600`); start the proxy, `disagg_proxy_demo.py` (lives at
-      `/root/rixl-bench/bench/pd-disaggregation/disagg_proxy_demo.py`, runs
-      in the same image, `--network host`, args `--model --prefill
-      HOST:PORT --decode HOST:PORT --port`), confirm its `/status` (**not**
-      `/health`) endpoint, then confirm a completion through it end-to-end.
-      Note: `disagg_proxy_demo.py` does **not** thread a
-      `kv_transfer_params` field — it sends `max_tokens=1` to prefill then
-      the original request to decode, KV moves out-of-band over the
-      NixlConnector side channel (see 6.14 — this settles
-      `PD_HANDOFF_FIELD` as unused here). Endpoint discovery is static CLI
-      args, no registry.
+      **Bring-up is DONE (2026-09-15, session 3).** Both roles answer
+      `/health` 200. Side channels bind the routable IPs, verified with
+      `ss -ltn`: `10.30.x.x:5600` on prefill, `:5601` on decode — not
+      loopback. The proxy (`disagg_proxy_demo.py`, same image,
+      `--network host`, args `--model --prefill HOST:PORT --decode
+      HOST:PORT --port`) comes up, `/status` lists both nodes, and a
+      completion through it returns coherent text with
+      `finish_reason: stop` in ~3 s.
+
+      **What remains is the actual point of the exercise: NO KV IS
+      TRANSFERRING.** The pipeline serves correctly while doing no
+      disaggregation at all — precisely the silent failure §7's invariants
+      exist to catch, and it passes every check that only looks at HTTP.
+      Measured with a 4000-token prompt through the proxy:
+
+      | engine | avg prompt throughput | external prefix cache hit rate |
+      |---|---|---|
+      | prefill | 400.0 tokens/s | 0.0% |
+      | decode  | **400.0 tokens/s** | 0.0% |
+
+      Decode re-prefilled the whole prompt. Both engines did identical
+      prefill work; nothing crossed the side channel, and no established
+      TCP connection between the two hosts appears in `ss -tn` either.
+
+      **Root cause to fix:** the vendored `disagg_proxy_demo.py` threads no
+      handoff metadata — it sends `max_tokens=1` to prefill, then the
+      original request to decode, and never passes the producer's
+      `kv_transfer_params` along. NixlConnector's consumer needs that to
+      know there is anything to pull. An earlier note in this file called
+      that absence "settled and unused"; it is neither. Either use a proxy
+      that implements the NixlConnector XpYd protocol, or add the field
+      (`PD_HANDOFF_FIELD` exists for exactly this) to this one. Endpoint
+      discovery is static CLI args, no registry.
+
+      **Do not accept a completion as proof.** The only acceptable
+      evidence is decode's prompt throughput collapsing toward zero on a
+      long prompt while prefill's does not, and/or a non-zero
+      `External prefix cache hit rate` on decode.
 
       **Watch for:** "stream ended without a finish reason" from the proxy
       means a vLLM 400 dressed up as a 200 SSE stream — read the **vLLM

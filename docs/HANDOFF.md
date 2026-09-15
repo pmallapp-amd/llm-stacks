@@ -356,17 +356,27 @@ when editing.
   that exists in this repo's `plugins/xnvme-kv` source. Not an
   architectural limit — the roundtrip above degrades to retrieve-as-probe
   with a visible INFO line. Recorded as a known limitation (TODO 6.10).
-- **The `kv_transfer_params` field name question is settled: there isn't
-  one.** Measured 2026-09-15 against vLLM's actual vendored
-  `disagg_proxy_demo.py`: the proxy sends the request to prefill with
-  `max_tokens=1`, then sends the original request to decode; KV moves
-  out-of-band over the NixlConnector side channel. There is no
-  `kv_transfer_params` in the body at all. `PD_HANDOFF_FIELD` is therefore
-  **unused** on this proxy — not wrong, just moot. Proxy facts for next
-  session: runs in the same image, `--network host`, args `--model
+- **The vendored `disagg_proxy_demo.py` sends no handoff field — and that
+  is a DEFECT, not a design.** Read from the source 2026-09-15: the proxy
+  sends the request to prefill with `max_tokens=1`, then sends the
+  original request to decode, and nothing carries `kv_transfer_params`.
+  Proxy facts: runs in the same image, `--network host`, args `--model
   --prefill HOST:PORT --decode HOST:PORT --port`, health endpoint
   `/status` (not `/health`), endpoint discovery is static CLI args. Lives
   at `/root/rixl-bench/bench/pd-disaggregation/disagg_proxy_demo.py`.
+
+  > **Correction, same day — do not repeat this inference.** An earlier
+  > pass concluded from the above that `PD_HANDOFF_FIELD` was therefore
+  > "settled and unused". That was wrong, and wrong in the direction this
+  > repo is most careful about: it read an ABSENCE as a design decision
+  > instead of as a missing piece. Measured afterwards on a live P/D pair
+  > (§10.6): with this proxy in front, **decode re-prefills the entire
+  > prompt** — a 4000-token request shows ~400 tokens/s of prompt
+  > throughput on BOTH engines, and `External prefix cache hit rate` stays
+  > 0.0% on both. No KV crosses. NixlConnector's consumer side needs the
+  > producer's handoff metadata to know there is anything to pull, and this
+  > proxy never gives it. So `PD_HANDOFF_FIELD` is not moot: it names
+  > something the proxy is missing. Fixing that is part of live item A.
 - **The NIXL Python API surface, reconciled against the real bindings**,
   2026-09-15 — the verify scripts' inferred version was wrong on several
   points: `register_memory` takes `backends` as a **list**, not `backend`;
