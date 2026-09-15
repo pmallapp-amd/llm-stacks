@@ -210,9 +210,34 @@ def main() -> int:
     ap.add_argument("--nonce", required=True)
     ap.add_argument("--size", type=int, required=True)
     ap.add_argument("--max-value-size", type=int, required=True)
-    ap.add_argument("--trid", required=True)
+    ap.add_argument("--trid", default=None,
+                     help="SPDK_NVMe_KV connect param — required when "
+                          "--backend=SPDK_NVMe_KV, ignored otherwise.")
+    ap.add_argument("--dev-uri", default=None,
+                     help="XNVME_KV connect param (e.g. /dev/ng1n1) — "
+                          "required when --backend=XNVME_KV, ignored "
+                          "otherwise. See plugins/xnvme-kv/xnvme_kv_plugin.cpp's "
+                          "getParams(): this backend has no trid concept at all.")
     ap.add_argument("--backend", default="SPDK_NVMe_KV")
     args = ap.parse_args()
+
+    # Backend-appropriate create_backend() params. Deliberately NOT a single
+    # {"trid": args.trid} dict for every backend — XNVME_KV's getParams()
+    # advertises {dev_uri, max_value_size} only (no trid, no kv_slot_offset;
+    # confirmed by reading xnvme_kv_backend.cpp/.h end to end), so handing it
+    # a trid would just be an ignored, misleading extra key at best and a
+    # rejected/unexpected param at worst.
+    if args.backend == "XNVME_KV":
+        if not args.dev_uri:
+            print("RESULT:MISSING_ARG:--dev-uri is required when --backend=XNVME_KV")
+            return 1
+        backend_params = {"dev_uri": args.dev_uri}
+    else:
+        if not args.trid:
+            print("RESULT:MISSING_ARG:--trid is required when "
+                  f"--backend={args.backend}")
+            return 1
+        backend_params = {"trid": args.trid}
 
     try:
         from nixl._api import nixl_agent, nixl_agent_config
@@ -238,7 +263,7 @@ def main() -> int:
     agent = nixl_agent(f"kvstack-verify-30-{args.mode}",
                         nixl_agent_config(backends=[args.backend]))
     try:
-        agent.create_backend(args.backend, {"trid": args.trid})
+        agent.create_backend(args.backend, backend_params)
     except Exception as exc:  # noqa: BLE001
         print(f"RESULT:CREATE_BACKEND_FAIL:{type(exc).__name__}: {exc}")
         return 1

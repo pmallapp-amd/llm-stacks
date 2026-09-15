@@ -229,9 +229,18 @@ if backend_module is not None:
               file=sys.stderr)
 
 # ── 5. Live plugin introspection — create a throwaway nixl_agent and echo
-#      back what the ACTUAL SPDK_NVMe_KV plugin (not LMCache's idea of it)
-#      reports for trid/max_value_size/kv_slot_offset, so a human can diff
-#      it against nixl_backend_params in the YAML by eye. ─────────────────
+#      back what the ACTUAL installed plugin (not LMCache's idea of it,
+#      and not this script's idea of it either) reports for its params, so
+#      a human can diff it against nixl_backend_params in the YAML by eye.
+#
+#      Deliberately NOT a hardcoded ("trid", "max_value_size",
+#      "kv_slot_offset") tuple: that was correct only for SPDK_NVMe_KV and
+#      silently echoed nothing for XNVME_KV, whose getParams() advertises a
+#      different pair ({dev_uri, max_value_size} — see
+#      plugins/xnvme-kv/xnvme_kv_plugin.cpp). Iterating over whatever keys
+#      the LIVE plugin's get_plugin_params() actually returns makes this
+#      echo correct for both backends today and for any future backend
+#      without editing this script again. ─────────────────────────────────
 print("\n--- live NIXL plugin introspection ---", file=sys.stderr)
 try:
     from nixl._api import nixl_agent, nixl_agent_config
@@ -243,11 +252,27 @@ try:
     if backend_name in plugins:
         params = agent.get_plugin_params(backend_name)
         print(f"  {backend_name} get_plugin_params(): {params}", file=sys.stderr)
-        for k in ("trid", "max_value_size", "kv_slot_offset"):
-            if k in params:
-                configured = generated_extra.get("nixl_backend_params", {}).get(k)
-                print(f"    {k}: plugin default={params[k]!r}  "
-                      f"configured={configured!r}", file=sys.stderr)
+        configured_params = generated_extra.get("nixl_backend_params", {}) or {}
+        param_keys = list(params.keys()) if hasattr(params, "keys") else []
+        if not param_keys:
+            print(f"  WARN: get_plugin_params({backend_name}) returned no "
+                  f"introspectable keys ({params!r}) — nothing to diff",
+                  file=sys.stderr)
+        for k in param_keys:
+            configured = configured_params.get(k)
+            print(f"    {k}: plugin default={params[k]!r}  "
+                  f"configured={configured!r}", file=sys.stderr)
+        # Flag the inverse mismatch too: a key this YAML configures that the
+        # live plugin does NOT advertise at all (e.g. kv_slot_offset carried
+        # over into an XNVME_KV config by copy-paste) is exactly the
+        # "looks load-bearing, does nothing" trap both plugins' getParams()
+        # comments warn about.
+        for k in configured_params:
+            if k not in param_keys:
+                print(f"    {k}: configured={configured_params[k]!r}  "
+                      f"NOT ADVERTISED by {backend_name}'s get_plugin_params() "
+                      f"— this key is IGNORED by the plugin, not applied",
+                      file=sys.stderr)
     else:
         print(f"  FAIL: '{backend_name}' not in NIXL's plugin list — check "
               f"NIXL_PLUGIN_DIR is set and points at the directory "

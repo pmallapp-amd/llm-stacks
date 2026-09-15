@@ -150,12 +150,84 @@ _NIXL_BUFFER_SIZE="${LMCACHE_NIXL_BUFFER_SIZE:-1073741824}"
 # no "rocm" or "hip" value to pass here.
 _NIXL_BUFFER_DEVICE="${LMCACHE_NIXL_BUFFER_DEVICE:-cuda}"
 
-_NIXL_BACKEND="${LMCACHE_NIXL_BACKEND:-SPDK_NVMe_KV}"
+_NIXL_BACKEND="${LMCACHE_NIXL_BACKEND:-${KV_BACKEND}}"
 
 # 0 = dynamic/content-derived storage backend. See the constraint block
 # above — do not change this without changing everything else that depends
 # on it.
 _NIXL_POOL_SIZE="${LMCACHE_NIXL_POOL_SIZE:-0}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# nixl_backend_params — the ONE block whose keys differ per backend
+# ═══════════════════════════════════════════════════════════════════════════
+# Built here, before the heredoc below, because the two backends' plugins
+# advertise genuinely different getParams() shapes — this is read straight
+# from each plugin's own source, not guessed:
+#
+#   SPDK_NVMe_KV (plugins/nvme-kv/spdk_nvme_kv_plugin.cpp getParams()):
+#     {trid, max_value_size, kv_slot_offset}
+#
+#   XNVME_KV (plugins/xnvme-kv/xnvme_kv_plugin.cpp getParams()):
+#     {dev_uri, max_value_size} ONLY. There is no trid (this backend has no
+#     SPDK transport-ID concept — it talks to a kernel-owned /dev/ngXnY char
+#     device instead) and no kv_slot_offset: make_key() in
+#     xnvme_kv_backend.h never reads a slot offset on ANY code path, unlike
+#     SPDK's make_key() which at least consults it on the metaInfo-less
+#     fallback. Emitting kv_slot_offset for XNVME_KV would look
+#     load-bearing while silently doing nothing — worse than omitting it.
+#
+# Both use KV_MAX_VALUE_SIZE_EFFECTIVE (config/cluster.env), NOT the
+# SPDK-specific KV_MAX_VALUE_SIZE directly, so this generator automatically
+# tracks whichever backend-appropriate ceiling KV_BACKEND selected. For the
+# default KV_BACKEND=SPDK_NVMe_KV, KV_MAX_VALUE_SIZE_EFFECTIVE resolves to
+# the exact same value KV_MAX_VALUE_SIZE always has (524288) — this
+# generator's SPDK output is unchanged by XNVME_KV existing.
+case "${_NIXL_BACKEND}" in
+    XNVME_KV)
+        _NIXL_BACKEND_PARAMS_BLOCK="$(cat <<PARAMS
+  # Parameters handed verbatim to the plugin create_backend(name, params)
+  # — exactly the {dev_uri, max_value_size} pair documented in
+  # plugins/xnvme-kv/xnvme_kv_plugin.cpp's getParams(). There is
+  # deliberately NO trid (this backend has no SPDK transport-ID concept —
+  # it talks to a kernel-owned /dev/ngXnY char device instead) and NO
+  # kv_slot_offset (make_key() in xnvme_kv_backend.h never reads a slot
+  # offset on ANY code path — emitting one here would look load-bearing
+  # while doing nothing). scripts/common/25-validate-lmcache-config.sh
+  # echoes the plugin's own get_plugin_params("${_NIXL_BACKEND}") defaults
+  # back so you can diff them against what's set here.
+  nixl_backend_params:
+    dev_uri: "${XNVME_DEV}"
+    max_value_size: "${KV_MAX_VALUE_SIZE_EFFECTIVE}"
+PARAMS
+)"
+        ;;
+    *)
+        _NIXL_BACKEND_PARAMS_BLOCK="$(cat <<PARAMS
+  # Parameters handed verbatim to the plugin create_backend(name, params)
+  # — these three are exactly the {trid, max_value_size, kv_slot_offset}
+  # triple documented in plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's
+  # getParams(). scripts/common/25-validate-lmcache-config.sh echoes the
+  # plugin's own get_plugin_params("${_NIXL_BACKEND}") defaults back so you
+  # can diff them against what's set here.
+  nixl_backend_params:
+    trid: "${KV_TRID}"
+    max_value_size: "${KV_MAX_VALUE_SIZE_EFFECTIVE}"
+    # NOTE: this offset is a NO-OP on this deployment. make_key() in
+    # spdk_nvme_kv_backend.h derives the on-wire key from metaInfo whenever
+    # the caller sets it (nixlBlobDesc::metaInfo), and
+    # NixlDynamicStorageAgent._format_object_key() ALWAYS sets metaInfo (it
+    # is the content-derived key itself) — so kv_slot_offset, which only
+    # applies on the devId/addr fallback path taken by callers that never
+    # set metaInfo (kv_io.py, nixlbench), never applies here. Kept
+    # populated anyway for symmetry with those tools and because
+    # 25-validate-lmcache-config.sh echoes it back from the plugin's real
+    # get_plugin_params() so a reader can see it's consistent, not because
+    # it changes this deployment's behavior.
+    kv_slot_offset: "${_SLOT_OFFSET}"
+PARAMS
+)"
+        ;;
+esac
 
 mkdir -p "$(dirname "${OUT}")"
 
@@ -209,27 +281,7 @@ extra_config:
   # constraint block above. Do not set > 0.
   nixl_pool_size: ${_NIXL_POOL_SIZE}
 
-  # Parameters handed verbatim to the plugin create_backend(name, params)
-  # — these three are exactly the {trid, max_value_size, kv_slot_offset}
-  # triple documented in plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's
-  # getParams(). scripts/common/25-validate-lmcache-config.sh echoes the
-  # plugin's own get_plugin_params("${_NIXL_BACKEND}") defaults back so you
-  # can diff them against what's set here.
-  nixl_backend_params:
-    trid: "${KV_TRID}"
-    max_value_size: "${KV_MAX_VALUE_SIZE}"
-    # NOTE: this offset is a NO-OP on this deployment. make_key() in
-    # spdk_nvme_kv_backend.h derives the on-wire key from metaInfo whenever
-    # the caller sets it (nixlBlobDesc::metaInfo), and
-    # NixlDynamicStorageAgent._format_object_key() ALWAYS sets metaInfo (it
-    # is the content-derived key itself) — so kv_slot_offset, which only
-    # applies on the devId/addr fallback path taken by callers that never
-    # set metaInfo (kv_io.py, nixlbench), never applies here. Kept
-    # populated anyway for symmetry with those tools and because
-    # 25-validate-lmcache-config.sh echoes it back from the plugin's real
-    # get_plugin_params() so a reader can see it's consistent, not because
-    # it changes this deployment's behavior.
-    kv_slot_offset: "${_SLOT_OFFSET}"
+${_NIXL_BACKEND_PARAMS_BLOCK}
 EOF
 
 ok "wrote ${OUT} (role=${ROLE}, nixl_backend=${_NIXL_BACKEND}, nixl_pool_size=${_NIXL_POOL_SIZE})"

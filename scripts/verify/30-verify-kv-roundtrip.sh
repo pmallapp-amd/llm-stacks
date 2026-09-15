@@ -20,15 +20,17 @@
 #   30-verify-kv-roundtrip.sh --read --nonce X     # read only; nonce MUST match the writer
 #   30-verify-kv-roundtrip.sh [--size BYTES] [--role prefill|decode]
 #
-# WHY --size defaults to several multiples of KV_MAX_VALUE_SIZE: a payload
-# smaller than KV_MAX_VALUE_SIZE never exercises the multipart-split code
-# path at all (see patches/lmcache/README.md's "multipart-split" section
-# and plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's getParams() comment on why
-# a ~5.7MB LMCache KV page has to be chopped into <=KV_MAX_VALUE_SIZE
-# sub-transfers) — a "roundtrip test" that only ever sends one small value
-# would pass even if the split/reassembly logic were completely broken.
-# Six parts is enough to also catch an off-by-one in the split boundary
-# arithmetic (ceil vs floor) without making the default run painfully slow.
+# WHY --size defaults to several multiples of the ACTIVE backend's
+# max_value_size (config/cluster.env's KV_MAX_VALUE_SIZE_EFFECTIVE, which
+# tracks whichever of KV_MAX_VALUE_SIZE / KV_MAX_VALUE_SIZE_XNVME KV_BACKEND
+# selects): a payload smaller than that never exercises the multipart-split
+# code path at all (see patches/lmcache/README.md's "multipart-split"
+# section and plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's getParams() comment
+# on why a ~5.7MB LMCache KV page has to be chopped into sub-transfers) — a
+# "roundtrip test" that only ever sends one small value would pass even if
+# the split/reassembly logic were completely broken. Six parts is enough to
+# also catch an off-by-one in the split boundary arithmetic (ceil vs floor)
+# without making the default run painfully slow.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../common/lib.sh"
@@ -64,7 +66,7 @@ if [ -z "${ROLE}" ]; then
 fi
 
 if [ -z "${SIZE}" ]; then
-    SIZE=$((KV_MAX_VALUE_SIZE * 6))
+    SIZE=$((KV_MAX_VALUE_SIZE_EFFECTIVE * 6))
 fi
 
 if [ "${MODE}" = "read" ] && [ -z "${NONCE}" ]; then
@@ -88,14 +90,26 @@ source "${STACK_ROOT}/etc/env.sh"
 setup_nixl_kv_env "${ROLE}"
 require_file "${VENV}/bin/python"
 
+# Backend-appropriate connect-param flag for _kv_roundtrip.py. See
+# config/cluster.env's KV_BACKEND comment and _kv_roundtrip.py's --dev-uri
+# help text: XNVME_KV has no trid concept, SPDK_NVMe_KV has no dev_uri
+# concept, and passing the wrong one is not merely unused — it is a
+# misleading param the reader would have to know to ignore.
+case "${KV_BACKEND}" in
+    XNVME_KV)     _CONNECT_ARGS=(--dev-uri "${NIXL_XNVME_DEV}") ;;
+    SPDK_NVMe_KV) _CONNECT_ARGS=(--trid "${NIXL_KV_TRID}") ;;
+    *) die "KV_BACKEND must be SPDK_NVMe_KV|XNVME_KV, got '${KV_BACKEND}'" ;;
+esac
+
 _run_side() {
     local side="$1"
     "${VENV}/bin/python" "${ENGINE}" \
         --mode "${side}" \
         --nonce "${NONCE}" \
         --size "${SIZE}" \
-        --max-value-size "${KV_MAX_VALUE_SIZE}" \
-        --trid "${NIXL_KV_TRID}"
+        --max-value-size "${KV_MAX_VALUE_SIZE_EFFECTIVE}" \
+        --backend "${KV_BACKEND}" \
+        "${_CONNECT_ARGS[@]}"
 }
 
 _report() {

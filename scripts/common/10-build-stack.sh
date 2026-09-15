@@ -294,8 +294,40 @@ else
             ninja -C build-xnvme-kv -j "${JOBS}"
             ninja -C build-xnvme-kv install
         )
-        require_file "${NIXL_PLUGIN_DIR}/libplugin_XNVME_KV.so"
-        ok "XNVME_KV plugin installed"
+        _xnvme_plugin_so="${NIXL_PLUGIN_DIR}/libplugin_XNVME_KV.so"
+        require_file "${_xnvme_plugin_so}"
+
+        # ── Post-build verification: NOT optional, but a DIFFERENT check
+        #    than SPDK_NVMe_KV's above. That check asserts ABSENCE of
+        #    librte_*/libspdk_* DT_NEEDED entries, because this plugin's
+        #    static archives must never leak a shared-lib dependency at all.
+        #    XNVME_KV is not built that way: it legitimately links libxnvme.so
+        #    DYNAMICALLY (see plugins/xnvme-kv/meson.build) — a DT_NEEDED on
+        #    libxnvme.so here is CORRECT and expected, so asserting its
+        #    absence would be asserting this plugin is broken. What DOES
+        #    carry over from the SPDK check, unchanged, is the underlying
+        #    failure mode it exists to catch: NIXL loads plugins via
+        #    dlopen(), an UNRESOLVABLE DT_NEEDED (libxnvme.so not on any
+        #    loader path in the deployed image, e.g. built against a
+        #    dev-host libxnvme that never got shipped) makes dlopen() fail,
+        #    and NIXL's plugin manager reports that as a bare "unsupported
+        #    backend" with nothing pointing at libxnvme specifically. So this
+        #    check asserts every DT_NEEDED entry RESOLVES (no "not found" in
+        #    ldd's output) — same failure caught, opposite assertion, because
+        #    "must not depend on X" and "must be able to find X" are
+        #    different properties and this plugin only needs the second one.
+        info "verifying ${_xnvme_plugin_so} has no unresolved DT_NEEDED entries"
+        _xnvme_ldd_out="$(ldd "${_xnvme_plugin_so}" 2>&1 || true)"
+        if echo "${_xnvme_ldd_out}" | grep -qi 'not found'; then
+            err "ldd reports missing shared libraries:"
+            echo "${_xnvme_ldd_out}" >&2
+            die "unresolved shared-library dependency in ${_xnvme_plugin_so}" \
+                " — most likely libxnvme.so is not on this host's loader" \
+                " path (ldconfig / LD_LIBRARY_PATH). A DT_NEEDED on" \
+                " libxnvme.so itself is expected here and is NOT the" \
+                " problem; only an unresolved one is."
+        fi
+        ok "XNVME_KV plugin installed (libxnvme.so DT_NEEDED resolves)"
     fi
 fi
 

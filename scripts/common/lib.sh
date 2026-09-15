@@ -577,30 +577,151 @@ require_rdma_access() {
     ok "RDMA device access preflight passed"
 }
 
-# Exports the NIXL_KV_* environment the SPDK_NVMe_KV plugin reads.
-# <role> is prefill|decode and only selects the key-space slot offset.
+# Exports the environment the storage-leg NIXL plugin reads, for whichever
+# plugin KV_BACKEND currently selects. <role> is prefill|decode.
+#
+# Dispatches to _setup_nixl_kv_env_spdk (KV_BACKEND=SPDK_NVMe_KV, the
+# default) or _setup_nixl_kv_env_xnvme (KV_BACKEND=XNVME_KV) below, so the
+# invariants that apply to BOTH backends live exactly once, here, rather than
+# being copy-pasted into each branch and risking one copy drifting from the
+# other.
 setup_nixl_kv_env() {
     local role="$1"
+    case "${role}" in
+        prefill|decode) ;;
+        *) die "setup_nixl_kv_env: role must be prefill|decode, got '${role}'" ;;
+    esac
+
     export NIXL_PLUGIN_DIR
+    export LD_LIBRARY_PATH="${NIXL_PREFIX}/lib/x86_64-linux-gnu:${UCX_PREFIX}/lib:${ROCM_PATH}/lib:${LD_LIBRARY_PATH:-}"
+
+    # Left UNSET on purpose, for BOTH backends. Setting it to 1 makes the
+    # plugin adopt the device's reported value ceiling instead of the
+    # validated constant, which silently changes on-wire object geometry and
+    # lets a reader reassemble a half-stale page from sub-keys written under
+    # the old split. This is docs/HANDOFF.md §7 invariant 4, and it applies
+    # identically to XNVME_KV — see the same hazard documented in
+    # plugins/xnvme-kv/xnvme_kv_plugin.cpp's getParams() comment, not just
+    # plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's.
+    unset NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE
+
+    case "${KV_BACKEND}" in
+        SPDK_NVMe_KV) _setup_nixl_kv_env_spdk "${role}" ;;
+        XNVME_KV)     _setup_nixl_kv_env_xnvme "${role}" ;;
+        *) die "setup_nixl_kv_env: KV_BACKEND must be SPDK_NVMe_KV|XNVME_KV," \
+               " got '${KV_BACKEND}'" ;;
+    esac
+}
+
+# SPDK_NVMe_KV branch — exports exactly the NIXL_KV_* vars this plugin reads
+# (plugins/nvme-kv/spdk_nvme_kv_backend.cpp). Unsets the XNVME_KV-only
+# NIXL_XNVME_* vars first: if a prior call in this same shell (or an
+# inherited environment) set them for the other backend, leaving them
+# exported here would be actively misleading — they are read by NEITHER this
+# plugin nor anything else once SPDK_NVMe_KV is selected.
+_setup_nixl_kv_env_spdk() {
+    local role="$1"
+    unset NIXL_XNVME_DEV NIXL_XNVME_NSID NIXL_XNVME_NUM_QUEUES \
+          NIXL_XNVME_STALL_TIMEOUT_SEC
+
     export NIXL_KV_TRID="${KV_TRID}"
     export NIXL_KV_NUM_QPAIRS="${KV_NUM_QPAIRS}"
     export NIXL_KV_QUERY_TIMEOUT_MS="${KV_QUERY_TIMEOUT_MS}"
     export NIXL_KV_ENOMEM_TIMEOUT_SEC="${KV_ENOMEM_TIMEOUT_SEC}"
     export NIXL_KV_BACKPRESSURE_LOG_SEC="${KV_BACKPRESSURE_LOG_SEC}"
     export NIXL_KV_METRICS_INTERVAL_SEC="${NIXL_METRICS_INTERVAL_SEC}"
-    # Left UNSET on purpose. Setting it to 1 makes the plugin adopt the device's
-    # reported value ceiling instead of the validated constant, which silently
-    # changes on-wire object geometry and lets a reader reassemble a half-stale
-    # page from sub-keys written under the old split. See the getParams() comment
-    # in plugins/nvme-kv/spdk_nvme_kv_plugin.cpp.
-    unset NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE
     case "${role}" in
         prefill) export NIXL_KV_SLOT_OFFSET="${KV_SLOT_OFFSET_PREFILL}" ;;
         decode)  export NIXL_KV_SLOT_OFFSET="${KV_SLOT_OFFSET_DECODE}"  ;;
-        *) die "setup_nixl_kv_env: role must be prefill|decode, got '${role}'" ;;
     esac
-    export LD_LIBRARY_PATH="${NIXL_PREFIX}/lib/x86_64-linux-gnu:${UCX_PREFIX}/lib:${ROCM_PATH}/lib:${LD_LIBRARY_PATH:-}"
     log "NIXL_KV_TRID=${NIXL_KV_TRID}"
+}
+
+# XNVME_KV branch — exports exactly the NIXL_XNVME_* vars this plugin reads
+# (plugins/xnvme-kv/xnvme_kv_backend.cpp), plus the metrics-interval var it
+# shares the spelling of with SPDK (NIXL_KV_METRICS_INTERVAL_SEC — see that
+# file's constructor). Unsets the SPDK-only NIXL_KV_* vars first, for the
+# same reason _setup_nixl_kv_env_spdk unsets NIXL_XNVME_* — this backend
+# reads NONE of them (there is no trid, no kv_slot_offset for XNVME_KV;
+# confirmed by reading xnvme_kv_backend.cpp/.h end to end), so leaving them
+# exported would imply they do something here when they do not.
+#
+# role is accepted only for a consistent call signature with the SPDK
+# branch; XNVME_KV has no kv_slot_offset equivalent at all —
+# make_key() in xnvme_kv_backend.h ignores devId/addr entirely once a
+# caller's metaInfo is set (the LMCache OBJ-mode path), and never reads a
+# per-role offset even on the metaInfo-less fallback path. There is
+# therefore nothing role-specific left to export for this backend.
+_setup_nixl_kv_env_xnvme() {
+    local role="$1"
+    : "${role}"
+    unset NIXL_KV_TRID NIXL_KV_NUM_QPAIRS NIXL_KV_QUERY_TIMEOUT_MS \
+          NIXL_KV_ENOMEM_TIMEOUT_SEC NIXL_KV_BACKPRESSURE_LOG_SEC \
+          NIXL_KV_SLOT_OFFSET
+
+    # FAIL LOUDLY rather than let an empty XNVME_DEV reach the plugin: an
+    # empty NIXL_XNVME_DEV falls through to the plugin's OWN /dev
+    # autodiscovery (xnvme_kv_backend.cpp's discover_kv_device()), which on a
+    # host with a local NVMe boot drive is exactly the wrong thing to guess
+    # at silently. See config/cluster.env's XNVME_DEV comment — this check is
+    # what makes that comment's promise ("the plugin autodiscovering here is
+    # unsafe") actually enforced rather than just documented.
+    if [ -z "${XNVME_DEV}" ]; then
+        die "setup_nixl_kv_env: KV_BACKEND=XNVME_KV but XNVME_DEV is empty." \
+            " Refusing to let this fall through to the plugin's own /dev" \
+            " autodiscovery, which on a host with a local NVMe boot drive" \
+            " risks aiming a KV backend at production storage. Set" \
+            " XNVME_DEV=/dev/ngXnY explicitly — see config/cluster.env's" \
+            " XNVME_DEV comment for how to find the right one (the" \
+            " nvme-connect step that establishes the kernel nvme-of session" \
+            " is where this should be set)."
+    fi
+    if [ ! -e "${XNVME_DEV}" ]; then
+        die "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} does not exist on" \
+            " this host. Check the kernel nvme-of initiator actually" \
+            " connected (nvme list-subsys) before retrying — a stale or" \
+            " mistyped path here must not silently become an autodiscovery"\
+            " guess either."
+    fi
+
+    # A KV namespace has NO block device: the kernel refuses to build one
+    # for a non-NVM command set and creates only the generic char node,
+    # whereas an ordinary NVM namespace (e.g. this host's local boot drive)
+    # has both. So /dev/ngXnY with a MATCHING /dev/nvmeXnY is a data disk,
+    # not a KV namespace — see plugins/xnvme-kv/xnvme_kv_backend.cpp's
+    # discover_kv_device() comment, which runs the identical test inside the
+    # plugin's own autodiscovery. Running it again here, on the EXPLICIT
+    # path an operator gave us, catches the case that matters most: someone
+    # pasted the wrong device node by hand. This is cheap and prevents
+    # writing KV opcodes at somebody's filesystem.
+    local _base
+    _base="$(basename -- "${XNVME_DEV}")"
+    if [[ "${_base}" =~ ^ng([0-9]+)n([0-9]+)$ ]]; then
+        local _blk; _blk="$(dirname -- "${XNVME_DEV}")/nvme${BASH_REMATCH[1]}n${BASH_REMATCH[2]}"
+        if [ -e "${_blk}" ]; then
+            die "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} has a matching" \
+                " block device (${_blk}). A true KV namespace has NO block" \
+                " device — the kernel cannot build one for a non-NVM" \
+                " command set. This path is an ordinary NVM namespace (a" \
+                " data disk, quite possibly this host's local boot drive)," \
+                " not a KV namespace. Refusing to hand it to the KV" \
+                " backend — double-check /dev/ngXnY against" \
+                " \`nvme list-subsys\` and this host's actual KV controller."
+        fi
+    else
+        warn "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} does not match the" \
+             " expected /dev/ngCnN shape — skipping the block-device safety" \
+             " check because the controller/namespace numbers can't be" \
+             " parsed out of it. Confirm by hand that this is really a KV" \
+             " namespace char device, not a data disk."
+    fi
+
+    export NIXL_XNVME_DEV="${XNVME_DEV}"
+    export NIXL_XNVME_NSID="${XNVME_NSID}"
+    export NIXL_XNVME_NUM_QUEUES="${XNVME_NUM_QUEUES}"
+    export NIXL_XNVME_STALL_TIMEOUT_SEC="${XNVME_STALL_TIMEOUT_SEC}"
+    export NIXL_KV_METRICS_INTERVAL_SEC="${NIXL_METRICS_INTERVAL_SEC}"
+    log "NIXL_XNVME_DEV=${NIXL_XNVME_DEV}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
