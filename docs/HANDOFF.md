@@ -15,9 +15,19 @@ machines and share KV cache.
 
 | Role | Hardware | Function |
 |---|---|---|
-| Prefill | 8× MI300X `[1dd8:5303]`, 2× DSC3-2Q400 `[1dd8:5200]` | vLLM, KV producer |
-| Decode | 8× MI300X `[1dd8:5303]`, 2× DSC3-2Q400 `[1dd8:5200]` | vLLM, KV consumer |
-| Target | no GPU, 2× POLLARA-1Q400 `[1dd8:1002]` | SPDK NVMe-KV over NVMe-oF/TCP |
+| Prefill (`smc1`) | 8× MI300X `[1002:74a1]` "Aqua Vanjaram", 10× DSC Ethernet Controller `[1dd8:1002]` | vLLM, KV producer |
+| Decode (`smc2`) | 8× MI300X `[1002:74a1]` "Aqua Vanjaram", 10× DSC Ethernet Controller `[1dd8:1002]` | vLLM, KV consumer |
+| Target (SMC3) | no GPU, 2× DSC Ethernet Controller `[1dd8:1002]` | SPDK NVMe-KV over NVMe-oF/TCP |
+
+> **Corrected 2026-09-14, first real contact with hardware.** The IDs above were
+> wrong: `1dd8:5303` and `1dd8:5200` do not exist on any of the three nodes (grep
+> count 0). The GPUs are vendor `1002` (AMD/ATI), not `1dd8` — `lspci -d 1dd8:`
+> finds no GPUs at all, on any node. There are 10 `[1dd8:1002]` DSC Ethernet
+> Controllers per compute node, not 2. The target's two `[1dd8:1002]` devices
+> carry the same ID as the compute-node NICs, so that ID alone does not
+> distinguish a "POLLARA" from a "DSC3" — the marketing names above are
+> unconfirmed and are not restated as fact; see the new blocker in §2 for the
+> consequence to `00-preflight.sh`.
 
 Addresses and credentials are **not in this repo** — see §3. Stack is
 vLLM + LMCache + NIXL + the two NIXL plugins in `plugins/`, on ROCm.
@@ -30,8 +40,8 @@ built an entire phase plan around the mistake.
 
 | Leg | Path | Transport | NICs |
 |---|---|---|---|
-| **A — P→D transfer** | prefill → decode, direct GPU-to-GPU via NIXL/UCX | TCP now → **RDMA = acceptance** | DSC3-2Q400 |
-| **B — Shared KV storage** | both compute nodes → target over NVMe-oF | **TCP, permanently by design** | POLLARA-1Q400 |
+| **A — P→D transfer** | prefill → decode, direct GPU-to-GPU via NIXL/UCX | TCP now → **RDMA = acceptance** | DSC Ethernet Controller `[1dd8:1002]` (10/node, `ionic` driver) |
+| **B — Shared KV storage** | both compute nodes → target over NVMe-oF | **TCP, permanently by design** | Same `[1dd8:1002]` ID on the target (2 present) — no distinguishing name confirmed |
 
 Composed as `MultiConnector[NixlConnector, LMCacheMPConnector]`: NixlConnector
 carries the P/D role and moves KV over RDMA; LMCache stays `kv_both` on both
@@ -48,10 +58,60 @@ sides as a reuse tier, not the transport.
 the history purged (§3). Verified: no credential or lab identifier appears in
 any blob of any commit.
 
-**Nothing has run on hardware.** Every script is written and lint-clean, and the
-target and compute-leg configurations are now transcribed from a working
-deployment rather than inferred — but no end-to-end run exists. Treat the first
-invocation as bring-up, not a benchmark.
+**First contact with hardware happened 2026-09-14.** `ssh` inventory reached
+all three nodes (§6) and confirms node identity and credentials resolve
+correctly (TODO 2.1). `00-preflight.sh` now runs clean on **all three** nodes,
+5/5 checks each (TODO 2.2). It did not at first: it aborted partway through on
+both compute nodes under `set -euo pipefail`, silently truncating the RDMA and
+NIC inventory the run existed to collect. That was a bug in the script, not a
+node defect, and it is fixed (TODO 2.13).
+
+Read that green preflight narrowly. Its GPU check is `check_soft`, so a node
+with **zero usable GPUs still passes** — see blocker 1 below. Preflight means
+"inventoried", not "ready to serve". No vLLM, SPDK build, or verify-ladder
+script has run anywhere yet. Treat the first invocation as bring-up, not a
+benchmark.
+
+One blocker from today is now **RESOLVED**; one remains and is now the top
+blocker:
+
+1. ~~The GPUs are unusable~~ **RESOLVED 2026-09-14.** All 16 MI300X (8 per
+   compute node) are now up on both nodes: `rocminfo` reports 10 agents each
+   (2× EPYC 9554 + 8× gfx942), `rocm-smi` reports 8 GPUs / 206141652992 B
+   (192 GiB) VRAM each, all `runtime_status=active`. **An earlier pass on
+   this same finding was wrong** — it concluded that removing
+   `modprobe.blacklist=amdgpu` (present on both compute nodes' kernel cmdline)
+   required editing GRUB and rebooting both machines. It did not:
+   `modprobe.blacklist=` suppresses **autoload only** (alias/`-b` resolution,
+   what udev uses — `modprobe -n -v -b amdgpu` does nothing) and does **not**
+   block an explicit `modprobe amdgpu` by module name (`modprobe -n -v
+   amdgpu` resolves the full 8-module chain, exit 0). There is no
+   `install amdgpu /bin/false`-style hard block in any of
+   `/etc|/lib|/run/modprobe.d` — the cmdline is the only source. Running
+   `modprobe amdgpu` for real on both nodes brought the GPUs up immediately,
+   with **no reboot**. **Residual fact that matters:** the blacklist itself
+   is still on the cmdline and untouched, so this does **not** survive a
+   reboot — every boot, the GPUs come up unusable again until something
+   explicitly runs `modprobe amdgpu`. `scripts/{prefill,decode}/01-host-prep.sh`
+   now do this automatically, every run, via `ensure_amdgpu_loaded()` in
+   `lib.sh` (opt-out: `AMDGPU_AUTOLOAD=0`). See TODO 0.4 for the corrected
+   record.
+
+   Cosmetic, non-blocking, recorded and not chased further: `rocm-smi`
+   prints `get_name, Error when calling libdrm` and an empty Marketing Name,
+   because `libdrm-amdgpu1` is Ubuntu's `2.4.113-2~ubuntu0.22.04.1` while
+   ROCm is 7.13.0 / hsa-rocr 7.2.0. `rocminfo` still correctly identifies
+   `gfx942` and vLLM uses ROCr, not libdrm device names — see TODO 4.6.
+
+2. **The P→D fabric (leg A) has no route yet — now the top blocker.**
+   `smc1`'s data-plane addresses are `30.1.N.1/24`; `smc2`'s are
+   `30.2.N.1/24` — different `/24`s, differing in the second octet — and
+   `smc1` has no route to `smc2` at all (falls back to the management
+   default route). This also falsifies the `/31` point-to-point premise in
+   `config/cluster.env` (§6); the `UCX_IB_ROCE_SUBNET_PREFIX_LEN=16`
+   workaround would not bridge `30.1.x` to `30.2.x` either, since they differ
+   inside the first 16 bits (TODO 3.6). Leg B (storage) is unaffected for
+   bring-up — see the measurement caveat added to §8.
 
 ---
 
@@ -95,7 +155,8 @@ config/creds.env.template   tracked template for a per-setup creds file
 creds/                      UNTRACKED, gitignored — real addresses and passwords
 scripts/common/             lib.sh (shared vocabulary), init-creds, preflight,
                             SPDK/UCX/NIXL build chain, venv, LMCache + kv-transfer
-                            config generation, shared vLLM launcher
+                            config generation, shared vLLM launcher, deploy.sh
+                            (repo sync + remote exec onto the three bare nodes)
 scripts/target/             SPDK build + nvmf_tgt, verify, namespace reset,
                             chunk-ceiling guard
 scripts/prefill/            host prep, vLLM as kv_producer
@@ -150,11 +211,29 @@ when editing.
   measurements.
 - Compute-leg composition and UCX configuration — `MultiConnector` schema,
   `UCX_TLS=ib,rocm,self,sm`, the RoCE `/31` subnet workaround, side-channel
-  behaviour — all from the same working deployment.
+  behaviour — all from the same working deployment. **The `/31` premise does
+  not hold on this fabric** — measured 2026-09-14, the P→D links are `/24`s in
+  different second octets with no route between them; see §2 and TODO 3.6.
 - LMCache's own `enable_pd`/`pd_role` peer channel is **unusable** with this
   plugin: it requires `supportsRemote() == true`, which
   `spdk_nvme_kv_backend.h` explicitly declines. This is why the P/D role goes on
   NixlConnector and never on LMCache.
+- **Node identity and creds resolution**, 2026-09-14: `ssh` as root via
+  `creds/active.env` reaches all three nodes as SMC1 (prefill),
+  SMC2 (decode) and SMC3 (target) (TODO 2.1).
+- **`ionic_*` → physical port mapping, both compute nodes**, measured
+  2026-09-14 (TODO 2.8): on `smc1` all eight `ionic_N` map 1:1 to
+  `benicNp1`-style names and are UP (`30.1.N.1/24`). On `smc2` only
+  `ionic_2/3/5/6` line up with the matching `benic3p1/benic4p1/benic6p1/benic7p1`
+  and are UP (`30.2.N.1/24`); `ionic_0/1` on `smc2` are different interfaces
+  (`enp10s0`/`enp39s0`) and DOWN. `ionic_2` (`benic3p1`) is the first candidate
+  common plane. This inverts the doc's prior claim that only the first two
+  indices line up — `ionic_0/1` are exactly the pair that does *not*.
+- **RDMA device presence** — 8 `ionic` RDMA devices on each compute node;
+  target exposes `rocep100s0` + `rocep132s0`. Confirmed by `00-preflight.sh`.
+- **`00-preflight.sh` on the target (SMC3)** — clean run, all 5 checks
+  pass: 320 CPUs, 62 GiB RAM, no ROCm (expected), the two RDMA devices above,
+  176.8 GiB free on `/opt`, kernel `6.8.0-38-generic`.
 
 ### Assumed — reconcile on first contact with hardware
 
@@ -167,9 +246,6 @@ when editing.
 - **The NIXL Python API surface** used by the verify scripts — partially
   grounded, partially inferred. Failures surface as `AttributeError`, not as
   silent passes.
-- **Which `ionic_*` device is which physical port on each host.** The indices
-  are *not* symmetric across machines; only the first two line up. Must be
-  pinned per host.
 - **All benchmark numbers** in `BENCHMARKING.md` are order-of-magnitude
   estimates, labelled as such.
 
@@ -249,16 +325,36 @@ to the same endpoint and is therefore subject to this. The warning and a
 `--confirm-connector-hit` mode are in place; restructuring the benchmark is
 TODO 1.13.
 
+**A second trap, found 2026-09-14.** The target's real data-plane NIC
+(`enp132s0`, its own /24, MTU 9000, 200000 Mb/s, `ionic` driver) is
+unreachable from the compute nodes right now — same routing gap as leg A
+(§2). But `NVMF_TRADDR` defaults to `TARGET_HOST`, the management address, which *is* reachable, so NVMe-oF/TCP can come up over
+management before the fabric route exists. Any storage-leg number measured
+that way is traversing a 1000 Mb/s `tg3` management NIC (`enp101s0`) and is not
+representative — the same kind of trap as above, one layer down.
+
 ---
 
 ## 9. How to resume
 
-1. `scripts/common/init-creds.sh 4`, populate it, confirm
-   `source config/cluster.env` resolves real addresses.
-2. Work [TODO.md §2](TODO.md) — hardware bring-up. The architecture correction
-   (§1) is complete; the remaining blockers are physical.
-3. Follow [BRINGUP.md](BRINGUP.md).
+1. `scripts/common/deploy.sh` to push the repo (and creds) onto each node —
+   none of the three has a shared filesystem, NFS, or the repo already on it;
+   this has to run before anything else can. SSH key auth is **not**
+   configured on any node, so this and everything else currently depends on
+   the passwords in `creds/active.env`; `deploy.sh` pushes those passwords to
+   all three machines by default (TODO 2.12).
+2. `scripts/common/init-creds.sh 4`, populate it, confirm
+   `source config/cluster.env` resolves real addresses. *(Done as of
+   2026-09-14 — TODO 2.1.)*
+3. Work [TODO.md §2](TODO.md) — hardware bring-up. The architecture correction
+   (§1) is complete; the GPU blocker is resolved (TODO 0.4, both nodes up via
+   `modprobe amdgpu`, redone automatically by host-prep every run); the
+   single biggest open blocker is now the P→D fabric having no route (TODO
+   3.6).
+4. Follow [BRINGUP.md](BRINGUP.md).
 
-The first three things likely to bite, in order: the LMCache allowlist patch
-against whatever version actually installs; the `kv_transfer_params` field name;
-and the per-host `ionic_*` device mapping.
+The first things likely to bite, in order: the P→D fabric having no route
+(3.6); the LMCache allowlist patch against whatever version actually
+installs; and the `kv_transfer_params` field name. (The amdgpu blacklist,
+formerly first on this list, is resolved — TODO 0.4 — but remember it must be
+redone after every reboot of either compute node.)
