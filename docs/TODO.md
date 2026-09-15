@@ -992,8 +992,8 @@ otherwise.*
       record is that a blocker marked "not actionable" silently lifted and
       nobody would have thought to re-check it. Re-verify before trusting
       either entry.
-- [!] **6.20** **`smc2` (decode) is reboot-unstable — 5 boots on
-      2026-09-15, cycling every ~8-10 minutes after 12:04.** This is now
+- [!] **6.20** **`smc2` (decode) is reboot-unstable — 7 boots on
+      2026-09-15, cycling every 3-13 minutes after 12:04.** This is now
       the top operational blocker: a 72B TP=8 load takes 5-6 minutes, so
       the node does not reliably stay up long enough to start an engine,
       let alone finish a measurement. Boot table and analysis in HANDOFF
@@ -1004,6 +1004,9 @@ otherwise.*
       idle, minutes after startup completed, and `journalctl -b -1 -p err`
       shows no panic, no MCE, no OOM kill and no thermal event. Do not
       assume the two share a cause just because one followed the other.
+      Two further reboots followed (12:41, 12:46), one of them while a
+      model load was in progress and one within three minutes of boot —
+      so this is ongoing, not a one-off aftershock of the allocation.
 
       This is the **second** independent occurrence of unexplained reboots
       on this hardware — TODO 0.4 records the first, in an earlier session,

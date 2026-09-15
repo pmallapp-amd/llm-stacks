@@ -1206,16 +1206,19 @@ enough to finish.
 `journalctl --list-boots` on `smc2`, 2026-09-15:
 
 ```
--4  03:56:58 -> 05:17:01
--3  05:30:26 -> 07:49:35
--2  07:52:37 -> 12:04:43     <- the 4h window in which leg A was proven
--1  12:13:55 -> 12:22:24     <- ~8 minutes
- 0  12:28:26 -> (current)
+-6  03:56:58 -> 05:17:01
+-5  05:30:26 -> 07:49:35
+-4  07:52:37 -> 12:04:43     <- the 4h window in which leg A was proven
+-3  12:13:55 -> 12:22:24     <-  ~8 minutes
+-2  12:28:26 -> 12:41:50     <- ~13 minutes
+-1  12:44:17 -> 12:46:58     <-  ~3 minutes
 ```
 
-Five boots in one day, and after 12:04 it is cycling roughly every eight
-to ten minutes — not long enough to load a 72B model at TP=8, which takes
-five or six.
+Seven boots in one day, and after 12:04 it is cycling every three to
+thirteen minutes — not long enough to load a 72B model at TP=8, which
+takes five or six. Confirmed the hard way: a final attempt to restore the
+proven leg-A pair was made at 12:41 and the node went down mid-load,
+again.
 
 The 12:04 reboot has a plausible cause: the 640 GiB pinned-memory request
 described in §12.3. **The 12:22 one does not.** It happened with the
@@ -1249,11 +1252,13 @@ Two practical consequences:
 - `smc1` / prefill: `rocm-aic:latest` container `vllm-pd-prefill` running
   the **proven leg-A configuration** (NixlConnector only, `UCX_NET_DEVICES=ens51f0`),
   `/health` 200, side channel bound `10.30.75.198:5600`. GPUs up.
-- `smc2` / decode: rebooted 12:28, `modprobe amdgpu` re-run (8 GPUs,
-  `/dev/kfd` present). **No vLLM container running** — not worth
-  relaunching into a node cycling every ten minutes. `nvme connect` NOT
-  re-established (the target no longer offers the subsystem anyway,
-  §12.5).
+- `smc2` / decode: **rebooting repeatedly** (§12.8); last seen up at
+  12:44 and down again by 12:47. A `vllm-pd-decode` container exists but
+  the node has not stayed up long enough to finish loading it, and
+  `modprobe amdgpu` will need re-running after whatever the current boot
+  is. `nvme connect` NOT re-established — the target no longer offers the
+  subsystem anyway (§12.5). Do not interpret decode being down as a
+  consequence of any change in this session's commits; it is 6.20.
 - `smc3` / target: running, but serving **another party's**
   configuration (§12.5). Not touched.
 - No proxy running.
