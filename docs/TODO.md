@@ -17,7 +17,7 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 0 | Blocking decisions and follow-ups | 4 | 2 | 2 |
 | 1 | Architecture correction (compute leg) | 13 | 12 | 0 |
 | 2 | Hardware bring-up (Phase 1, TCP) | 13 | 5 | 3 |
-| 3 | Acceptance (Phase 2, RDMA compute leg) | 6 | 0 | 0 |
+| 3 | Acceptance (Phase 2, RDMA compute leg) | 8 | 0 | 1 |
 | 4 | Open items and known limitations | 6 | 0 | 0 |
 | 5 | Done | 14 | 14 | — |
 | 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 20 | 12 | 6 |
@@ -26,7 +26,16 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 until it is.** It rebooted five times on 2026-09-15 and is cycling every
 ~8-10 minutes, which is shorter than a 72B TP=8 model load. Then **6.18** —
 establish ownership of the shared KV target on `smc3` — and only then resume
-6.10. 6.10 was attempted in session 4 and did not land, but
+6.10.
+
+**Independently, and ahead of ALL of §3: 3.7 — the `ionic` RDMA stack is
+broken on both compute nodes.** Two version/ABI mismatches introduced by the
+session-2 OS upgrade: no ionic provider loads in userspace (`ibv_devinfo` →
+`No IB devices found`) and the kernel driver's QP creation is rejected by the
+card. RDMA acceptance cannot begin until this is fixed, and 3.6's routing gap
+— long treated as §3's first blocker — is secondary to it. Leg A is
+unaffected. See HANDOFF §13, and 3.8 for why preflight could not have caught
+it. 6.10 was attempted in session 4 and did not land, but
 not for any reason inside this repo: the target was reconfigured by another
 party mid-session and `nqn.2024-01.io.nixl:kv0` no longer exists (6.18).
 Everything else 6.10 needed is now worked out — including the discovery that
@@ -283,6 +292,15 @@ counters rather than inferred from throughput.*
 - [ ] **3.2** Confirm `/dev/infiniband/uverbs*` are openable, `memlock` is
       unlimited, and `ibv_devinfo` shows `PORT_ACTIVE`. Nodes present but
       unopenable present as a ~90 s hang, not an error.
+      **Partly ANSWERED 2026-09-15 (session 4), and the answer is bad:**
+      `/dev/infiniband/uverbs0..7` and `rdma_cm` all exist and are
+      world-readable, and all 8 ports read `state=4: ACTIVE`,
+      `phys_state=5: LinkUp` — yet `ibv_devinfo` returns **`No IB devices
+      found`**, because no ionic provider loads (3.7). This item's own
+      premise is what makes 3.7 so easy to miss: it anticipated "present
+      but unopenable" as a hang, and what actually happens is an instant,
+      quiet empty list. `memlock` is still unchecked. *Now blocked by
+      3.7.*
 - [ ] **3.3** Set the compute leg to RDMA and restart. `UCX_TLS` excludes `tcp`
       by design so a half-configured fabric fails loudly.
 - [ ] **3.4** Prove RDMA is carrying the KV traffic — counters, not throughput
@@ -299,6 +317,68 @@ counters rather than inferred from throughput.*
       `UCX_IB_ROCE_SUBNET_PREFIX_LEN=16` workaround would not bridge
       `30.1.x`/`30.2.x` either, since they differ inside the first 16 bits. No
       correct value is known yet — do not guess one. *blocks 3.1.*
+
+      **Re-scoped 2026-09-15 (session 4): this is no longer the first
+      blocker in §3, and treating it as such would waste the effort.**
+      There is currently no functioning verbs layer on either compute node
+      (3.7) — a route with nothing to carry over it changes nothing. Fix
+      3.7, then come back to this. *now blocked by 3.7.*
+- [!] **3.7** **The `ionic` RDMA stack is broken on BOTH compute nodes —
+      two independent version/ABI mismatches, introduced by the 24.04.5 /
+      6.8 upgrade in session 2 and unnoticed until now.** Full detail in
+      HANDOFF §13. `ibv_devinfo` on `smc1` returns `No IB devices found`
+      while sysfs simultaneously reports all 8 `ionic` ports
+      `ACTIVE`/`LinkUp` with `uverbs0..7` present — every cheap indicator
+      looks right.
+
+      1. **Userspace provider ABI.** The only ionic provider on disk is
+         `libionic-rdmav59.so` (rdma-core 61, and an orphan — `dpkg -S`
+         finds no owning package); the installed `libibverbs` is Ubuntu's
+         `50.0-2ubuntu0.2`, which loads `lib*-rdmav34.so`. No ionic
+         provider loads at all. `libionic1` and `rdma-core 61.0-1` are
+         both `rc` (removed, config only), `apt-cache policy libionic1`
+         reports **Candidate: (none)**, and no AMD/Pensando apt source is
+         configured — so this cannot be fixed with `apt` as the machine
+         stands.
+      2. **Kernel driver vs DSC firmware.** `ionic_rdma` is DKMS
+         `26.09.4.001~ubu22.04` — the 22.04 source rebuilt against 6.8.
+         `vermagic` matches and it loads, but the card answers
+         `opcode CREATE_QP (2) error BAD_ATTR (5)`, so
+         `Couldn't create ib_mad QP1` → `Couldn't open port 1`. No GSI QP
+         means no MAD agent, no SA, no CM — `rdma_cm` cannot connect
+         regardless of the reported port state.
+
+      Either break alone is fatal. Both are present, on both nodes.
+      Note what this means for diagnosis: modules present, loaded, and
+      correctly versioned for the running kernel proves nothing — all
+      three are true here.
+
+      **Fix:** obtain and install the AMD DSC driver bundle built for
+      **24.04** (the `~ubu22.04` suffix on all three DKMS packages
+      suggests only the 22.04 bundle was ever installed). Relinking the
+      provider against rdma-core 50 addresses break 1 only. Also check DSC
+      firmware (`ethtool -i`) against driver 26.09.4.001 — `BAD_ATTR` on
+      `CREATE_QP` is equally a firmware-skew signature.
+
+      *Blocks all of §3. Does NOT affect leg A, which is TCP/UCX and needs
+      no verbs (HANDOFF §11).*
+- [ ] **3.8** **Make `00-preflight.sh` actually test RDMA rather than
+      inventory it.** It could not have caught 3.7: its only assertion is
+      `check_soft "rdma-core userspace tools present" command -v
+      ibv_devinfo`, which checks that the *binary exists*. The inventory
+      step runs `ibv_devinfo -l`, and with zero loadable devices that
+      returns empty, whereupon preflight logs
+      `none found (expected in Phase 1 / KV_TRANSPORT=tcp)` and passes
+      green.
+
+      Assert instead that `ibv_devinfo` returns at least one device and
+      that at least one port reads `PORT_ACTIVE`, and surface any
+      `couldn't load driver` warning from `libibverbs` as a `warn` rather
+      than discarding stderr — that warning line names the exact missing
+      provider and would have made 3.7 self-diagnosing. Keep it
+      `check_soft` in Phase 1 (TCP needs no verbs) but make it a hard
+      check when `KV_TRANSPORT=rdma`. Use `timeout` — 3.2 records that an
+      unopenable device presents as a ~90 s hang, not an error.
 
 ---
 

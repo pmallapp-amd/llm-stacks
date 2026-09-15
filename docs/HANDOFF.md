@@ -298,8 +298,19 @@ when editing.
   (`enp10s0`/`enp39s0`) and DOWN. `ionic_2` (`benic3p1`) is the first candidate
   common plane. This inverts the doc's prior claim that only the first two
   indices line up — `ionic_0/1` are exactly the pair that does *not*.
-- **RDMA device presence** — 8 `ionic` RDMA devices on each compute node;
-  target exposes `rocep100s0` + `rocep132s0`. Confirmed by `00-preflight.sh`.
+- ~~**RDMA device presence** — 8 `ionic` RDMA devices on each compute node;
+  target exposes `rocep100s0` + `rocep132s0`. Confirmed by
+  `00-preflight.sh`.~~ **EXPIRED — do not rely on this. Measured
+  2026-09-15 (session 4): `ibv_devinfo` on `smc1` returns `No IB devices
+  found`.** The claim was true when taken on 2026-09-14, on Ubuntu 22.04
+  / kernel 5.15, and the 24.04.5 / 6.8 upgrade in session 2 broke the
+  RDMA stack underneath it. Nobody re-ran preflight afterwards, and
+  preflight would not have caught it anyway — see §13.
+
+  Note also what the original entry ever established: `00-preflight.sh`
+  runs `ibv_devinfo -l`, which **lists** device names. It never opens a
+  device and never reads port state. "Presence" was the literal and
+  correct word; it was read as functional.
 - **`00-preflight.sh` on the target (SMC3)** — clean run, all 5 checks
   pass: 320 CPUs, 62 GiB RAM, no ROCm (expected), the two RDMA devices above,
   176.8 GiB free on `/opt`, kernel `6.8.0-38-generic`.
@@ -1225,8 +1236,21 @@ described in §12.3. **The 12:22 one does not.** It happened with the
 engine idle, minutes after `Application startup complete`, with the
 container exiting 255 because the host went away underneath it. Nothing
 in `journalctl -b -1 -p err` names a cause — no panic, no MCE, no OOM
-kill, no thermal event. The only errors are benign boot-time noise
+kill, no thermal event. The only errors are ~~benign boot-time noise~~
 (`ionic_N: Couldn't open port 1`, a networkd wait-online timeout).
+
+> **Correction, same session: "benign boot-time noise" was wrong.** Those
+> `ionic_N: Couldn't create ib_mad QP1` / `Couldn't open port 1` lines are
+> a real RDMA-stack failure, they occur on **both** compute nodes, and
+> `iwpmd.service` failing beside them is a second signal from the same
+> stack. They were dismissed here because they appeared during an
+> unrelated investigation and looked like startup chatter. They are
+> §13's subject. Whether they bear on these reboots is still unknown —
+> the DSC cards are the `ionic` devices, and a firmware-level fault there
+> would reset a host without leaving a journal entry, which would fit
+> "no recorded cause" — but that is a hypothesis to test, not a finding.
+> The point of this correction is narrower and certain: the lines are not
+> noise, and reading them as such delayed finding §13 by a session.
 
 So this is not explained, and it should not be assumed to be a
 consequence of §12.3 just because that came first. TODO 0.4 already
@@ -1266,3 +1290,167 @@ Two practical consequences:
 To get back to the proven leg-A state once `smc2` is stable: relaunch both
 roles and the proxy, then re-run the §11 measurement. Nothing about the
 leg-A fix depends on the storage target.
+
+---
+
+## 13. The `ionic` RDMA stack is broken on both compute nodes (2026-09-15, session 4)
+
+Found by following up an operator's hypothesis that there was a
+version/ABI mismatch between `ionic` and the kernel uverbs ABI. There is.
+It is worse than one mismatch, and it has been true since the OS upgrade
+in session 2 without anything reporting it.
+
+**There is no functioning RDMA userspace on `smc1` today:**
+
+```
+$ ibv_devinfo
+libibverbs: Warning: couldn't load driver 'libionic-rdmav34.so':
+            cannot open shared object file: No such file or directory
+No IB devices found
+```
+
+Zero devices — while sysfs simultaneously reports all eight ports healthy:
+
+```
+ionic_0 .. ionic_7   state=4: ACTIVE   phys_state=5: LinkUp
+/dev/infiniband/uverbs0 .. uverbs7 all present, plus rdma_cm
+/sys/class/infiniband_verbs/abi_version = 6
+```
+
+That combination is the whole trap: every cheap indicator looks right.
+
+### 13.1 Break one — userspace provider ABI mismatch
+
+| | |
+|---|---|
+| Provider on disk | `libionic-rdmav59.so` → `libionic.so.1.0.61.0` (Jan 21 2025) |
+| Owning package | **none** — `dpkg -S` finds no match. It is an orphan. |
+| `libionic1`, `rdma-core 61.0-1` | state `rc` — removed, config files only |
+| Installed userspace | Ubuntu `ibverbs-providers` / `libibverbs1` `50.0-2ubuntu0.2` |
+| Provider ABI that libibverbs 50 loads | `lib*-rdmav**34**.so` |
+
+Every other provider in `/usr/lib/x86_64-linux-gnu/libibverbs/` is
+`-rdmav34.so`. The AMD-built ionic provider is ABI **59**, built against
+rdma-core 61. `libibverbs` 50 looks for `libionic-rdmav34.so`, does not
+find it, and loads **no ionic provider at all**.
+
+This cannot be repaired with `apt` as the machine currently stands:
+
+```
+$ apt-cache policy libionic1
+  Installed: (none)
+  Candidate: (none)
+```
+
+and no Pensando/AMD apt source is configured anywhere in
+`/etc/apt/sources.list*`.
+
+### 13.2 Break two — kernel driver against DSC firmware
+
+Independent of the above, and equally fatal:
+
+```
+ionic 0000:08:00.3 ionic_0: opcode CREATE_QP (2) error BAD_ATTR (5)   [all 8, repeatedly]
+infiniband ionic_0: Couldn't create ib_mad QP1
+infiniband ionic_0: Couldn't open port 1
+```
+
+`ionic_rdma` is DKMS `26.09.4.001~ubu22.04` — the **22.04** source package
+rebuilt against the 6.8 kernel. Its `vermagic` matches `6.8.0-139-generic`
+so it loads cleanly, but the card rejects the QP attributes it passes.
+Failing to create QP1 (the GSI special QP) means no MAD agent, which means
+no SA and no CM, which means `rdma_cm` cannot establish a connection no
+matter what `state=ACTIVE` claims.
+
+So the kernel modules being present, loaded, and correctly versioned for
+the running kernel proves nothing on its own — all three are true here.
+
+### 13.3 Why this went unnoticed for two sessions
+
+The OS upgrade (session 2) replaced the AMD DSC userspace with Ubuntu's
+while leaving the DKMS kernel modules rebuilt and in place. That split a
+matched vendor stack in half. Then:
+
+- **Preflight cannot detect it.** Its only assertion is
+  `check_soft "rdma-core userspace tools present" command -v ibv_devinfo`
+  — the *binary exists*. Its inventory step runs `ibv_devinfo -l`, and
+  with zero devices that returns empty, whereupon preflight logs
+  `none found (expected in Phase 1 / KV_TRANSPORT=tcp)` and **passes
+  green**. Fixing this is TODO 3.7.
+- **Nobody re-ran preflight after the upgrade** — so §6's RDMA entry
+  still described the pre-upgrade machine.
+- **Leg A never touched verbs.** It runs UCX over TCP.
+- The containers never mapped `/dev/infiniband`, so UCX inside them
+  enumerated only `tcp/self/sm/rocm` — which was read as a consequence of
+  the missing device mapping. It would have been empty regardless.
+
+### 13.4 The failure pattern, stated plainly
+
+This is the fourth instance in one session of a check that passed while
+the thing it checked was broken, and it is the most instructive:
+
+| # | Check | What it actually proved |
+|---|---|---|
+| 1 | HTTP 200 + coherent completion | that vLLM serves. Not that any KV moved. |
+| 2 | `create_backend()` returned without error | nothing — the function has no `return` |
+| 3 | `00-preflight.sh` GPU check | `check_soft`, so 0 GPUs still passes |
+| 4 | `00-preflight.sh` RDMA "verified" | that 8 names existed in sysfs, on a kernel since replaced |
+
+The first three prove too little. **The fourth is different: it was a
+correct verification that silently expired.** The ground moved under a
+recorded fact and nothing re-checked it. That is a failure mode this
+document's whole Verified/Assumed split is supposed to guard against, and
+it did not, because the split has no notion of a fact going stale.
+
+Treat every "Verified" entry taken before 2026-09-15 as suspect if it
+concerns anything the OS upgrade could have touched — kernel, drivers,
+userspace libraries, device nodes. Entries about hardware identity, plugin
+source code, and Gerrit status are unaffected.
+
+### 13.5 What it blocks, and what it does not
+
+- **Blocks all of TODO §3 (Phase 2 RDMA acceptance).** 3.6 frames the
+  blocker as a missing route between `30.1.x` and `30.2.x`. That is real
+  but secondary: there is currently no verbs layer for a route to carry.
+  Fix the stack first, then the routing. Tracked as TODO 3.7, which 3.1
+  and 3.6 now sit behind.
+- **Does not affect leg A.** The §11 result is TCP/UCX and stands.
+- **Invariant 6 behaves correctly here**, and is worth keeping for exactly
+  this reason: `UCX_TLS=ib,rocm,self,sm` with no ib devices makes UCX fail
+  rather than fall back to TCP and report a good number over the wrong
+  transport.
+
+### 13.6 Remediation sketch — not attempted
+
+The DSC driver bundle (`ionic`, `ionic_rdma`, `pds` DKMS + `libionic1` +
+a matching `rdma-core`) is a matched set. Options, in order of
+correctness:
+
+1. **Install the AMD DSC bundle built for 24.04.** The `~ubu22.04` suffix
+   on all three DKMS packages suggests only the 22.04 bundle was ever
+   installed. This is the real fix and needs the vendor package.
+2. Rebuild the ionic provider against rdma-core 50 to produce a
+   `libionic-rdmav34.so`. Addresses break one only — break two is
+   kernel/firmware and would survive it.
+3. Check DSC firmware level (`ethtool -i <ionic netdev>`) against driver
+   `26.09.4.001`. `CREATE_QP ... BAD_ATTR` is the signature of the card
+   disagreeing with the driver about QP attributes, which firmware skew
+   would also produce.
+
+Do (1) if the package can be obtained; do not bother with (2) alone.
+
+### 13.7 Someone else is on this hardware
+
+Recorded because it affects how to read anything measured here:
+
+```
+14:52  ionic_N: opcode CREATE_QP (2) error BAD_ATTR (5)   [storm, all 8 devices]
+14:58  ionic 0000:33:00.0 enp51s0: Link up - 200 Gbps
+```
+
+A 200G link came up during this investigation. Together with the KV target
+being reconfigured mid-session (§12.5) and the target's 200G links coming
+up (TODO 6.19), this is active work by another party on the same machines.
+Some observations in this section may be racing their changes — re-verify
+before acting on anything here, and find out who else is on these boxes
+(TODO 6.18).
