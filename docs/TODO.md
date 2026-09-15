@@ -1,6 +1,6 @@
 # TODO
 
-Working task list. Last updated 2026-09-14.
+Working task list. Last updated 2026-09-15.
 
 ## How to use this list
 
@@ -20,13 +20,25 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 6 | 0 | 0 |
 | 4 | Open items and known limitations | 6 | 0 | 0 |
 | 5 | Done | 14 | 14 | — |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 17 | 0 | 0 |
 
-**Next action: 2.3.** 0.4 (the GPU blacklist) is resolved — `modprobe amdgpu`
-was all it took, no reboot, and host-prep now redoes it automatically every
-run (see 0.4's corrected record). The next actionable item is 2.3 (pin the
-SPDK SHA), blocked by nothing; 2.4 onward follows. The current top *blocker*
-(not merely next task) is 3.6 — the P→D fabric has no route yet and no
-correct value is known to fix it.
+**Next action: 2.3, but read §6 first.** 0.4 (the GPU blacklist) is resolved —
+`modprobe amdgpu` was all it took, no reboot, and host-prep now redoes it
+automatically every run (see 0.4's corrected record) — **though 0.4 now also
+records an observed recurrence**: both compute nodes rebooted unexpectedly
+this session and came back with 0 GPUs again, exactly as predicted. The next
+actionable item in the original hardware-bring-up plan is still 2.3 (pin the
+SPDK SHA), now updated with this session's finding that it fails against
+current master — see 2.3's correction and **6.2**. The current top *blocker*
+in §2/§3 (not merely next task) is still 3.6 — the P→D fabric has no route
+yet and no correct value is known to fix it. **Separately, §6 is now open and
+is arguably higher-leverage than either**: this session found the
+from-source build chain may be redundant against an already-working
+container deployment (6.1), that a KV backend can only ever be an LMCache
+tier and never `NixlConnector`'s transport (see HANDOFF §10), and that this
+exact tier-under-live-P/D combination has never been run. Whoever picks this
+up should read §6 in full and make 6.1/6.2/6.3's decisions before doing
+anything else in that section.
 
 ---
 
@@ -75,6 +87,17 @@ correct value is known to fix it.
       still flagged as an open question, not asserted to be a problem
       either way. *Was blocking every GPU-dependent item in §2 and all of
       §3 — no longer does.*
+      **Recurrence OBSERVED 2026-09-15** (not just predicted): both compute
+      nodes rebooted unexpectedly this session — cause unknown, but provably
+      not the paused kernel-upgrade work in §6, since its installer script
+      never even transferred to either node. After reboot both again
+      reported 0 GPUs and `/dev/kfd` absent, exactly as the residual note
+      above predicted. This confirms the behaviour empirically rather than
+      by inference; nothing about it is fixed, only automated —
+      `01-host-prep.sh` (or a manual `modprobe amdgpu`) must run again after
+      any reboot before GPU-dependent work resumes. The kernel `nvme
+      connect` established in §6 also did **not** survive this reboot (no
+      `--persistent` flag, no systemd unit) — see 6.9.
 
 ---
 
@@ -136,9 +159,30 @@ rework.
       serve".
 - [ ] **2.3** Pin an SPDK master SHA in `SPDK_TARGET_REF`; confirm patches 0002
       and 0003 apply cleanly to it. *blocked by nothing — do before 2.4*
-- [ ] **2.4** Build SPDK and start the target; `scripts/target/04-verify-target.sh`.
+      **Attempted 2026-09-15, FAILED as written:** ran
+      `scripts/target/02-build-spdk-kv.sh` against the current
+      `SPDK_TARGET_REF=master`; `git am` could not apply
+      `patches/spdk/0002-spdk-bdev-kvmalloc.patch`. Not closed by that
+      attempt — the actual decision (pin a compatible SHA / rebase the
+      patches / adopt the prebuilt tree) now lives at **6.2**, since this
+      session recorded a working target via a different route (see 2.4's
+      correction below).
+- [~] **2.4** Build SPDK and start the target; `scripts/target/04-verify-target.sh`.
       Hard-check that `max_io_qpairs_per_ctrlr` actually reports 512 — the wrong
       spelling is accepted silently. *blocked by 2.3*
+      **Partially done a different way, 2026-09-15:** this repo's own build
+      (2.3) failed, so the target was brought up instead from the
+      **prebuilt** `/root/kv_spdk` (SPDK v26.05-pre, already carrying the KV
+      target support that patches 0002/0003 add). On that binary: namespace
+      `KvMalloc0`, subsystem `nqn.2024-01.io.nixl:kv0`, listener on the
+      management IP port 4420, and `max_io_qpairs_per_ctrlr: 512`
+      **confirmed** — the hard-check this item asks for passes, just not
+      against this repo's build. Also measured: the transport reports
+      `max_io_size: 131072` (128 KiB), **not** the 16 MiB HANDOFF §7
+      invariant 8 assumes — see the new **6.4**, unresolved and potentially
+      serious. Not marking this fully done: `scripts/target/04-verify-target.sh`
+      itself was not run against this substitute target, and the underlying
+      build failure (2.3) is still open.
 - [ ] **2.5** `nvme discover` against the target from both compute nodes.
 - [ ] **2.6** Build the stack on both compute nodes; pass the `ldd`
       self-containment check on `libplugin_SPDK_NVMe_KV.so`.
@@ -273,3 +317,180 @@ counters rather than inferred from throughput.*
 - [x] **5.13** Direct P→D compute leg implemented and composed.
 - [x] **5.14** Credentials externalised, history purged, repo published to
       `main` at `github.com/pmallapp-amd/llm-stacks`.
+
+---
+
+## 6. Storage-tier integration plan (XNVME_KV / SPDK_NVMe_KV as an LMCache tier)
+
+*Done when a KV storage backend serves as a live LMCache tier underneath a
+real P/D deployment, proven independently of the P→D leg, on a chosen
+deployment model and KV backend. This is new integration — see
+[HANDOFF §10](HANDOFF.md#10-reference-deployment-container-image-contents-and-the-storage-backend-transport-constraint-2026-09-15)
+— not reproduction of anything the lab has run before. All items below are
+new this session (2026-09-15), measured on live hardware unless marked
+otherwise.*
+
+- [ ] **6.1** Decide the deployment model: this repo's from-source build
+      chain (`scripts/common/{05-build-spdk-initiator,10-build-stack,
+      20-build-vllm-lmcache}.sh`, a venv-run vLLM) vs the containerised path
+      already running on both compute nodes
+      (`rocm-aic:{latest,mp-pd,kv-planefix,pr4467,kv-mppd,kv-mppd-assertfix}`,
+      ~43.7 GB each). Measured 2026-09-15: `rocm-aic:kv-mppd-assertfix`
+      (built 2026-09-11) already contains vLLM 0.26.0+rocm, LMCache 0.5.3,
+      torch 2.13.0+rocm7.2, nvme-cli 2.8, libxnvme with 5 `xnvme_kvs_*`
+      symbols, and **prebuilt** `libplugin_SPDK_NVMe_KV.so` and
+      `libplugin_XNVME_KV.so` alongside `libplugin_UCX.so`/`POSIX.so`/
+      `AIS_MT.so` at `NIXL_PLUGIN_DIR=/opt/nixl/lib/x86_64-linux-gnu/plugins`;
+      entrypoint is `python3 -m vllm.entrypoints.openai.api_server`. This
+      makes the entire from-source build chain redundant for bring-up as
+      measured today. Not decided here — three options, tradeoffs only: (a)
+      adopt the container images wholesale — fastest to a working demo, but
+      this repo's build/patch provenance (HANDOFF §5) goes untested against
+      whatever's actually baked into the image; (b) keep the from-source
+      path — preserves the provenance this repo exists to establish, but
+      2.3–2.7 remain necessary and 6.2 is still open; (c) both, from-source
+      as the pinned/reproducible path and the container as a fast smoke
+      test. See HANDOFF §10.1. *blocked by nothing.*
+- [ ] **6.2** Resolve the repo's own SPDK-vs-master build failure:
+      `scripts/target/02-build-spdk-kv.sh` ran with `SPDK_TARGET_REF=master`
+      and `git am` could not apply
+      `patches/spdk/0002-spdk-bdev-kvmalloc.patch` (measured 2026-09-15, see
+      2.3's correction). The target was brought up this session anyway using
+      the prebuilt `/root/kv_spdk` (SPDK v26.05-pre, already carrying KV
+      target support) as a substitute — see HANDOFF §5's correction. Three
+      options, not decided: pin a compatible SHA that predates whatever
+      changed on master, rebase 0002/0003 onto current master, or adopt the
+      prebuilt tree as the reference and stop tracking master. Relevant to
+      6.1(b) — the from-source option is not viable until one of these is
+      chosen. *blocked by nothing; makes 2.3/2.4 partly moot until decided.*
+- [ ] **6.3** Decide the KV backend: **(A)** kernel `nvme-of` + XNVME_KV —
+      requires the 6.8 kernel work (6.5–6.8), unusable on the current
+      `5.15.0-191-generic` compute kernel (see the CSI-1 finding, HANDOFF
+      §10.4); or **(B)** SPDK_NVMe_KV userspace initiator — works today on
+      5.15, and is what 6.10–6.12 below actually exercise via the prebuilt
+      target. `config/cluster.env:279` already carries the `KV_BACKEND`
+      switch (`SPDK_NVMe_KV` default, `XNVME_KV` alternate) plus a
+      backend-aware `KV_MAX_VALUE_SIZE_EFFECTIVE`
+      (`config/cluster.env:434-462`) — confirmed present in the repo already,
+      nothing to build there. Switching `KV_BACKEND` changes the effective
+      max value size (524288 for SPDK_NVMe_KV vs 32768 for XNVME_KV, the
+      latter a measured DSC firmware ceiling, not a transport parameter) and
+      **requires draining the namespace** exactly as an explicit
+      `KV_MAX_VALUE_SIZE` edit does (HANDOFF §7 invariant 5) — the same
+      silent half-stale-read hazard applies to a backend switch, not only a
+      value edit. *blocked by nothing to choose (B) now; choosing (A) is
+      additionally blocked by 6.8.*
+- [ ] **6.4** **Urgent — check before any storage-leg roundtrip runs.** The
+      prebuilt target's transport came up reporting `max_io_size: 131072`
+      (128 KiB) — measured 2026-09-15 — not the 16 MiB ceiling HANDOFF §7
+      invariant 8's chunk-ceiling formula assumes ("current config is 10 MiB
+      against a 16 MiB ceiling — 37% headroom"). If `max_io_size` is the
+      ceiling `scripts/target/05-check-chunk-ceiling.sh` should actually be
+      checking against, the current 10 MiB chunk would **fail outright**,
+      not merely lose headroom — an 80x gap, not a thin margin. UNVERIFIED
+      whether 128 KiB is a fixed property of the prebuilt `/root/kv_spdk`
+      build/config or tunable; reconcile before trusting 05's pass/fail on
+      this target. *blocked by nothing; blocks 6.10 and 6.12 in practice.*
+- [ ] **6.5** *(Kernel upgrade sub-plan, step 1 of 4 — PAUSED at user
+      instruction this session; nothing installed, not failed.)* Install
+      `linux-image-generic-hwe-22.04` candidate `6.8.0-138.138~22.04.1`
+      (present in apt) on both compute nodes. Only needed if 6.3 chooses
+      backend (A). The installer script never even transferred to either
+      node this session. *blocked by 6.3 choosing (A).*
+- [ ] **6.6** Rebuild amdgpu DKMS for 6.8 — currently built only for 5.15.x
+      per node (`smc1` 6.16.13, `smc2` 6.18.4, both ROCm 7.13.0) — and
+      **verify `amdgpu.ko` exists for the new kernel before rebooting either
+      node**; do not reboot on faith. UNVERIFIED whether ROCm 7.13 + these
+      DKMS versions build cleanly against 6.8. *blocked by 6.5.*
+- [ ] **6.7** Stage the reboots **one compute node at a time**, never both
+      together, re-handling `modprobe.blacklist=amdgpu` per TODO 0.4 on each
+      boot (host-prep does this automatically; confirm it still does on the
+      new kernel). *blocked by 6.6.*
+- [ ] **6.8** Re-test that a KV namespace yields a `/dev/ngXnY` generic char
+      device (and no `/dev/nvmeXnY`) on the new kernel — the concrete
+      pass/fail for whether 6.8 actually closes the CSI-1 gap that disproved
+      the plugin header's claim on 5.15 (HANDOFF §10.4). Do not assume 6.8
+      fixes it without running this same test. *blocked by 6.7.*
+- [ ] **6.9** Make the kernel `nvme connect` persistent across reboot —
+      currently untracked (no `--persistent` flag, no systemd unit), and
+      every remaining backend-(A) storage step depends on the connection
+      existing; confirmed this session that it does **not** survive a reboot
+      (see TODO 0.4's recurrence note). Applies regardless of kernel
+      version. Not applicable to backend (B): SPDK's own initiator handles
+      its own reconnection. *blocked by 6.3 choosing (A); no-op for (B).*
+- [ ] **6.10** Compose `MultiConnector[NixlConnector, LMCacheMPConnector]`
+      with the chosen KV backend as the **live** LMCache storage tier
+      underneath a real P/D deployment. This exact combination has never
+      been run: the lab has proven (a) NixlConnector P/D over UCX
+      (`rixl-bench/stack/tracks/nixl/vllm/{08,11}-deploy-qwen-nixl*.sh`) and
+      (b) raw KV backends via `nixlbench` in isolation, but never (c) a KV
+      backend serving as an LMCache tier underneath a live P/D deployment
+      simultaneously. Treat as new integration, not reproduction — see
+      HANDOFF §10.3. *blocked by 6.3 (backend decision), 6.4 (chunk-ceiling
+      reconciliation) and 2.5–2.7 (target reachable + plugin build), or by
+      6.1 if the container path is chosen instead.*
+- [ ] **6.11** Prove leg A independently: a direct P→D NIXL transfer with
+      **no** LMCache/KV backend involved, following the rixl-bench pattern —
+      `NixlConnector` only, `kv_role` kv_producer/kv_consumer,
+      `kv_buffer_device`, `extra_config` `{hostname, port: 14579}`,
+      `NIXL_BACKEND=UCX`, no LMCache env/YAML at all. Set
+      `VLLM_NIXL_SIDE_CHANNEL_HOST` explicitly to the routable IP —
+      `extra_config.hostname` alone does not change vLLM's bind, which
+      defaults to localhost. Ports 5600 (prefill) / 5601 (decode); verify
+      with `ss -ltn`. Ties to existing 2.10. *blocked by 3.6 for RDMA; usable
+      on TCP now.*
+- [ ] **6.12** Prove leg B independently: an LMCache hit served from the KV
+      storage tier (LMCache → NIXL → the chosen backend), confirmed by a
+      non-zero connector-hit signal per HANDOFF §8 (`need to load:` and
+      `External prefix cache hit rate` in the logs), never by throughput or
+      by the flag's presence alone. *blocked by 6.10 and 6.4.*
+- [ ] **6.13** Generate/validate the LMCache YAML for the chosen backend
+      (`scripts/common/gen-lmcache-config.sh` /
+      `scripts/common/25-validate-lmcache-config.sh`) and confirm the
+      plugin's **reported** max value size at runtime matches
+      `KV_MAX_VALUE_SIZE_EFFECTIVE` for that backend — do not trust the
+      config file's value alone. Ties to HANDOFF §7 invariant 8, and to
+      6.4's open question about which figure (16 MiB assumed vs 131072
+      measured) is actually live. *blocked by 6.3.*
+- [ ] **6.14** Bring up the proxy/router and confirm the handoff field name
+      for whichever deployment model 6.1 lands on. If the container path is
+      adopted, the reference router is upstream vLLM's
+      `disagg_proxy_demo.py` (`--model --prefill HOST:PORT --decode
+      HOST:PORT --port`, health endpoint `/status` — **not** `/health`,
+      static CLI-arg endpoint discovery, no registry), not this repo's
+      `scripts/proxy/disagg_proxy.py` — 6.1 needs to settle which router the
+      repo targets. Watch for `disagg_proxy_demo.py` mislabelling a vLLM 400
+      as a 200 SSE stream (surfaces client-side as "stream ended without a
+      finish reason") — read the vLLM container logs, not the proxy, when
+      this happens. Also carries over the Qwen caveats from `rixl-bench`:
+      force `--dtype bfloat16` (their float16 default overflows to inf/NaN
+      on bf16-trained checkpoints), YARN config key is `rope_type` not
+      `type`, and TP is **not** derived from `HIP_VISIBLE_DEVICES` — it
+      defaults to 1 and silently single-GPU-loads if not set explicitly.
+      *blocked by 6.1.*
+- [ ] **6.15** Cross-instance reuse measurement, not confounded by vLLM's
+      own prefix cache (HANDOFF §8) or by same-endpoint repeats — ties to
+      existing 1.13 and to the storage-tier hit proven in 6.12. This is the
+      number that actually demonstrates the KV backend is doing anything.
+      *blocked by 6.12 and 1.13.*
+- [ ] **6.16** Both 200G data-plane NICs on the target report `Link
+      detected: no` — `enp132s0` (which holds `1.1.0.2`) and `enp100s0`,
+      measured 2026-09-15. The lab reference script
+      `target_scale_kv_spdk.sh` hardcodes listener `1.1.0.2`, which is
+      consequently unusable as written. The only reachable path to the
+      target right now is its 1 GbE management NIC (`tg3`); any storage-leg
+      throughput measured today is bounded by 1 Gb/s and not representative
+      — this compounds the existing caveat at HANDOFF §8. The two compute
+      nodes ARE on a common /24 management subnet and reach each other
+      directly, so leg A has a working path today independent of this.
+      *blocked by nothing here — needs the 200G links brought up
+      physically; no known fix, do not guess one.*
+- [ ] **6.17** Reclaim the now-redundant Qwen2.5-72B-Instruct copy in
+      `/root/.cache/huggingface/hub` (~136 GB/node) once
+      `/var/tmp/hf/Qwen2.5-72B-Instruct` (verified complete 2026-09-15:
+      37/37 shards, 0 missing, matches `model.safetensors.index.json`; 80
+      layers, 64 heads, 8 kv_heads, hidden 8192, bfloat16) is confirmed as
+      the actual bind-mount source (`/hf` in the container). `smc2` is down
+      to ~118 GB free. Housekeeping only — do not delete until the
+      bind-mount is actually in use, to avoid deleting the only copy
+      mid-transition. *blocked by 6.1 landing on the container path.*

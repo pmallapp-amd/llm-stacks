@@ -1,7 +1,7 @@
 # Handoff
 
-State of the P/D-disaggregated KV cache project, for whoever picks this up next
-(including future me). Last updated 2026-09-14.
+State of the P/D-disaggregated KV cache project, for whoever picks this up
+next (including future me). Last updated 2026-09-15.
 
 Read this before [BRINGUP.md](BRINGUP.md). It tells you what is real, what is
 assumed, and what is still wrong.
@@ -42,6 +42,15 @@ built an entire phase plan around the mistake.
 |---|---|---|---|
 | **A — P→D transfer** | prefill → decode, direct GPU-to-GPU via NIXL/UCX | TCP now → **RDMA = acceptance** | DSC Ethernet Controller `[1dd8:1002]` (10/node, `ionic` driver) |
 | **B — Shared KV storage** | both compute nodes → target over NVMe-oF | **TCP, permanently by design** | Same `[1dd8:1002]` ID on the target (2 present) — no distinguishing name confirmed |
+
+**Why leg B can only ever be an LMCache tier, never `NixlConnector`'s
+transport itself:** `NixlConnector`'s handshake (`getLocalMD()`) requires
+RDMA-style addressable memory. Storage/KV backends — SPDK_NVMe_KV and
+XNVME_KV alike — return `NIXL_ERR_INVALID_PARAM` there (verified from
+`/root/rixl-bench`'s `11-deploy-qwen-nixl-xnvme.sh`, quoted in full at
+§10.3). A KV backend can therefore never carry the P/D handshake itself; it
+is only reachable as an LMCache storage tier underneath NixlConnector, which
+is exactly what the composition below does.
 
 Composed as `MultiConnector[NixlConnector, LMCacheMPConnector]`: NixlConnector
 carries the P/D role and moves KV over RDMA; LMCache stays `kv_both` on both
@@ -102,6 +111,14 @@ blocker:
    because `libdrm-amdgpu1` is Ubuntu's `2.4.113-2~ubuntu0.22.04.1` while
    ROCm is 7.13.0 / hsa-rocr 7.2.0. `rocminfo` still correctly identifies
    `gfx942` and vLLM uses ROCr, not libdrm device names — see TODO 4.6.
+
+Also new this session (2026-09-15), not yet folded into a numbered blocker
+above because each is an open decision rather than something broken: the
+lab's actual working deployment is containerised, not built from source
+(§10.1); a KV backend can only ever be an LMCache tier, never
+`NixlConnector`'s transport (§1, §10.3); and the compute nodes' kernel
+cannot yield a `/dev/ngXnY` device for a KV namespace at all (§10.4). See
+TODO §6 for the plan this drives.
 
 2. **The P→D fabric (leg A) has no route yet — now the top blocker.**
    `smc1`'s data-plane addresses are `30.1.N.1/24`; `smc2`'s are
@@ -191,6 +208,17 @@ v26.05 has the KV *initiator* API but predates all four. Master carries 0001 and
 re-check `https://review.spdk.io/q/topic:kv+status:open`; when they land, the
 vendored copies can be dropped. See [patches/spdk/README.md](../patches/spdk/README.md).
 
+> **Correction 2026-09-15:** `scripts/target/02-build-spdk-kv.sh` was run
+> against `SPDK_TARGET_REF=master` and `git am` **failed** to apply
+> `0002-spdk-bdev-kvmalloc.patch` — master has moved since these patches were
+> vendored. The target for this session's work was brought up instead from
+> the **prebuilt** `/root/kv_spdk` (SPDK v26.05-pre, already carrying
+> `bdev_kvmalloc`/`kvbdev` and 11 KV command-set symbols), not from this
+> repo's build. This makes TODO 2.3/2.4 partly moot as written; the real
+> decision — pin a compatible SHA, rebase 0002/0003 onto current master, or
+> adopt the prebuilt tree as the reference — is tracked at TODO 6.2, not
+> decided here. See §10.4 for what was verified on that prebuilt target.
+
 ---
 
 ## 6. Verified vs assumed
@@ -234,9 +262,36 @@ when editing.
 - **`00-preflight.sh` on the target (SMC3)** — clean run, all 5 checks
   pass: 320 CPUs, 62 GiB RAM, no ROCm (expected), the two RDMA devices above,
   176.8 GiB free on `/opt`, kernel `6.8.0-38-generic`.
+- **The KV target now genuinely runs and is verified**, 2026-09-15 — via the
+  prebuilt `/root/kv_spdk`, not this repo's build (§5's correction):
+  namespace `KvMalloc0`, subsystem `nqn.2024-01.io.nixl:kv0`, listener on
+  the management IP port 4420, `max_io_qpairs_per_ctrlr: 512` confirmed (§7
+  invariant 7 holds). Also measured: `max_io_size: 131072` (128 KiB), **not**
+  the 16 MiB invariant 8 assumes — flagged, unresolved, see TODO 6.4.
+- **Kernel `nvme connect` against the KV namespace, 2026-09-15**: controller
+  attach succeeds (`/dev/nvme2`, correct `subsysnqn`, live state, "creating
+  128 I/O queues", `nvme list-ns` reports `[0]:0x1`, admin passthru works),
+  but **no namespace device node is created at all** — no
+  `/dev/nvme2n1` block device and no `/dev/ng2n1` char device — because the
+  kernel logs `unknown csi 1 for nsid 1` and has no fallback for a
+  Key-Value-command-set namespace. Same result for the local Pensando DSC KV
+  device (`nvme1`) — a kernel limitation, not a fabric one. Full detail and
+  its consequence for the plugin's own assumption at §10.4.
 
 ### Assumed — reconcile on first contact with hardware
 
+- **`plugins/xnvme-kv/xnvme_kv_backend.h:244-251`'s claim that a KV
+  namespace always appears as `/dev/ngXnY` with no matching
+  `/dev/nvmeXnY`, "Verified both ways on the Austin prefill node
+  2026-09-10" — DISPROVEN on these hosts, 2026-09-15.** Measured: the
+  kernel logs `unknown csi 1 for nsid 1` and creates **neither** device node
+  for a KV namespace on `5.15.0-191-generic` (both compute nodes) — not the
+  block device, and not the char device either. The plugin's own
+  `discover_kv_device()` heuristic therefore finds nothing on these hosts.
+  The 2026-09-10 verification must have run on a different kernel — the
+  **target** node here runs `6.8.0-38-generic` while both **compute** nodes
+  run `5.15.0-191-generic`. See §10.4. Remedy is the paused kernel-upgrade
+  sub-plan at TODO 6.5–6.8, itself unverified to actually fix this.
 - **LMCache YAML key names and the allowlist patch sites.** Derived against
   v0.5.4, validated only against a mock. `apply-patches.sh` fails loudly if it
   finds zero allowlist sites, because that means the assumption is stale.
@@ -333,6 +388,17 @@ management before the fabric route exists. Any storage-leg number measured
 that way is traversing a 1000 Mb/s `tg3` management NIC (`enp101s0`) and is not
 representative — the same kind of trap as above, one layer down.
 
+**Sharpened 2026-09-15: this is not only a routing gap, the physical links
+are down.** Both 200G data-plane NICs on the target — `enp132s0` (holding
+`1.1.0.2`) and `enp100s0` — report `Link detected: no`. The lab reference
+script `target_scale_kv_spdk.sh` hardcodes listener `1.1.0.2`, which is
+consequently unusable as written, independent of any routing fix. So the
+storage leg is bounded to 1 Gb/s not merely "until the fabric route exists"
+as the 2026-09-14 note framed it, but until someone brings the physical
+200G links up — no known fix, see TODO 6.16. Leg A is unaffected by this:
+the two compute nodes share a common /24 management subnet and reach each
+other directly today.
+
 ---
 
 ## 9. How to resume
@@ -352,9 +418,165 @@ representative — the same kind of trap as above, one layer down.
    single biggest open blocker is now the P→D fabric having no route (TODO
    3.6).
 4. Follow [BRINGUP.md](BRINGUP.md).
+5. Before touching the storage tier specifically, read §10 below and
+   [TODO.md §6](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier)
+   in full, and make the 6.1/6.2/6.3 decisions (deployment model, SPDK build
+   route, KV backend) before doing anything else in that section — none of
+   §6's later items mean much until those are settled.
 
 The first things likely to bite, in order: the P→D fabric having no route
 (3.6); the LMCache allowlist patch against whatever version actually
 installs; and the `kv_transfer_params` field name. (The amdgpu blacklist,
 formerly first on this list, is resolved — TODO 0.4 — but remember it must be
-redone after every reboot of either compute node.)
+redone after every reboot of either compute node, and this session confirmed
+that recurrence in practice, not just in theory.)
+
+---
+
+## 10. Reference deployment, container image contents, and the storage-backend transport constraint (2026-09-15)
+
+Everything below was measured directly on the three nodes and by inspecting
+`/root/rixl-bench` and the `rocm-aic` Docker images already present there —
+none of it is inferred. This is the session that produced TODO §6; read that
+section alongside this one.
+
+### 10.1 The deployment model this repo assumes does not match how the lab actually runs
+
+This repo's scripts build everything from source into `/opt/kvstack`
+(`scripts/common/{05-build-spdk-initiator,10-build-stack,
+20-build-vllm-lmcache}.sh`) and run vLLM from a venv. The lab's actual,
+working deployment is **containerised** and already present on both compute
+nodes:
+
+- Docker images `rocm-aic:{latest,mp-pd,kv-planefix,pr4467,kv-mppd,kv-mppd-assertfix}`
+  (~43.7 GB each), plus `rocm/vllm:latest` and `rocm/pytorch:latest` on `smc2`.
+- `rocm-aic:kv-mppd-assertfix` (built 2026-09-11), inspected directly: vLLM
+  0.26.0+rocm, LMCache 0.5.3, torch 2.13.0+rocm7.2, nvme-cli 2.8, libxnvme
+  with 5 `xnvme_kvs_*` symbols, and NIXL plugins **already built**:
+  `libplugin_UCX.so`, `libplugin_POSIX.so`, `libplugin_AIS_MT.so`,
+  `libplugin_SPDK_NVMe_KV.so`, **and** `libplugin_XNVME_KV.so`.
+  `NIXL_PLUGIN_DIR=/opt/nixl/lib/x86_64-linux-gnu/plugins`. Entrypoint is
+  `python3 -m vllm.entrypoints.openai.api_server`.
+
+This makes the entire from-source build chain redundant for bring-up as
+measured today. Whether the repo adopts the container path, keeps the
+from-source path, or supports both is an **open decision with tradeoffs, not
+made here** — see TODO 6.1.
+
+### 10.2 Reference deployment tooling: `/root/rixl-bench`
+
+Present on all three nodes; this is the provenance for this repo's target
+config, heavily commented. Relevant paths:
+
+```
+stack/tracks/nixl/vllm/08-deploy-qwen-nixl.sh
+stack/tracks/nixl/vllm/11-deploy-qwen-nixl-xnvme.sh
+bench/pd-disaggregation/deploy-pd-disaggregated.sh
+bench/pd-disaggregation/deploy-pd-asymmetric-p2p.sh
+bench/lib/deployment.sh
+stack/tracks/nixl/core/10-nixlbench-xnvme-kv.sh
+stack/tracks/nixl/core/xnvme-kv-plugin/build.sh
+```
+
+Key facts extracted:
+
+- The proven P/D deploy uses `kv_connector: NixlConnector` **only** —
+  `kv_role` kv_producer/kv_consumer, `kv_buffer_device` cpu (or cuda),
+  `extra_config {hostname, port: 14579}`, `NIXL_BACKEND=UCX`. **No LMCache at
+  all** — no `LMCACHE_*` env, no YAML, no `nixl_pool_size`, nothing.
+- The router is upstream vLLM's `disagg_proxy_demo.py`, run in the same
+  image, `--network host`, args `--model --prefill HOST:PORT --decode
+  HOST:PORT --port`, health endpoint `/status` (**not** `/health`). Endpoint
+  discovery is static CLI args; there is no registry.
+- `VLLM_NIXL_SIDE_CHANNEL_HOST` must be set to the routable IP — vLLM
+  defaults it to localhost, and setting only `extra_config.hostname` does
+  **not** change the bind. Ports 5600 (prefill) / 5601 (decode); verify with
+  `ss -ltn`.
+- Qwen caveats: `--dtype bfloat16` (their float16 default overflows to
+  inf/NaN on bf16-trained checkpoints); YARN needs key `rope_type`, not
+  `type`; TP is **not** derived from `HIP_VISIBLE_DEVICES` and defaults to 1,
+  which silently single-GPU-loads.
+- `disagg_proxy_demo.py` mislabels vLLM 400s as a 200 SSE stream — surfaces
+  client-side as "stream ended without a finish reason". Read the vLLM
+  container logs, not the proxy, when this happens.
+
+### 10.3 The core integration gap: a KV backend can never be NixlConnector's transport
+
+Both lab scripts state plainly that `NixlConnector`'s handshake
+(`getLocalMD()`) requires RDMA-style addressable memory, and that
+storage/KV backends — SPDK_NVMe_KV and XNVME_KV alike — return
+`NIXL_ERR_INVALID_PARAM` there. Quote, `11-deploy-qwen-nixl-xnvme.sh`:
+
+> "Storage/KV backends — SPDK_NVMe_KV *and* XNVME_KV alike — return
+> NIXL_ERR_INVALID_PARAM there, so they cannot serve as the live transfer
+> path for vLLM serving."
+
+So a KV storage backend can **never** be NixlConnector's transport. It can
+only be reached as an **LMCache storage tier** (LMCache → NIXL →
+XNVME_KV/SPDK_NVMe_KV) — exactly this repo's leg-B design, composed via
+`MultiConnector[NixlConnector, LMCacheMPConnector]` (§1).
+
+The consequence: the lab has run (a) NixlConnector P/D over UCX and (b) raw
+KV backends via `nixlbench` — but has **never** run (c) a KV backend as an
+LMCache tier underneath a live P/D deployment. That combination is **new
+integration**, not reproduction of a proven setup. Planned as such at
+TODO §6, with the unknowns named there.
+
+### 10.4 Kernel blocker for the XNVME_KV path — measured, definitive
+
+The SPDK NVMe-KV target was brought up on the target node using the prebuilt
+`/root/kv_spdk` (already carrying `bdev_kvmalloc`/`kvbdev` and 11 KV
+command-set symbols — this repo's own from-source build of patches
+0002/0003 **failed** to apply to SPDK master, see §5's correction). Target
+verified: namespace `KvMalloc0`, `nqn.2024-01.io.nixl:kv0`, listener on the
+management IP port 4420, `max_io_qpairs_per_ctrlr: 512` confirmed (§7
+invariant 7 holds). Also note the transport came up with `max_io_size:
+131072` (128 KiB), **not** 16 MiB — see the open question at TODO 6.4; this
+may invalidate invariant 8's stated headroom.
+
+A kernel `nvme connect` from the prefill node then:
+
+- **Succeeded** at the controller level: `/dev/nvme2` exists, `subsysnqn`
+  correct, state live, "creating 128 I/O queues", and `nvme list-ns` reports
+  the namespace `[0]:0x1`. Admin passthru works (`nvme id-ns` returns data).
+- But the kernel logs `nvme nvme2: unknown csi 1 for nsid 1` and creates
+  **no namespace device node at all** — no `/dev/nvme2n1` block device and
+  no `/dev/ng2n1` generic char device.
+- CSI 1 is the Key-Value command set. Both compute nodes run
+  `5.15.0-191-generic`, which has no KV support and does not fall back to a
+  char-only node.
+- The **same** message appears for the local Pensando DSC KV device
+  (`nvme1`) — this is a kernel limitation, not a fabric one.
+
+**This disproves the assumption in `plugins/xnvme-kv/xnvme_kv_backend.h:244-251`**,
+which asserts a KV namespace appears as `/dev/ngXnY` with no `/dev/nvmeXnY`
+and states it was "Verified both ways on the Austin prefill node
+2026-09-10." That verification must have run on a different kernel: the
+**target** node runs `6.8.0-38-generic` while **both compute** nodes run
+`5.15.0-191-generic` — the contradiction is explicit, and the plugin's own
+`discover_kv_device()` heuristic finds nothing on these hosts as they stand.
+
+Remedy path (paused, not started — TODO 6.5–6.8): the HWE kernel
+`linux-image-generic-hwe-22.04` candidate `6.8.0-138.138~22.04.1` is
+available in apt. Requires an amdgpu DKMS rebuild for 6.8 (currently built
+only for 5.15.x), staged single-node reboots, and re-handling
+`modprobe.blacklist=amdgpu` (TODO 0.4). **UNVERIFIED** whether ROCm 7.13 +
+amdgpu DKMS 6.16.13/6.18.4 work on 6.8. Nothing was installed this session —
+the installer script never transferred to either node.
+
+### 10.5 Also this session
+
+- **`nvme connect` does not persist across reboot** (no `--persistent` flag,
+  no systemd unit) — every remaining storage step depends on the connection
+  existing. TODO 6.9.
+- **Both compute nodes rebooted unexpectedly this session** (cause unknown —
+  provably not the paused kernel-upgrade work, since its installer never
+  reached either host). Both came back with 0 GPUs and `/dev/kfd` absent,
+  confirming TODO 0.4's predicted recurrence in practice, not just in theory.
+- **Model weights**: Qwen2.5-72B-Instruct was already present in
+  `/root/.cache/huggingface/hub` on both compute nodes (153 GB hub cache
+  total) and is now also staged at `/var/tmp/hf/Qwen2.5-72B-Instruct` (37/37
+  shards, 0 missing, verified against `model.safetensors.index.json`; 80
+  layers, 64 heads, 8 kv_heads, hidden 8192, bfloat16), intended as the
+  container's `/hf` bind-mount. The hub-cache copy is now redundant
+  (~136 GB/node); `smc2` is down to ~118 GB free. TODO 6.17.
