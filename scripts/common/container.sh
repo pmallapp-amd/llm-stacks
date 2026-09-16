@@ -73,6 +73,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 IMAGE="${KVSTACK_IMAGE:-rocm-aic:mp-pd-ionic2609}"
 SHM_SIZE="${KVSTACK_SHM_SIZE:-64g}"
+# Where the image keeps its NIXL plugins — the mount point for the rebuilt
+# XNVME_KV plugin (see cmd_plugin_build). Matches the image's own
+# NIXL_PLUGIN_DIR; kept separate from the shim's exported value so that
+# changing one cannot silently desync the bind-mount target.
+NIXL_PLUGIN_DIR_IN_IMAGE="${NIXL_PLUGIN_DIR_IN_IMAGE:-/opt/nixl/lib/x86_64-linux-gnu/plugins}"
 
 _cname() { echo "kvstack-$1"; }
 
@@ -215,10 +220,74 @@ PYEOF
     ok "wrote ${pdir}/nixl_utils.py (mounts over ${target})"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# plugin-build — rebuild the XNVME_KV NIXL plugin from THIS REPO's source.
+#
+# WHY: the rocm-aic image ships a plugin built from the vendor's separate
+# `kv-plugins/xnvme-kv-plugin/` tree (its own runtime log lines name that
+# path), and that build PREDATES this repo's queryMem() override. Measured
+# 2026-09-16 on the image's copy:
+#
+#   nm -D libplugin_XNVME_KV.so | c++filt | grep nixlXnvmeKvEngine::
+#     -> 25 methods, queryMem NOT among them; the only queryMem symbol is
+#        the WEAK base-class nixlBackendEngine::queryMem.
+#
+# plugins/xnvme-kv/xnvme_kv_backend.h's own header comment states exactly
+# what that costs: NIXL's base class answers NIXL_ERR_NOT_SUPPORTED, LMCache
+# reports EVERY L2 lookup as a miss, and "this backend then stores correctly
+# and can never read anything back: writes land and are unreachable... it is
+# also precisely what makes P/D disaggregation impossible, because a
+# receiver's entire job is to discover keys IT NEVER WROTE."
+#
+# That is not a prediction — it is what this cluster did: a real query drove
+# 283,520 stores / 1.16 GB onto the device, and no read ever followed.
+#
+# Configure options are the image's own, recovered from its build tree
+# (/tmp/xnvme-kv-build/meson-info/intro-buildoptions.json), so the rebuild
+# differs from the shipped artifact in SOURCE only, not in build config.
+cmd_plugin_build() {
+    local odir="${STACK_ROOT}/plugins"
+    mkdir -p "${odir}"
+    step "Rebuilding libplugin_XNVME_KV.so from ${REPO_ROOT}/plugins/xnvme-kv"
+
+    # No --device flags: compiling against ROCm HEADERS needs no GPU, so this
+    # stays runnable on a node whose amdgpu module is not loaded yet.
+    docker run --rm \
+        -v "${REPO_ROOT}:${REPO_ROOT}" -v "${odir}:/out" \
+        --entrypoint bash "${IMAGE}" -c '
+            set -e
+            rm -rf /tmp/xnvme-kv-rebuild
+            meson setup /tmp/xnvme-kv-rebuild '"${REPO_ROOT}"'/plugins/xnvme-kv \
+                -Dnixl_path=/opt/nixl \
+                -Dxnvme_incdir=/usr/local/include \
+                -Dxnvme_libdir=/usr/local/lib/x86_64-linux-gnu \
+                -Drocm_path=/opt/rocm \
+                -Denable_vram=true \
+                --prefix=/opt/nixl --buildtype=release >/dev/null
+            ninja -C /tmp/xnvme-kv-rebuild
+            cp /tmp/xnvme-kv-rebuild/libplugin_XNVME_KV.so /out/
+        ' || die "plugin rebuild failed — see the meson/ninja output above."
+
+    # Refuse to install a plugin that still lacks the override this whole
+    # function exists to restore. A silently-unpatched .so would reproduce
+    # the original bug while looking like a fix.
+    docker run --rm -v "${odir}:/out" --entrypoint bash "${IMAGE}" -c \
+        'nm -D --defined-only /out/libplugin_XNVME_KV.so | c++filt \
+            | grep -q "nixlXnvmeKvEngine::queryMem"' \
+        || die "the rebuilt plugin STILL has no nixlXnvmeKvEngine::queryMem" \
+               " override — the source in plugins/xnvme-kv did not provide it," \
+               " so installing this would silently reproduce the exact" \
+               " every-lookup-is-a-miss bug it is meant to fix."
+    ok "built ${odir}/libplugin_XNVME_KV.so (queryMem override present)"
+}
+
 cmd_up() {
     local role="$1"; local cname; cname="$(_cname "${role}")"
     local dev; dev="$(_role_dev)"
     local pdir; pdir="$(_PATCH_DIR)"
+    local plugin_so="${STACK_ROOT}/plugins/libplugin_XNVME_KV.so"
+
+    [ -f "${plugin_so}" ] || cmd_plugin_build
 
     [ -f "${pdir}/nixl_utils.py" ] && [ -f "${pdir}/target-path" ] \
         || cmd_vllm_patch
@@ -248,6 +317,7 @@ cmd_up() {
         -v "${STACK_ROOT}:${STACK_ROOT}" \
         -v "${HF_HOME}:${HF_HOME}" \
         -v "${pdir}/nixl_utils.py:${patch_target}:ro" \
+        -v "${plugin_so}:${NIXL_PLUGIN_DIR_IN_IMAGE}/libplugin_XNVME_KV.so:ro" \
         -e HF_HOME="${HF_HOME}" \
         -e XNVME_DEV="${dev}" \
         -e KV_BACKEND="${KV_BACKEND}" \
@@ -268,7 +338,8 @@ cmd_exec() {
 ACTION="${1:-}"; shift || true
 case "${ACTION}" in
     shim)   cmd_shim ;;
-    vllm-patch) cmd_vllm_patch ;;
+    vllm-patch)   cmd_vllm_patch ;;
+    plugin-build) cmd_plugin_build ;;
     up)     cmd_up "${1:?role required}" ;;
     exec)   cmd_exec "${1:?role required}" "${@:2}" ;;
     logs)   docker logs "${@:2}" "$(_cname "${1:?role required}")" ;;

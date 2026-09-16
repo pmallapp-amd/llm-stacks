@@ -1436,3 +1436,113 @@ otherwise.*
       path needs no vfio-pci, no hugepages and no DPDK/SPDK version
       pairing. Note a backend switch still requires draining the
       namespace — see 4.2 and the `KV_MAX_VALUE_SIZE_*` comments.
+
+### 6.21 The image's XNVME_KV plugin predates `queryMem()` — REBUILT, but it does not unlock cross-instance reuse
+
+**Measured 2026-09-16, first composed run on live hardware.**
+
+The `rocm-aic` image builds its plugin from the vendor's separate
+`kv-plugins/xnvme-kv-plugin/` tree (its own runtime log lines name that
+path), and that artifact — dated Sep 9 — predates this repo's
+`queryMem()` override:
+
+```
+nm -D libplugin_XNVME_KV.so | c++filt | grep nixlXnvmeKvEngine::
+  -> 25 methods; queryMem NOT among them.
+     The only queryMem symbol is the WEAK base nixlBackendEngine::queryMem.
+```
+
+`scripts/common/container.sh plugin-build` now rebuilds it from
+`plugins/xnvme-kv` with the image's OWN configure options (recovered from
+`/tmp/xnvme-kv-build/meson-info/intro-buildoptions.json`, so the rebuild
+differs in source only), refuses to install an artifact still missing the
+override, and `up` bind-mounts it over the image's copy. Verified:
+`T nixlXnvmeKvEngine::queryMem(...)`.
+
+**It did not produce a cross-instance hit, and the reason is not the
+plugin.** `query_memory` is called from exactly one place in the installed
+lmcache 0.5.3:
+
+```
+grep -rl query_memory lmcache/ -> v1/storage_backend/nixl_storage_backend.py
+```
+
+— the **in-process `LMCacheConnectorV1`** path, which this repo does not
+run. The MP daemon's **static `nixl_store` L2 adapter never calls it**.
+That adapter is an `_IndexPool` — "a thread-safe pool of integer indices
+representing pre-allocated storage slots" — and the chunk-to-slot mapping
+lives only in that daemon's memory. So the store is **slot-addressed, not
+content-addressed**: a daemon cannot discover a key it did not itself
+write, and the mapping dies with the process.
+
+Consequence, and it is architectural rather than a bug to fix here:
+
+- Within one daemon lifetime the L2 tier is a genuine capacity extension
+  (spill past L1) — that part works and is measured (6.22).
+- **Cross-node and post-restart reuse through the shared KV device is not
+  reachable via this adapter**, no matter what the plugin exports.
+  Demonstrated: prefill stored 238,903 objects / 978 MB; decode, restarted
+  with empty L1 and empty vLLM prefix cache, was then handed the identical
+  prompt and recomputed all of it (`Avg prompt throughput: 1041.4`,
+  `External prefix cache hit rate: 0.0%`).
+- Cross-node KV movement therefore happens over the **P→D `NixlConnector`
+  handoff**, which does work — the same stack shows decode at
+  `Avg prompt throughput: 0.0` / `External prefix cache hit rate: 100.0%`
+  on a proxy-routed request.
+
+Open, and NOT actioned here because both options are worse than the
+status quo without evidence: `nixl_store_dynamic` is the adapter that
+would key by content, but `start-lmcache-daemon.sh`'s header already
+documents why it was rejected — it is file-oriented, requires
+`backend_params["file_path"]`, does `os.makedirs`, and registers
+`mem_type="FILE"`, none of which suits a KV-keyed device. Re-evaluate only
+with a measurement, not a preference.
+
+### 6.22 The KV pipeline is 8x64, and the DSC wedges under sustained load
+
+**Measured 2026-09-16 alongside 6.21.**
+
+Pipeline ceiling is **8 queues x 64 queue depth = 512** outstanding ops —
+the depth is the plugin's fixed default (`xnvme_kv_backend.cpp:634`), and
+both counters agree: `peak_in_flight: 512`, and the stall message reports
+exactly `64 in flight` on the wedged queue. (An earlier guess of 8x256 in
+the deployment write-up was wrong.)
+
+Two separate things show up in the metrics and should not be conflated:
+
+- **`submit_retry: 1,367,781,109` is a SPIN COUNT, not an error count.**
+  On transient `-EBUSY/-EAGAIN/-ENOMEM` `submit_one()` returns `kRetry`,
+  the reactor pushes the item back and breaks to poke for completions —
+  correct behaviour, but the outer loop has no sleep or yield, so a
+  saturated device is polled at memory speed across all 8 reactor threads.
+  Harmless to correctness; it burns 8 cores and makes the counter
+  meaningless as a health signal. A short backoff on the `kRetry` path
+  would fix both.
+- **`completions_err: 192` is real, dropped stores.** The 30 s stall check
+  fired and `fail_queued_work()` failed queued items. The device genuinely
+  stopped completing — the plugin distinguishes this from queue-full
+  explicitly and refuses to attempt recovery, which is right: per the
+  `stall_timeout_ns_` declaration, only a DPU-side restart clears a wedged
+  DSC and host-side resets make it worse. Logged verbatim:
+
+```
+queue made no forward progress for 30s: 37705 op(s) queued, 64 in flight
+```
+
+  37,705 items backed up behind one wedged queue. This is the same failure
+  the standalone round-trip hits: `--size` of 1 MiB / 2 MiB / 4 MiB pass,
+  8 MiB (2048 parts) and 64 MiB fail.
+
+**Not reconciled, and left stated rather than smoothed over:** the stall
+log reports 37,705 queued items, but only 192 stores were counted as
+failed (238,903 submitted vs 238,711 ok) — 192 is also exactly
+`3 stalls x 64`. Whether `fail_queued_work()`'s `local`/`mbox` drain is
+being under-counted, or the queued backlog drained normally after the
+stall was reported, is unresolved. Do not quote either number as the
+dropped-chunk count until this is settled.
+
+Actionable, in order: (a) add backoff to the `kRetry` path; (b) establish
+whether the wedge is load-rate or total-bytes triggered, since that
+decides whether widening the pipeline helps or just reaches the wedge
+sooner; (c) raise with the DSC vendor with the stall log above — this is
+DPU-side behaviour, not something the plugin can resolve.
