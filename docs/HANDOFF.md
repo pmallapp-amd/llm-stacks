@@ -1454,3 +1454,144 @@ up (TODO 6.19), this is active work by another party on the same machines.
 Some observations in this section may be racing their changes — re-verify
 before acting on anything here, and find out who else is on these boxes
 (TODO 6.18).
+
+---
+
+## 14. The DSC software was updated — §13 is half-fixed, and the other half is now precisely characterised (2026-09-16)
+
+Another party installed a matched AMD DSC bundle for 24.04 between
+sessions — §13.6's remediation option (1). Re-measured on both compute
+nodes. The picture is better and much sharper.
+
+> **Tooling note:** the tool for this is `show_gid` (there is no
+> `show_igb` on either node). It prints the per-device GID table with the
+> associated netdev, and is the only convenient way to confirm both the
+> `UCX_IB_GID_INDEX` value and the `ionic_N` → netdev mapping at once.
+
+### 14.1 Break one — userspace provider ABI — FIXED
+
+| | Before (§13) | Now |
+|---|---|---|
+| `libionic1` | `rc` (removed), `~ubu22.04` | **`ii` 50.0.26.06.3.001-1** |
+| Provider file | only `libionic-rdmav59.so` (orphan) | **`libionic-rdmav34.so`** present |
+| `ionic_rdma` | `26.09.4.001~ubu22.04` | **`26.06.9.001`** |
+| `ibv_devinfo` | `No IB devices found` | **works** |
+
+Identical on `smc1` and `smc2`. The `~ubu22.04` suffix is gone — this is
+a 24.04-matched build, which is what §13.6 asked for. The stale
+`libionic-rdmav59.so` orphan is still on disk and is now harmless.
+
+`show_gid` returns **24 GIDs per node**, three per device:
+
+```
+ionic_0  1  0  fe80::...                   v2  benic1p1   link-local IPv6
+ionic_0  1  1  ::ffff:30.1.1.1   30.1.1.1  v2  benic1p1   IPv4 RoCEv2
+ionic_0  1  2  2001:0db8:0001::1           v2  benic1p1   global IPv6
+```
+
+**This confirms `UCX_IB_GID_INDEX=1` in `config/cluster.env` is correct** —
+index 1 is the IPv4 RoCEv2 GID on every device, on both nodes. That value
+was previously a default nobody had verified.
+
+### 14.2 Break two — NOT fixed, but it is narrower than §13 claimed
+
+The `ib_mad QP1` / `CREATE_QP ... BAD_ATTR` failures still occur, and they
+are **contemporaneous with the new driver**, not leftovers:
+
+```
+06:06:26  boot
+06:10:50  ionic_rdma : AMD Pensando RoCE HCA driver     <- NEW module loads
+06:10:50  infiniband ionic_0: Couldn't create ib_mad QP1
+06:10:51  ionic 0000:a5:00.3 ionic_5: opcode CREATE_QP (2) error BAD_ATTR (5)
+```
+
+But §13 characterised the consequence too broadly. Measured directly:
+
+| Path | Result |
+|---|---|
+| Device enumeration (`ibv_devinfo`, `show_gid`) | **works** |
+| **RC QP** create + data (`ibv_rc_pingpong`, GID idx 1) | **WORKS** — 6.8 Gbit/s, 9.6 µs/iter (`smc1`); 5.9 Gbit/s, 11.1 µs (`smc2`) |
+| **UD QP** create (`ibv_ud_pingpong`) | **FAILS** — `Couldn't create QP` |
+| **`rdma_cm`** connect (`rping`) | **FAILS** — `rdma_connect: Invalid argument` |
+| GSI/MAD QP1 (a UD QP) | **FAILS** — `CREATE_QP BAD_ATTR` |
+
+**The pattern is: this driver/firmware cannot create UD queue pairs. RC
+queue pairs work and move data.** QP1 is a UD QP, which is why the MAD
+agent fails; `rdma_cm` fails downstream of that because CM MADs ride the
+GSI QP.
+
+So §13's "no verbs layer for a route to carry" is **no longer true** — there
+is a working RC verbs layer today. §13's narrower claim, that `rdma_cm`
+cannot establish a connection regardless of `state=ACTIVE`, is **confirmed
+exactly**.
+
+### 14.3 Why this probably does not block us
+
+NIXL/UCX do not need `rdma_cm`. NixlConnector exchanges agent metadata
+over its **own** side channel — that is precisely the `getLocalMD()` /
+`loadRemoteMD()` path §11 fixed — and then programs QPs directly with
+`ibv_modify_qp`. `ibv_rc_pingpong` above works the same way (out-of-band
+TCP exchange, no `rdma_cm`) and succeeds.
+
+**Caveat that must be tested, not assumed:** `UCX_TLS=ib,...` (invariant 6)
+expands `ib` to include UD-based transports (`ud_verbs`, and `rc_verbs`
+uses a UD QP for some connection-establishment modes). On this hardware
+those will fail. Phase 2 may need `UCX_TLS` narrowed to RC explicitly
+rather than the `ib` alias. Tracked as TODO 3.9 — do not edit invariant 6
+until it is measured, because the invariant's *reason* (never let RDMA
+acceptance pass on a silent TCP fallback) remains valid and the fix must
+preserve it.
+
+### 14.4 The `ionic_N` → netdev mapping changed — TODO 2.8 is stale
+
+Measured on both nodes, now **symmetric and all eight up**:
+
+```
+smc1:  ionic_0..7 -> benic1p1..benic8p1   all up   30.1.1.1 .. 30.1.8.1
+smc2:  ionic_0..7 -> benic1p1..benic8p1   all up   30.2.1.1 .. 30.2.8.1
+```
+
+TODO 2.8 and §6 record that on `smc2` only `ionic_2/3/5/6` lined up, and
+that `ionic_0/1` were `enp10s0`/`enp39s0` and **down**. That is no longer
+the case. The creds pin `PREFILL_UCX_NET_DEVICES=DECODE_UCX_NET_DEVICES=ionic_2:1`
+is still *valid* (ionic_2 is `benic3p1` on both), but it was chosen to work
+around an asymmetry that no longer exists, and any index would now do.
+
+**This is the fifth expired fact in two sessions** — see §13.4's table. The
+pattern is now established well enough to state as a rule: *on this
+cluster, any recorded measurement of driver, device, or library state has
+a shelf life, because the hardware is shared and changes under us
+(§13.7).* Re-measure rather than trust, and prefer a check that fails
+loudly over a note in a document.
+
+### 14.5 Firmware is not identical across the two nodes
+
+```
+smc1 (prefill):  fw_ver: 1.130.0-pi-121
+smc2 (decode):   fw_ver: 1.130.0-a-120
+```
+
+Different build suffix and different build number. Both nodes carry the
+same driver (`26.06.9.001`) and the same userspace (`50.0.26.06.3.001-1`),
+so this is a firmware-only skew. Not known to cause a problem — RC works
+on both — but RDMA is a two-sided protocol and leg A is exactly a
+cross-node RC path, so this is worth levelling before trusting any P↔D
+RDMA result. Recorded, not chased. TODO 3.10.
+
+### 14.6 What is now the actual blocker for Phase 2
+
+Routing, as TODO 3.6 always said — the IPv4 fabric addresses are still
+`30.1.N.1/24` on `smc1` and `30.2.N.1/24` on `smc2`, different `/24`s with
+no route. §13 re-scoped 3.6 behind 3.7 on the grounds that there was no
+verbs layer; that re-scoping is now **partly withdrawn**: there is an RC
+verbs layer, so routing is operative again, with 3.9 (UD/UCX_TLS) beside
+it.
+
+One observation worth following up rather than acting on: the **index-2
+global IPv6 GIDs share a common `2001:0db8::/32`** — `smc1` holds
+`2001:0db8:0001::1`..`0008::1`, `smc2` holds `2001:0db8:0009::1`..`0010::1`
+— whereas the IPv4 GIDs differ in the second octet with no route. Distinct
+`/64`s still need routing between them, so this is not a free path, but it
+is a materially different addressing situation from IPv4 and may be the
+easier one to route. RoCEv2 over the IPv6 GID is legitimate. Do not guess
+a configuration from this; measure whether a route exists first.
