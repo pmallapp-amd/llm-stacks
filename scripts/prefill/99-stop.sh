@@ -44,3 +44,15 @@ if [ "${CLEAN_SHM}" -eq 1 ]; then
 fi
 
 ok "vllm-prefill stopped"
+
+# The LMCache MP daemon is this node's own separate host process (started
+# by scripts/prefill/03-start-prefill.sh via scripts/common/
+# 30-start-lmcache-daemon.sh, not by vllm-prefill itself) — stopping
+# vllm-prefill above does not touch it. --clean-shm is forwarded so a
+# single flag here cleans up after BOTH processes' SHM segments, exactly
+# as start-prefill.sh starts both with a single command.
+if [ "${CLEAN_SHM}" -eq 1 ]; then
+    "${REPO_ROOT}/scripts/common/31-stop-lmcache-daemon.sh" --clean-shm
+else
+    "${REPO_ROOT}/scripts/common/31-stop-lmcache-daemon.sh"
+fi

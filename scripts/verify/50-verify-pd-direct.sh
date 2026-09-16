@@ -15,8 +15,11 @@
 #                itself, since that is where ${LOG_DIR}/vllm-{prefill,
 #                decode}.log actually live — see the per-check notes.
 # Prerequisites: scripts/prefill/03-start-prefill.sh,
-#                scripts/decode/03-start-decode.sh up, PD_ENABLED=1 (the
-#                default — see config/cluster.env).
+#                scripts/decode/03-start-decode.sh up. P/D disaggregation
+#                is always on in this architecture (there is no PD_ENABLED
+#                switch anymore — see config/cluster.env's "Compute leg"
+#                section: composition is fixed as
+#                MultiConnector[NixlConnector, LMCacheMPConnector]).
 # Next step:     none — this is the acceptance rung for the direct P->D
 #                leg specifically. scripts/verify/40-verify-disagg.sh
 #                remains the broader "did caching help at all" proof.
@@ -62,14 +65,8 @@ DECODE_BASE="http://${DECODE_HOST}:${DECODE_PORT}"
 
 step "P->D direct-transfer verification (distinct from a storage/L2 cache hit)"
 banner_config
-log "PD_ENABLED=${PD_ENABLED} PD_CONNECTOR=${PD_CONNECTOR} PD_LMCACHE_FIRST=${PD_LMCACHE_FIRST}" \
-    " PD_HANDOFF_FIELD=${PD_HANDOFF_FIELD}"
-
-if [ "${PD_ENABLED}" != "1" ]; then
-    die "PD_ENABLED=${PD_ENABLED} — the direct leg is disabled" \
-        " (config/cluster.env's revert switch). There is nothing for this" \
-        " script to verify; set PD_ENABLED=1 and restart both roles first."
-fi
+log "connector composition (fixed, not configurable): MultiConnector[NixlConnector," \
+    " LMCacheMPConnector], NixlConnector FIRST — PD_HANDOFF_FIELD=${PD_HANDOFF_FIELD}"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}"' EXIT
@@ -197,8 +194,12 @@ else
     warn "$(cat "${WORKDIR}/handoff.err")"
     warn "THIS IS THE SIGNATURE OF A MISCONFIGURED DIRECT LEG (per" \
          " scripts/proxy/disagg_proxy.py's prefill_no_handoff counter):" \
-         " either NixlConnector isn't composed into --kv-transfer-config" \
-         " (check PD_ENABLED, gen-kv-transfer-config.sh's output), or this" \
+         " either NixlConnector isn't actually composed into" \
+         " --kv-transfer-config on prefill (check" \
+         " gen-kv-transfer-config.sh's actual emitted output — the" \
+         " composition is hardcoded to MultiConnector[NixlConnector," \
+         " LMCacheMPConnector], so this would be a real bug in that" \
+         " generator, not a config flag left in the wrong state), or this" \
          " installed vLLM names the handoff field something other than" \
          " '${PD_HANDOFF_FIELD}' — override PD_HANDOFF_FIELD in" \
          " config/cluster.env if so."
@@ -306,9 +307,20 @@ else
         warn "VERDICT (request 3): served by LMCache L2 (storage-mediated" \
              " reuse tier), NOT the direct NixlConnector leg — the" \
              " required 'need to load:'/'External prefix cache hit rate'" \
-             " signals were absent. Check PD_LMCACHE_FIRST (should be 0" \
-             " for NixlConnector to get first refusal) and confirm" \
-             " PD_ENABLED=1 actually took effect on both roles."
+             " signals were absent. THIS IS NOW A REAL BUG, not a config" \
+             " mistake to dial: connector order is HARDCODED as" \
+             " MultiConnector[NixlConnector, LMCacheMPConnector] with" \
+             " NixlConnector FIRST (config/cluster.env's 'Compute leg'" \
+             " section — MultiConnector.get_num_new_matched_tokens() gives" \
+             " the match to whichever child reports non-zero FIRST, and" \
+             " there is no longer a PD_LMCACHE_FIRST switch to have gotten" \
+             " this backwards). If LMCache is winning the match instead of" \
+             " NixlConnector, check scripts/common/gen-kv-transfer-config.sh's" \
+             " actual emitted --kv-transfer-config on decode for the real" \
+             " child order, and confirm the direct leg's prerequisites" \
+             " (NIXL side-channel reachability, F2; UCX_NET_DEVICES" \
+             " resolving to a routable interface) actually held for this" \
+             " request — see scripts/verify/10-verify-network.sh."
     elif [ "${_vllm_prefix_hit}" = 1 ]; then
         warn "VERDICT (request 3): apparently served by vLLM's OWN prefix" \
              " cache — unexpected for a fresh nonce decode has never seen;" \

@@ -1,29 +1,42 @@
 #!/usr/bin/env python3
-"""_kv_roundtrip.py — cross-PROCESS NIXL STORE/RETRIEVE proof for the
-SPDK_NVMe_KV backend. Invoked by scripts/verify/30-verify-kv-roundtrip.sh,
-once per OS process (--write, then --read as a SEPARATE `python` invocation
-— never imported and called twice in one interpreter), which is the whole
-point: this is testing that a process that never saw the writer's memory
-can independently derive the SAME on-wire key and find the SAME bytes.
+"""_kv_roundtrip.py — cross-PROCESS NIXL STORE/RETRIEVE proof for whichever
+storage backend KV_BACKEND selects (SPDK_NVMe_KV against SMC3's NVMe-oF
+target, or XNVME_KV against a LOCAL Pensando DSC char device — see
+config/cluster.env's KV_BACKEND comment). Invoked by
+scripts/verify/30-verify-kv-roundtrip.sh, once per OS process (--write,
+then --read as a SEPARATE `python` invocation — never imported and called
+twice in one interpreter), which is the whole point: this is testing that
+a process that never saw the writer's memory can independently derive the
+SAME on-wire key and find the SAME bytes.
 
 WHY the payload is derived from --nonce + --size rather than passed
 in-band between the two processes: LMCache's real content-derived key
 (NixlDynamicStorageAgent._format_object_key(), see
-scripts/common/gen-lmcache-config.sh's "THE CONTENT-DERIVED-KEY CONSTRAINT")
-works precisely because BOTH the prefill process that stores a KV chunk and
-the decode process that looks it up compute the identical hash from
-identical input (the same model + token content) without either one telling
-the other what the hash is. Mirroring that here — both --write and --read
+scripts/common/gen-lmcache-config.sh's "THE CONTENT-DERIVED-KEY CONSTRAINT"
+and, for the XNVME_KV-specific key-derivation detail,
+tmp/TOPOLOGY-KV-DATAPATH.md §4.3's "Two key namespaces" section) works
+precisely because BOTH the prefill process that stores a KV chunk and the
+decode process that looks it up compute the identical hash from identical
+input (the same model + token content) without either one telling the
+other what the hash is. Mirroring that here — both --write and --read
 derive metaInfo purely from (nonce, size), never from each other — is what
 makes this test actually exercise cross-process key AGREEMENT rather than
 just cross-process plumbing.
 
 Multipart split: mimics LMCache's own sub-key convention documented in
-plugins/nvme-kv/spdk_nvme_kv_backend.h's make_key() comment — "LMCache
-names objects obj_{slot}_{uuid4}[#{part}]" — i.e. chunk `i` of a
-multi-part page is stored under `f"{base_meta}#{i}"`. A --size larger than
-KV_MAX_VALUE_SIZE is REQUIRED to exercise this at all; see
-30-verify-kv-roundtrip.sh's --size default and comment.
+plugins/nvme-kv/spdk_nvme_kv_backend.h's make_key() comment (and, for
+XNVME_KV, tmp/TOPOLOGY-KV-DATAPATH.md §4.5's "`mem_split_n` — and the
+`#{j}` landmine") — "LMCache names objects obj_{slot}_{uuid4}[#{part}]",
+i.e. chunk `i` of a multi-part page is stored under `f"{base_meta}#{i}"`.
+That suffix is LOAD-BEARING for XNVME_KV specifically, which keys off
+metaInfo and ignores addr/offset entirely: drop the suffix and every
+sub-part after the first silently overwrites the one before it, with no
+error at any layer. A --size larger than KV_MAX_VALUE_SIZE_EFFECTIVE is
+REQUIRED to exercise this split path at all — see
+30-verify-kv-roundtrip.sh's --size default and comment, and this file's
+own do_read() byte-compare, which is the only thing that would ever catch
+a collapsed suffix (or, on SPDK_NVMe_KV, an off-by-one in the split
+boundary arithmetic).
 """
 from __future__ import annotations
 
@@ -266,7 +279,10 @@ def do_read(agent, backend, meta_infos: list[str], expected_chunks: list[bytes])
                 "key does NOT exist on the target. Either the writer "
                 "process never ran / failed silently, this reader is "
                 "pointed at a DIFFERENT namespace/target than the writer "
-                "(check KV_TRID matches on both sides), or "
+                "(check KV_TRID matches on both sides for SPDK_NVMe_KV, or "
+                "XNVME_DEV/--dev-uri matches on both sides for XNVME_KV — "
+                "note XNVME_KV is a LOCAL device, so writer and reader must "
+                "run on the SAME host to share one namespace), or "
                 "KV_SLOT_OFFSET_PREFILL/KV_SLOT_OFFSET_DECODE + a "
                 "metaInfo-LESS caller collided this key with something "
                 "else (see scripts/target/50-reset-namespace.sh if you "
@@ -340,11 +356,18 @@ def do_read(agent, backend, meta_infos: list[str], expected_chunks: list[bytes])
             f"{len(expected_full)} bytes, first differing byte at offset "
             f"{first_diff!r}. THIS IS THE SILENT-CORRUPTION SIGNATURE "
             "described in plugins/nvme-kv/spdk_nvme_kv_backend.h's "
-            "make_key() comment: two deployments (or two split geometries "
-            "of the SAME deployment) sharing a key space produced a "
-            "collision. Check KV_SLOT_OFFSET_PREFILL/KV_SLOT_OFFSET_DECODE "
-            "are disjoint, and if KV_MAX_VALUE_SIZE was ever changed on "
-            "this namespace, drain it first: "
+            "make_key() comment (and, for XNVME_KV, "
+            "tmp/TOPOLOGY-KV-DATAPATH.md §4.5's `#{j}` landmine): two "
+            "deployments (or two split geometries of the SAME deployment) "
+            "sharing a key space produced a collision — for XNVME_KV "
+            "specifically this means the multipart split's `#{j}` suffix "
+            "collapsed, since that backend keys purely off metaInfo and "
+            "ignores addr/offset, so later sub-parts silently overwrite "
+            "earlier ones with no error at any layer. Check "
+            "KV_SLOT_OFFSET_PREFILL/KV_SLOT_OFFSET_DECODE are disjoint "
+            "(SPDK_NVMe_KV), and if KV_MAX_VALUE_SIZE/"
+            "KV_MAX_VALUE_SIZE_EFFECTIVE was ever changed on this "
+            "namespace/device, drain or reformat it first: "
             "scripts/target/50-reset-namespace.sh."
         )
         sys.exit(1)

@@ -245,14 +245,19 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. plugins/xnvme-kv (optional — local DSC-attached KV devices)
+# 5. plugins/xnvme-kv (XNVME_KV) — the ONLY OTHER KV backend this repo
+#    vendors, talking to a LOCAL Pensando DSC char device via libxnvme's
+#    io_uring_cmd passthru rather than a remote NVMe-oF target. A
+#    "successful" build with this step silently skipped would leave that
+#    backend entirely unavailable, so — unlike a genuinely optional
+#    step — missing libxnvme is a hard `die`, below, not a skip.
 # ─────────────────────────────────────────────────────────────────────────────
 if [ "${SKIP_PLUGINS}" -eq 1 ]; then
     info "step 5/6: plugins/xnvme-kv — skipped (--skip-plugins)"
 elif [ -e "${NIXL_PLUGIN_DIR}/libplugin_XNVME_KV.so" ]; then
     ok "step 5/6: XNVME_KV plugin already installed — skip (rm to force rebuild)"
 else
-    step "5/6: plugins/xnvme-kv (optional)"
+    step "5/6: plugins/xnvme-kv (XNVME_KV) -> ${NIXL_PLUGIN_DIR}"
     XNVME_INCDIR="${XNVME_INCDIR:-}"
     XNVME_LIBDIR="${XNVME_LIBDIR:-}"
     if [ -z "${XNVME_INCDIR}" ] && command -v pkg-config >/dev/null 2>&1 \
@@ -272,10 +277,24 @@ else
     fi
 
     if [ -z "${XNVME_INCDIR}" ] || [ -z "${XNVME_LIBDIR}" ]; then
-        info "libxnvme headers/lib not found — skipping xnvme-kv plugin" \
-             " (only needed for local DSC-attached KV devices, not this" \
-             " cluster's remote-NVMe-oF topology). Set XNVME_INCDIR /" \
-             " XNVME_LIBDIR to force-enable."
+        die "libxnvme headers/lib NOT FOUND (incdir='${XNVME_INCDIR:-<empty>}'" \
+            " libdir='${XNVME_LIBDIR:-<empty>}') — this is FATAL, not" \
+            " optional: XNVME_KV is the ONLY KV backend this architecture" \
+            " supports (no remote NVMe-oF target, no SPDK anywhere), so a" \
+            " build that silently skips this step ships with NO KV BACKEND" \
+            " AT ALL and every vLLM launch's NIXL createBackend() will fail" \
+            " with 'unsupported backend' the moment it tries to load" \
+            " XNVME_KV. Checked: pkg-config --exists xnvme;" \
+            " /usr/local/include|/usr/include for libxnvme.h;" \
+            " /usr/local/lib/x86_64-linux-gnu|/usr/lib/x86_64-linux-gnu|" \
+            "/usr/local/lib for libxnvme.so. Install libxnvme" \
+            " (https://github.com/xnvme/xnvme — 'meson setup builddir &&" \
+            " meson compile -C builddir && meson install -C builddir', or" \
+            " your distro's libxnvme-dev/xnvme package if it ships one)," \
+            " then re-run. If it's installed somewhere non-standard, set" \
+            " XNVME_INCDIR=/path/to/include and" \
+            " XNVME_LIBDIR=/path/to/lib explicitly rather than relying on" \
+            " autodetection."
     else
         info "libxnvme found: incdir=${XNVME_INCDIR} libdir=${XNVME_LIBDIR}"
         ENABLE_VRAM=true
@@ -297,25 +316,17 @@ else
         _xnvme_plugin_so="${NIXL_PLUGIN_DIR}/libplugin_XNVME_KV.so"
         require_file "${_xnvme_plugin_so}"
 
-        # ── Post-build verification: NOT optional, but a DIFFERENT check
-        #    than SPDK_NVMe_KV's above. That check asserts ABSENCE of
-        #    librte_*/libspdk_* DT_NEEDED entries, because this plugin's
-        #    static archives must never leak a shared-lib dependency at all.
-        #    XNVME_KV is not built that way: it legitimately links libxnvme.so
-        #    DYNAMICALLY (see plugins/xnvme-kv/meson.build) — a DT_NEEDED on
-        #    libxnvme.so here is CORRECT and expected, so asserting its
-        #    absence would be asserting this plugin is broken. What DOES
-        #    carry over from the SPDK check, unchanged, is the underlying
-        #    failure mode it exists to catch: NIXL loads plugins via
-        #    dlopen(), an UNRESOLVABLE DT_NEEDED (libxnvme.so not on any
-        #    loader path in the deployed image, e.g. built against a
-        #    dev-host libxnvme that never got shipped) makes dlopen() fail,
-        #    and NIXL's plugin manager reports that as a bare "unsupported
-        #    backend" with nothing pointing at libxnvme specifically. So this
-        #    check asserts every DT_NEEDED entry RESOLVES (no "not found" in
-        #    ldd's output) — same failure caught, opposite assertion, because
-        #    "must not depend on X" and "must be able to find X" are
-        #    different properties and this plugin only needs the second one.
+        # ── Post-build verification: NOT optional. ──────────────────────
+        #    XNVME_KV legitimately links libxnvme.so DYNAMICALLY (see
+        #    plugins/xnvme-kv/meson.build) — a DT_NEEDED on libxnvme.so here
+        #    is CORRECT and expected. What matters is that it RESOLVES: NIXL
+        #    loads plugins via dlopen(), an UNRESOLVABLE DT_NEEDED
+        #    (libxnvme.so not on any loader path in the deployed image, e.g.
+        #    built against a dev-host libxnvme that never got shipped) makes
+        #    dlopen() fail, and NIXL's plugin manager reports that as a bare
+        #    "unsupported backend" with nothing pointing at libxnvme
+        #    specifically. So this check asserts every DT_NEEDED entry
+        #    RESOLVES (no "not found" in ldd's output).
         info "verifying ${_xnvme_plugin_so} has no unresolved DT_NEEDED entries"
         _xnvme_ldd_out="$(ldd "${_xnvme_plugin_so}" 2>&1 || true)"
         if echo "${_xnvme_ldd_out}" | grep -qi 'not found'; then

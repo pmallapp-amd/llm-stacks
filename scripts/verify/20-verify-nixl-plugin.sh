@@ -10,7 +10,10 @@
 #                scripts/common/20-build-vllm-lmcache.sh (nixl python
 #                bindings importable in ${VENV}); the NVMe-oF target on
 #                SMC3 already listening (scripts/verify/10-verify-network.sh
-#                clean on the storage leg is a good pre-check).
+#                clean on the storage leg is a good pre-check) when
+#                KV_BACKEND=SPDK_NVMe_KV, or ${XNVME_DEV} present on THIS
+#                host when KV_BACKEND=XNVME_KV (a local device — nothing on
+#                the network to verify before this in that case).
 # Next step:     scripts/verify/30-verify-kv-roundtrip.sh — this script only
 #                proves the backend CONSTRUCTS; that script proves it
 #                actually stores and retrieves bytes correctly.

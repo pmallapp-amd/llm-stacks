@@ -652,21 +652,6 @@ _setup_nixl_kv_env_spdk() {
     log "NIXL_KV_TRID=${NIXL_KV_TRID}"
 }
 
-# XNVME_KV branch — exports exactly the NIXL_XNVME_* vars this plugin reads
-# (plugins/xnvme-kv/xnvme_kv_backend.cpp), plus the metrics-interval var it
-# shares the spelling of with SPDK (NIXL_KV_METRICS_INTERVAL_SEC — see that
-# file's constructor). Unsets the SPDK-only NIXL_KV_* vars first, for the
-# same reason _setup_nixl_kv_env_spdk unsets NIXL_XNVME_* — this backend
-# reads NONE of them (there is no trid, no kv_slot_offset for XNVME_KV;
-# confirmed by reading xnvme_kv_backend.cpp/.h end to end), so leaving them
-# exported would imply they do something here when they do not.
-#
-# role is accepted only for a consistent call signature with the SPDK
-# branch; XNVME_KV has no kv_slot_offset equivalent at all —
-# make_key() in xnvme_kv_backend.h ignores devId/addr entirely once a
-# caller's metaInfo is set (the LMCache OBJ-mode path), and never reads a
-# per-role offset even on the metaInfo-less fallback path. There is
-# therefore nothing role-specific left to export for this backend.
 # Resolve the KV namespace char device by SUBSYSTEM NQN rather than by path.
 #
 # Pinning a literal /dev/ngCnN in config is wrong here for two measured
@@ -713,6 +698,21 @@ resolve_xnvme_kv_dev() {
     esac
 }
 
+# XNVME_KV branch — exports exactly the NIXL_XNVME_* vars this plugin reads
+# (plugins/xnvme-kv/xnvme_kv_backend.cpp), plus the metrics-interval var it
+# shares the spelling of with SPDK (NIXL_KV_METRICS_INTERVAL_SEC — see that
+# file's constructor). Unsets the SPDK-only NIXL_KV_* vars first, for the
+# same reason _setup_nixl_kv_env_spdk unsets NIXL_XNVME_* — this backend
+# reads NONE of them (there is no trid, no kv_slot_offset for XNVME_KV;
+# confirmed by reading xnvme_kv_backend.cpp/.h end to end), so leaving them
+# exported would imply they do something here when they do not.
+#
+# role is accepted only for a consistent call signature with the SPDK
+# branch; XNVME_KV has no kv_slot_offset equivalent at all —
+# make_key() in xnvme_kv_backend.h ignores devId/addr entirely once a
+# caller's metaInfo is set (the LMCache OBJ-mode path), and never reads a
+# per-role offset even on the metaInfo-less fallback path. There is
+# therefore nothing role-specific left to export for this backend.
 _setup_nixl_kv_env_xnvme() {
     local role="$1"
     : "${role}"
@@ -743,14 +743,16 @@ _setup_nixl_kv_env_xnvme() {
     # what makes that comment's promise ("the plugin autodiscovering here is
     # unsafe") actually enforced rather than just documented.
     if [ -z "${XNVME_DEV}" ]; then
-        die "setup_nixl_kv_env: KV_BACKEND=XNVME_KV but XNVME_DEV is empty." \
-            " Refusing to let this fall through to the plugin's own /dev" \
-            " autodiscovery, which on a host with a local NVMe boot drive" \
-            " risks aiming a KV backend at production storage. Set" \
+        die "setup_nixl_kv_env: KV_BACKEND=XNVME_KV but XNVME_DEV is empty" \
+            " and NQN resolution (resolve_xnvme_kv_dev, above) found no" \
+            " match for NVMF_SUBNQN='${NVMF_SUBNQN}'. Refusing to let this" \
+            " fall through to the plugin's own /dev autodiscovery, which on" \
+            " a host with a local NVMe boot drive risks aiming a KV backend" \
+            " at production storage. Confirm the kernel nvme-of session to" \
+            " the target is actually connected (nvme list-subsys), or set" \
             " XNVME_DEV=/dev/ngXnY explicitly — see config/cluster.env's" \
-            " XNVME_DEV comment for how to find the right one (the" \
-            " nvme-connect step that establishes the kernel nvme-of session" \
-            " is where this should be set)."
+            " XNVME_DEV comment for the ng0n1 (boot drive) vs ng1n1" \
+            " (Pensando DSC) hazard on this cluster."
     fi
     if [ ! -e "${XNVME_DEV}" ]; then
         die "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} does not exist on" \
@@ -767,9 +769,15 @@ _setup_nixl_kv_env_xnvme() {
     # not a KV namespace — see plugins/xnvme-kv/xnvme_kv_backend.cpp's
     # discover_kv_device() comment, which runs the identical test inside the
     # plugin's own autodiscovery. Running it again here, on the EXPLICIT
-    # path an operator gave us, catches the case that matters most: someone
-    # pasted the wrong device node by hand. This is cheap and prevents
-    # writing KV opcodes at somebody's filesystem.
+    # path an operator gave us (or that NQN resolution just picked), catches
+    # the case that matters most: someone pasted the wrong device node by
+    # hand, or NQN resolution's own block-device filter somehow got bypassed.
+    # This is cheap and prevents writing KV opcodes at somebody's filesystem
+    # — concretely, on smc1/smc2, this is the check that stops
+    # XNVME_DEV=/dev/ng0n1 (the Micron OS BOOT drive, which has
+    # nvme0n1p1/nvme0n1p2 block partitions) from ever being handed to the KV
+    # backend; only /dev/ng1n1 (the Pensando DSC, PDSNVME-00) has no matching
+    # block device and passes.
     local _base
     _base="$(basename -- "${XNVME_DEV}")"
     if [[ "${_base}" =~ ^ng([0-9]+)n([0-9]+)$ ]]; then
@@ -779,10 +787,12 @@ _setup_nixl_kv_env_xnvme() {
                 " block device (${_blk}). A true KV namespace has NO block" \
                 " device — the kernel cannot build one for a non-NVM" \
                 " command set. This path is an ordinary NVM namespace (a" \
-                " data disk, quite possibly this host's local boot drive)," \
-                " not a KV namespace. Refusing to hand it to the KV" \
-                " backend — double-check /dev/ngXnY against" \
-                " \`nvme list-subsys\` and this host's actual KV controller."
+                " data disk — on smc1/smc2 this is almost certainly" \
+                " /dev/ng0n1, the Micron OS BOOT drive, not /dev/ng1n1, the" \
+                " Pensando DSC). Refusing to hand it to the KV backend —" \
+                " double-check /dev/ngXnY against \`nvme list-subsys\` and" \
+                " this host's actual KV controller before overriding" \
+                " XNVME_DEV."
         fi
     else
         warn "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} does not match the" \
@@ -843,17 +853,24 @@ confirm() {
     [[ "${reply}" =~ ^[Yy]$ ]]
 }
 
+# This function has ~24 callers across the repo and runs under
+# `set -euo pipefail` (line 13 above) — interpolating a variable that no
+# longer exists aborts every one of them with an unbound-variable error, so
+# every field below must be a variable that unconditionally exists
+# regardless of KV_BACKEND (config/cluster.env sets NVMF_*/KV_TRID/TARGET_*
+# unconditionally; only XNVME_* is backend-specific, and XNVME_DEV is always
+# defined, empty or not).
 banner_config() {
     cat >&2 <<EOF
 ${_C_DIM}
   transport : ${KV_TRANSPORT}   (${NVMF_TRTYPE})
-  prefill   : ${PREFILL_HOST}:${PREFILL_PORT}
-  decode    : ${DECODE_HOST}:${DECODE_PORT}
+  prefill   : ${PREFILL_HOST}:${PREFILL_PORT}  (fleet: ${PREFILL_HOSTS} / ${PREFILL_PORTS})
+  decode    : ${DECODE_HOST}:${DECODE_PORT}  (fleet: ${DECODE_HOSTS} / ${DECODE_PORTS})
   target    : ${TARGET_HOST}:${NVMF_TRSVCID}  subnqn=${NVMF_SUBNQN}
   model     : ${MODEL}  (TP=${TP_SIZE})
-  trid      : ${KV_TRID}
-  compute leg (P->D): PD_ENABLED=${PD_ENABLED} PD_CONNECTOR=${PD_CONNECTOR} PD_LMCACHE_FIRST=${PD_LMCACHE_FIRST}
-  nixl side channel : prefill=${NIXL_SIDE_CHANNEL_PORT_PREFILL} decode=${NIXL_SIDE_CHANNEL_PORT_DECODE}
+  kv backend: ${KV_BACKEND}  trid=${KV_TRID}  dev=${XNVME_DEV}
+  lmcache mp: ${LMCACHE_MP_HOST}:${LMCACHE_MP_PORT}
+  nixl side channel (base ports): prefill=${NIXL_SIDE_CHANNEL_PORT_PREFILL} decode=${NIXL_SIDE_CHANNEL_PORT_DECODE}
 ${_C_RST}
 EOF
 }

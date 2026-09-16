@@ -19,22 +19,41 @@
 #   the remote tier has to move per request; the smallest shape in the
 #   sweep is the least likely to ever saturate anything.
 #
-# WHY THIS MATTERS: the SPDK initiator on prefill/decode runs
-# ${KV_NUM_QPAIRS} qpairs against the SMC3 target (config/cluster.env).
-# Each in-flight KV store/retrieve consumes one qpair slot for its
-# duration. Concurrency BEYOND that qpair count is exactly where the
-# plugin's own backpressure handling engages — see
+# WHY THIS MATTERS (KV_BACKEND=SPDK_NVMe_KV): the SPDK initiator on
+# prefill/decode runs ${KV_NUM_QPAIRS} qpairs against the SMC3 target
+# (config/cluster.env). Each in-flight KV store/retrieve consumes one
+# qpair slot for its duration. Concurrency BEYOND that qpair count is
+# exactly where the plugin's own backpressure handling engages — see
 # plugins/nvme-kv/spdk_nvme_kv_backend.h's drain_retry_queue() and
 # maybe_report_backpressure() — because SPDK's nvmf initiator returns
 # -ENOMEM when it cannot get a free qpair/request slot immediately, and the
 # plugin's own retry queue is what absorbs that rather than failing the
-# request outright. Below saturation, the retry queue never engages and
+# request outright.
+#
+# WHY THIS MATTERS (KV_BACKEND=XNVME_KV): the XNVME_KV plugin on
+# prefill/decode opens ${XNVME_NUM_QUEUES} independent I/O queues (one
+# xnvme_dev + one xnvme_queue + one reactor pthread each — see
+# plugins/xnvme-kv/xnvme_kv_backend.h's QueueWorker) against the LOCAL
+# Pensando DSC char device (config/cluster.env's XNVME_DEV). Each
+# in-flight KV store/retrieve consumes one queue's ctx-pool slot for its
+# duration. Concurrency BEYOND what those queues can absorb is exactly
+# where the plugin's own backpressure handling engages — see
+# xnvme_kv_backend.cpp's reactor_loop()/submit_one(): the device returning
+# -EBUSY/-EAGAIN/-ENOMEM means "queue/device temporarily full", and the
+# work item is put back and retried rather than the request failing
+# outright. (A DIFFERENT failure mode entirely — the queue making
+# literally zero forward progress for ${XNVME_STALL_TIMEOUT_SEC}s — is the
+# device-wedged case documented on XNVME_STALL_TIMEOUT_SEC in
+# config/cluster.env; that is not what saturation looks like and would
+# show as a hard error, not a latency climb.)
+#
+# Below saturation (either backend), the retry path never engages and
 # request latency should be flat as concurrency rises. AT or above it,
 # expect e2e_ttft/est_ppt to start climbing super-linearly with
 # concurrency: that inflection point IS the tier's saturation point.
 #
 # GREP PATTERN TO WATCH (in ${LOG_DIR}, on prefill/decode, while this runs):
-#   grep -E 'ENOMEM|backpressure|drain_retry_queue' ${LOG_DIR}/vllm-prefill.log ${LOG_DIR}/vllm-decode.log
+#   grep -E 'ENOMEM|backpressure|drain_retry_queue|no forward progress' ${LOG_DIR}/vllm-prefill.log ${LOG_DIR}/vllm-decode.log
 # A clean run at the concurrency levels in BENCHY_CONCURRENCY that never
 # matches this pattern is itself informational: it means this sweep never
 # reached saturation, and BENCHY_CONCURRENCY should be raised to actually
@@ -66,8 +85,16 @@ BASE_URL="http://${PROXY_HOST}:${PROXY_PORT}/v1"
 step "Concurrency saturation sweep against proxy: ${BASE_URL}"
 log "  fixed shape: pp=${FIXED_PP} tg=${FIXED_TG} depth=${FIXED_DEPTH}"
 log "  concurrency sweep: ${BENCHY_CONCURRENCY}"
-log "  KV_NUM_QPAIRS=${KV_NUM_QPAIRS} — watch for backpressure once" \
-    " concurrency exceeds this (see this script's header comment)"
+case "${KV_BACKEND}" in
+    SPDK_NVMe_KV)
+        log "  KV_NUM_QPAIRS=${KV_NUM_QPAIRS} — watch for backpressure once" \
+            " concurrency exceeds this (see this script's header comment)"
+        ;;
+    XNVME_KV)
+        log "  XNVME_NUM_QUEUES=${XNVME_NUM_QUEUES} — watch for backpressure once" \
+            " concurrency exceeds this (see this script's header comment)"
+        ;;
+esac
 banner_config
 ensure_dirs
 
@@ -87,4 +114,4 @@ RUNDIR="$(benchy_run "concurrency" "${BASE_URL}" \
 
 ok "concurrency sweep complete: ${RUNDIR}"
 log "  now check for backpressure log lines during the run window:"
-log "  grep -E 'ENOMEM|backpressure|drain_retry_queue' ${LOG_DIR}/vllm-prefill.log ${LOG_DIR}/vllm-decode.log"
+log "  grep -E 'ENOMEM|backpressure|drain_retry_queue|no forward progress' ${LOG_DIR}/vllm-prefill.log ${LOG_DIR}/vllm-decode.log"

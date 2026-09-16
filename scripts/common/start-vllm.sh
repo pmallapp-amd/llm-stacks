@@ -5,10 +5,12 @@
 # each of which pins its own required host first.
 #
 # Node:          SMC1 (prefill) or SMC2 (decode), selected by $1.
-# Prerequisites: scripts/common/20-build-vllm-lmcache.sh; SMC3's NVMe-oF
-#                target already listening on NVMF_TRSVCID (this script
-#                refuses to start otherwise — see the wait_for_port gate
-#                below).
+# Prerequisites: scripts/common/20-build-vllm-lmcache.sh; the LMCache MP
+#                daemon already running on THIS node (scripts/common/
+#                30-start-lmcache-daemon.sh); SMC3's NVMe-oF target already
+#                listening on NVMF_TRSVCID. This script refuses to start
+#                unless BOTH are reachable — see the wait_for_port gates
+#                below.
 # Next step:     scripts/proxy/start-proxy.sh once both roles are up.
 #
 # usage: start-vllm.sh <prefill|decode> [--skip-validate]
@@ -89,7 +91,42 @@ fi
 export LMCACHE_CONFIG_FILE="${LMCACHE_CFG}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Refuse to start unless the remote KV target is actually reachable.
+# Refuse to start unless the LMCache MP daemon is actually reachable.
+#
+# WHY this is a hard gate, not a warning: LMCacheMPConnector talks to the
+# MP daemon over a ZMQ control channel at LMCACHE_MP_HOST:LMCACHE_MP_PORT
+# (config/cluster.env) — a SEPARATE HOST PROCESS that nothing else in this
+# stack spawns or checks for (HANDOFF §12.1: "MP mode needs a daemon and
+# nothing spawns it"). If that daemon isn't up, vLLM does NOT fail to
+# start: LMCacheMPConnector is one of two children inside MultiConnector,
+# so the server starts fine, answers /health, and serves every request —
+# just with the LMCache leg of the KV path silently absent. That failure
+# mode is indistinguishable from "working" until someone benchmarks
+# cross-node cache hit rate and finds the LMCache tier never engaged.
+# Refusing to start is the only failure mode that can't be mistaken for
+# success. LMCACHE_MP_HOST carries a ZMQ URL scheme (e.g. "tcp://
+# 127.0.0.1") because that's what the client side needs; wait_for_port
+# wants a bare host, so the scheme is stripped here the same way
+# scripts/common/30-start-lmcache-daemon.sh strips it for the server's
+# --host flag.
+# ─────────────────────────────────────────────────────────────────────────────
+_LMCACHE_MP_BIND_HOST="${LMCACHE_MP_HOST#tcp://}"
+[ -n "${_LMCACHE_MP_BIND_HOST}" ] || die "LMCACHE_MP_HOST resolved to an" \
+    " empty host after stripping 'tcp://' (raw value:" \
+    " '${LMCACHE_MP_HOST}') — fix config/cluster.env's LMCACHE_MP_HOST."
+info "checking LMCache MP daemon reachability: ${_LMCACHE_MP_BIND_HOST}:${LMCACHE_MP_PORT}"
+if ! wait_for_port "${_LMCACHE_MP_BIND_HOST}" "${LMCACHE_MP_PORT}" 30; then
+    die "LMCache MP daemon ${_LMCACHE_MP_BIND_HOST}:${LMCACHE_MP_PORT} is" \
+        " not reachable after 30s. Refusing to start: a silently-absent" \
+        " LMCache leg is the worst failure mode here (see this script's" \
+        " comment above) because the server would otherwise start" \
+        " successfully and LOOK like it works. Start the daemon first:" \
+        " scripts/common/30-start-lmcache-daemon.sh"
+fi
+ok "LMCache MP daemon reachable"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Refuse to start unless the remote KV target is ALSO actually reachable.
 #
 # WHY this is a hard gate, not a warning: LMCache's NIXL storage backend is
 # one of several storage tiers (local_cpu is another, and it's on by
@@ -100,7 +137,10 @@ export LMCACHE_CONFIG_FILE="${LMCACHE_CFG}"
 # serves every request perfectly looks IDENTICAL to a correctly wired P/D
 # deployment right up until someone benchmarks cross-node cache hit rate and
 # finds it's always zero. Refusing to start is the only failure mode that
-# can't be mistaken for success.
+# can't be mistaken for success. This gate is IN ADDITION to the LMCache MP
+# daemon gate above, not instead of it — both are now required: the daemon
+# must be up on THIS host AND the KV target must be reachable over the
+# network, since a healthy daemon says nothing about whether SMC3 answers.
 # ─────────────────────────────────────────────────────────────────────────────
 info "checking NVMe-oF target reachability: ${TARGET_HOST}:${NVMF_TRSVCID}"
 if ! wait_for_port "${TARGET_HOST}" "${NVMF_TRSVCID}" 30; then
@@ -108,7 +148,8 @@ if ! wait_for_port "${TARGET_HOST}" "${NVMF_TRSVCID}" 30; then
         " after 30s. Refusing to start: a silent fallback to local-only" \
         " caching is the worst failure mode here (see this script's" \
         " comment above) because the server would otherwise start" \
-        " successfully and LOOK like it works. Start the target first."
+        " successfully and LOOK like it works. Start the target first:" \
+        " scripts/target/03-start-kv-target.sh"
 fi
 ok "target reachable"
 
@@ -127,8 +168,8 @@ export HF_TOKEN
 KV_TRANSFER_CONFIG="$("${REPO_ROOT}/scripts/common/gen-kv-transfer-config.sh" "${ROLE}")"
 
 log "kv-transfer-config: ${KV_TRANSFER_CONFIG}"
-log "PD_ENABLED=${PD_ENABLED} PD_CONNECTOR=${PD_CONNECTOR} PD_LMCACHE_FIRST=${PD_LMCACHE_FIRST}"
 log "NIXL side channel: ${VLLM_NIXL_SIDE_CHANNEL_HOST}:${VLLM_NIXL_SIDE_CHANNEL_PORT}"
+log "LMCache MP daemon: ${LMCACHE_MP_HOST}:${LMCACHE_MP_PORT}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Launch.

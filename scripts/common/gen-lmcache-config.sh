@@ -12,6 +12,26 @@
 # usage: gen-lmcache-config.sh <prefill|decode> <output-path>
 #
 # ═══════════════════════════════════════════════════════════════════════════
+# WHICH PROCESS READS THIS FILE — MP mode changes this from earlier builds
+# ═══════════════════════════════════════════════════════════════════════════
+# LMCache now runs as LMCacheMPConnector's SEPARATE HOST PROCESS (the "MP"
+# daemon, reached over ZMQ at LMCACHE_MP_HOST:LMCACHE_MP_PORT — see
+# config/cluster.env), not in-process inside the vLLM engine. That means the
+# NIXL storage-backend config below (enable_nixl_storage, nixl_backend,
+# nixl_pool_size, nixl_backend_params, the nixl_buffer_* fields) is consumed
+# DAEMON-side: whatever process loads this YAML to construct the LMCache
+# engine's storage backends is the MP daemon, not vLLM's own Python process.
+# This has NOT been independently re-verified against the installed
+# LMCacheMPConnector/daemon entry point for this task — the daemon-reads-this
+# claim follows directly from what MP mode means (a separate process must
+# have ITS OWN engine config to construct ITS OWN storage backends; vLLM's
+# process no longer constructs a LocalCacheEngine at all), but the exact
+# code path the daemon uses to load this specific file was not traced here.
+# If that matters, verify against the installed lmcache package's MP daemon
+# entry point (whatever launches the process on the other end of
+# LMCACHE_MP_HOST:LMCACHE_MP_PORT) before relying on this comment further.
+#
+# ═══════════════════════════════════════════════════════════════════════════
 # READ THIS BEFORE TOUCHING THIS FILE
 # ═══════════════════════════════════════════════════════════════════════════
 # LMCacheEngineConfig's accepted top-level keys, and — separately — the keys
@@ -145,9 +165,10 @@ _MAX_LOCAL_CPU_SIZE="${LMCACHE_MAX_LOCAL_CPU_SIZE}"
 _SAVE_UNFULL_CHUNK="${LMCACHE_SAVE_UNFULL_CHUNK:-false}"
 
 # NIXL staging buffer: a bounce buffer NIXL/UCX moves KV pages through on
-# their way to/from the SPDK_NVMe_KV plugin — sized independently of
-# KV_MAX_VALUE_SIZE (that's the plugin's per-STORE/RETRIEVE ceiling; this is
-# how much in-flight staging capacity the backend gets). 1 GiB default is
+# their way to/from whichever plugin KV_BACKEND selects (SPDK_NVMe_KV or
+# XNVME_KV) — sized independently of KV_MAX_VALUE_SIZE_EFFECTIVE (that's
+# the plugin's per-STORE/RETRIEVE ceiling; this is how much in-flight
+# staging capacity the backend gets). 1 GiB default is
 # generous headroom over a single ~5.7MB KV page (chunk_size=256) with room
 # for several in-flight transfers; too small shows up as
 # "Failed to allocate memory, consider increasing the `nixl_buffer_size`
@@ -166,6 +187,21 @@ _NIXL_BUFFER_DEVICE="${LMCACHE_NIXL_BUFFER_DEVICE:-cuda}"
 # buffer size is meaningless there). Intercept the contradictory combination
 # early so the error names the env var at generation time rather than surfacing
 # as a ValueError from deep inside LMCache at engine start.
+#
+# KEEP this branch and BOTH its `die`s below — do not delete them as
+# "unreachable" or "dead code for a backend we don't use". They are
+# load-bearing specifically BECAUSE the storage tier is XNVME_KV: XNVME_KV
+# reaches the device through plain kernel pread/pwrite (io_uring_cmd
+# passthru against a /dev/ngXnY char device — plugins/xnvme-kv/
+# xnvme_kv_backend.h), not an RDMA-capable target. A kernel syscall like
+# pread/pwrite can only operate on host-addressable memory; it cannot read
+# or write directly out of GPU VRAM the way an RDMA NIC can. So whenever
+# this deployment's staging buffer ends up being host memory
+# (nixl_buffer_device=cpu), these two `die`s are exactly the guardrails
+# that keep that configuration internally consistent (buffer size implied
+# by max_local_cpu_size, not a separate nixl_buffer_size) — remove them and
+# a broken cpu-buffer config would surface as a ValueError deep inside
+# LMCache at engine start instead of here, at generation time.
 case "${_NIXL_BUFFER_DEVICE}" in
     cpu)
         if [ -n "${LMCACHE_NIXL_BUFFER_SIZE+x}" ]; then

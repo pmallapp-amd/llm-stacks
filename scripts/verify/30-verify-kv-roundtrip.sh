@@ -20,17 +20,28 @@
 #   30-verify-kv-roundtrip.sh --read --nonce X     # read only; nonce MUST match the writer
 #   30-verify-kv-roundtrip.sh [--size BYTES] [--role prefill|decode]
 #
-# WHY --size defaults to several multiples of the ACTIVE backend's
-# max_value_size (config/cluster.env's KV_MAX_VALUE_SIZE_EFFECTIVE, which
-# tracks whichever of KV_MAX_VALUE_SIZE / KV_MAX_VALUE_SIZE_XNVME KV_BACKEND
-# selects): a payload smaller than that never exercises the multipart-split
-# code path at all (see patches/lmcache/README.md's "multipart-split"
-# section and plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's getParams() comment
-# on why a ~5.7MB LMCache KV page has to be chopped into sub-transfers) — a
-# "roundtrip test" that only ever sends one small value would pass even if
-# the split/reassembly logic were completely broken. Six parts is enough to
-# also catch an off-by-one in the split boundary arithmetic (ceil vs floor)
-# without making the default run painfully slow.
+# CORRECTNESS-CRITICAL: --size MUST default to something LARGER than
+# KV_MAX_VALUE_SIZE_EFFECTIVE (config/cluster.env's XNVME_KV per-value
+# ceiling, 32768 B), and this script deliberately uses several multiples
+# of it (6x), not something merely-larger-by-one-byte. Reason (see
+# patches/lmcache/README.md's "multipart-split" section and
+# tmp/TOPOLOGY-KV-DATAPATH.md §4.5's "`mem_split_n` — and the `#{j}`
+# landmine"): LMCache's nixl_store L2 adapter splits any page bigger than
+# the backend's declared max_value_size into ceil(page_size/max_value_size)
+# sub-objects, each carrying a distinct `#{j}` suffix on its metaInfo key.
+# XNVME_KV keys OFF metaInfo and IGNORES addr/offset entirely — collapse or
+# lose that suffix (e.g. by only ever testing a payload <= max_value_size,
+# where num_parts==1 and the suffix path never engages) and every sub-part
+# after the first SILENTLY OVERWRITES the one before it: the store returns
+# success, the device reports success, and read-back returns the LAST
+# sub-part's bytes in every position — there is no error at any layer, only
+# a byte-compare on read-back would ever catch it. A "roundtrip test" that
+# only ever sends one small value proves nothing about this path. Six parts
+# is enough to also catch an off-by-one in the split boundary arithmetic
+# (ceil vs floor) without making the default run painfully slow.
+# _kv_roundtrip.py's do_read() does a full byte-for-byte compare of the
+# reassembled payload against the expected one specifically because of this
+# — see its RESULT:MISMATCH branch.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../common/lib.sh"
@@ -59,9 +70,12 @@ if [ -z "${ROLE}" ]; then
     case " ${_local_ips} " in
         *" ${PREFILL_HOST} "*) ROLE="prefill" ;;
         *" ${DECODE_HOST} "*)  ROLE="decode" ;;
-        *) ROLE="prefill" ;;  # arbitrary but harmless: see gen-lmcache-config.sh's
-                              # note that KV_SLOT_OFFSET is a no-op once metaInfo
-                              # is set, which this test always does.
+        *) ROLE="prefill" ;;  # arbitrary but harmless: setup_nixl_kv_env()'s
+                              # only per-role behavior is host-check plumbing —
+                              # XNVME_KV keys purely off metaInfo (this test
+                              # always sets it), so which role's env this
+                              # resolves under makes no difference to the
+                              # backend's connect params.
     esac
 fi
 

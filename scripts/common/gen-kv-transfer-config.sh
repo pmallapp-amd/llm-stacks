@@ -4,7 +4,7 @@
 #
 # Node:          SMC1 (prefill) or SMC2 (decode) — generates JSON on
 #                stdout, does not itself start anything.
-# Prerequisites: none beyond config/cluster.env's PD_* values.
+# Prerequisites: none beyond config/cluster.env's LMCACHE_MP_HOST/_PORT.
 # Next step:     scripts/common/start-vllm.sh passes this straight to
 #                vLLM's --kv-transfer-config.
 #
@@ -19,7 +19,7 @@
 #
 #   {"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[
 #     {"kv_connector":"NixlConnector","kv_role":"kv_producer"|"kv_consumer"},
-#     {"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"...","lmcache.mp.port":6556}}
+#     {"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"...","lmcache.mp.port":6557}}
 #   ]}}
 #
 # Prefill uses kv_producer on the NixlConnector entry; decode uses
@@ -32,25 +32,36 @@
 # into KVTransferConfig(**ktc), so each element takes the ordinary
 # top-level connector keys.
 #
-# ORDER MATTERS. MultiConnector asks children to load in list order and
-# the FIRST that answers wins. Default order [NixlConnector,
-# LMCacheMPConnector] gives the P/D transport first refusal — correct for
-# measuring the P/D hop. The reverse order (PD_LMCACHE_FIRST=1) is the
-# ONLY posture in which the L2 reuse tier can win a load.
-#
 # Both children implement SupportsHMA (nixl/connector.py:79,
 # lmcache_mp_connector.py:575), so the hybrid KV cache manager does NOT
 # need disabling — verified, because MultiConnector.__init__'s assertion
 # would otherwise abort startup.
 #
 # ═══════════════════════════════════════════════════════════════════════════
-# PD_ENABLED=0 — the revert switch
+# THE ORDER IS FIXED — NixlConnector MUST be child[0], not configurable
 # ═══════════════════════════════════════════════════════════════════════════
-# Emits the LMCache-only form this repo used BEFORE this task: a single
-# LMCacheConnectorV1 kv_producer/kv_consumer config, no NixlConnector, no
-# MultiConnector wrapper. Byte-for-byte what scripts/common/start-vllm.sh
-# used to hardcode inline — this is what makes the two-leg change
-# revertible without touching any other file.
+# This repo used to expose PD_ENABLED/PD_CONNECTOR/PD_LMCACHE_FIRST as
+# variables selecting among alternative architectures (LMCache-only vs
+# MultiConnector, and which child goes first). There is now exactly ONE
+# supported architecture, so those variables are GONE (see
+# config/cluster.env's "Compute leg (P->D)" section) and this generator
+# always emits the same shape below. The order specifically can never be
+# made configurable again, because it is not a style choice:
+#
+# MultiConnector.get_num_new_matched_tokens() (multi_connector.py:387-400)
+# walks its child connectors in list order and assigns the ENTIRE load to
+# the FIRST child that reports a non-zero match — it does not merge or
+# prefer a "better" match across children, it just takes the first
+# nonzero one and stops. If LMCacheMPConnector were listed before
+# NixlConnector, then on the decode side any request whose prefix is
+# already in the local L2 (XNVME_KV) tier would have its match satisfied
+# by LMCache FIRST, and NixlConnector would never even be asked — the
+# direct P->D remote-prefill pull this whole two-leg architecture exists
+# to measure would be silently skipped every time the L2 tier has
+# anything at all cached, which is most of the time. NixlConnector MUST
+# be child[0] for the direct P->D leg to ever fire on decode. This was
+# HANDOFF §12.1's one surviving finding, reaffirmed again in §16.9 — do
+# not reintroduce a switch to flip this.
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -64,29 +75,17 @@ esac
 
 require_cmd python3
 
-CONFIG_JSON="$(PD_ENABLED="${PD_ENABLED}" PD_CONNECTOR="${PD_CONNECTOR}" \
-    PD_LMCACHE_FIRST="${PD_LMCACHE_FIRST}" NIXL_KV_ROLE="${_NIXL_KV_ROLE}" \
+CONFIG_JSON="$(NIXL_KV_ROLE="${_NIXL_KV_ROLE}" \
     LMCACHE_MP_HOST="${LMCACHE_MP_HOST}" LMCACHE_MP_PORT="${LMCACHE_MP_PORT}" \
     python3 - <<'PYEOF'
 import json
 import os
 
-pd_enabled = os.environ["PD_ENABLED"] == "1"
 nixl_kv_role = os.environ["NIXL_KV_ROLE"]
 
-if not pd_enabled:
-    # See "PD_ENABLED=0 — the revert switch" in this script's header.
-    config = {
-        "kv_connector": "LMCacheConnectorV1",
-        "kv_role": nixl_kv_role,
-        "kv_connector_extra_config": {},
-    }
-    print(json.dumps(config))
-    raise SystemExit(0)
-
-pd_connector = os.environ["PD_CONNECTOR"]
-lmcache_first = os.environ["PD_LMCACHE_FIRST"] == "1"
-
+# ORDER IS FIXED — see "THE ORDER IS FIXED" above. NixlConnector MUST be
+# child[0] so it gets first refusal on every load; there is no longer a
+# variable that can flip this.
 nixl_entry = {"kv_connector": "NixlConnector", "kv_role": nixl_kv_role}
 lmcache_entry = {
     "kv_connector": "LMCacheMPConnector",
@@ -97,14 +96,10 @@ lmcache_entry = {
     },
 }
 
-# ORDER MATTERS — see "F1 — the composition" above. Default order puts
-# NixlConnector first so it gets first refusal on every load.
-connectors = [lmcache_entry, nixl_entry] if lmcache_first else [nixl_entry, lmcache_entry]
-
 config = {
-    "kv_connector": pd_connector,
+    "kv_connector": "MultiConnector",
     "kv_role": "kv_both",
-    "kv_connector_extra_config": {"connectors": connectors},
+    "kv_connector_extra_config": {"connectors": [nixl_entry, lmcache_entry]},
 }
 print(json.dumps(config))
 PYEOF

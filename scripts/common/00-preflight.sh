@@ -175,21 +175,46 @@ done
 check_soft "ethtool available (NIC speed/driver reporting)" command -v ethtool
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RDMA device presence — advisory only in Phase 1 (KV_TRANSPORT=tcp); becomes
+# RDMA userspace — advisory only in Phase 1 (KV_TRANSPORT=tcp); becomes
 # load-bearing in Phase 2 (KV_TRANSPORT=rdma), checked hard by 01-host-prep.sh.
+#
+# HANDOFF TODO 3.8: this check used to assert only that the `ibv_devinfo`
+# BINARY exists — not that it actually enumerates a device. That gap cost
+# two full sessions (HANDOFF §13.3): rdma-core can be installed and
+# `command -v ibv_devinfo` can succeed while the ionic RDMA provider driver
+# itself is missing/mismatched, in which case `ibv_devinfo` runs, prints
+# libibverbs' own "couldn't load driver 'ionic'"-style warning to stderr,
+# and then reports zero devices — a state that looks identical to "not
+# installed yet" if all you check is the binary's presence. Assert the
+# actual OUTPUT instead: a device must be enumerated, and if it isn't,
+# surface whatever libibverbs printed on stderr so the "couldn't load
+# driver" signature is visible immediately instead of discovered two
+# sessions later.
 # ─────────────────────────────────────────────────────────────────────────────
 step "RDMA devices"
 if command -v ibv_devinfo >/dev/null 2>&1; then
-    _rdma_devs="$(ibv_devinfo -l 2>/dev/null | tail -n +2 | tr -d ' \t' || true)"
+    _rdma_out="$(ibv_devinfo -l 2>&1 || true)"
+    _rdma_devs="$(printf '%s\n' "${_rdma_out}" | tail -n +2 | tr -d ' \t')"
     if [ -n "${_rdma_devs}" ]; then
         printf '%s\n' "${_rdma_devs}" | while IFS= read -r d; do log "  ${d}"; done
     else
         log "  none found (expected in Phase 1 / KV_TRANSPORT=tcp)"
+        if printf '%s\n' "${_rdma_out}" | grep -qi "couldn't load driver\|failed to load driver\|no matching driver"; then
+            warn "libibverbs reported a driver-load failure, not just" \
+                 " 'no devices':"
+            printf '%s\n' "${_rdma_out}" | while IFS= read -r _l; do warn "  ${_l}"; done
+            warn "this means rdma-core IS installed but the userspace" \
+                 " provider driver for this NIC (ionic) is missing or" \
+                 " mismatched — 'ibv_devinfo present' alone would have" \
+                 " reported this as healthy; see HANDOFF §13.3."
+        fi
     fi
 else
     log "  ibv_devinfo not installed (rdma-core not yet installed — 10-build-stack.sh installs it)"
 fi
 check_soft "rdma-core userspace tools present" command -v ibv_devinfo
+check_soft "ibv_devinfo actually enumerates >= 1 RDMA device (not just installed)" \
+    bash -c '[ -n "$(ibv_devinfo -l 2>/dev/null | tail -n +2 | tr -d " \t")" ]'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # python3
@@ -246,13 +271,40 @@ for _label in "${!_peers[@]}"; do
     [ "${_ip}" = "${DECODE_HOST}" ] && [[ "${THIS_ROLE}" == decode* ]] && continue
     check "ping reachable: ${_label}" bash -c "ping -c1 -W2 '${_ip}' >/dev/null 2>&1" || true
     # Service port: soft. The port may legitimately not be listening yet if
-    # this is being run before the corresponding service/target is started —
-    # that is a "not up yet" condition, not a preflight failure. Called
-    # directly (not via `bash -c`) because wait_for_port is a shell function
-    # from lib.sh, not an external binary — a subshell wouldn't have it.
+    # this is being run before the corresponding service is started — that
+    # is a "not up yet" condition, not a preflight failure. Called directly
+    # (not via `bash -c`) because wait_for_port is a shell function from
+    # lib.sh, not an external binary — a subshell wouldn't have it.
     check_soft "TCP port reachable: ${_label}:${_port}" \
         wait_for_port "${_ip}" "${_port}" 3
 done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KV storage device — only meaningful when KV_BACKEND=XNVME_KV, where it is
+# the LOCAL Pensando DSC char device (leg B). An empty/missing/wrong device
+# here is exactly the boot-disk hazard setup_nixl_kv_env() (lib.sh) guards
+# against at launch time — catching it here, read-only, is cheaper than
+# discovering it when start-vllm.sh's own hard check refuses to start.
+#
+# XNVME_DEV is now resolved at RUNTIME by NQN (resolve_xnvme_kv_dev() in
+# lib.sh), not pinned in config, so it is normal and expected for it to be
+# EMPTY at preflight time — the kernel nvme-of session that fills it in may
+# not exist yet this early in bring-up. Treat empty as a soft, informational
+# skip, not a failure; only hard-check when an operator (or a prior
+# nvme-connect step) has already set it explicitly.
+# ─────────────────────────────────────────────────────────────────────────────
+step "KV storage device (XNVME_DEV=${XNVME_DEV:-<empty, resolved by NQN at runtime>})"
+if [ "${KV_BACKEND}" = "XNVME_KV" ]; then
+    if [ -z "${XNVME_DEV}" ]; then
+        check_soft "XNVME_DEV is set (empty is OK pre-connect; resolved by NQN at runtime)" \
+            bash -c 'false'
+    else
+        check "XNVME_DEV (${XNVME_DEV}) exists and is a char device" \
+            bash -c "[ -c '${XNVME_DEV}' ]" || true
+    fi
+else
+    log "KV_BACKEND=${KV_BACKEND} — XNVME_DEV check not applicable"
+fi
 
 banner_config
 checks_summary

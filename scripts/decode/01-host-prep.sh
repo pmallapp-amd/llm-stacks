@@ -269,27 +269,46 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Firewall — open the NIXL side-channel port to the peer (prefill) node.
-# Same pattern as scripts/target/01-host-prep.sh's NVMe-oF port opening: act
-# only if a host firewall is actually enforcing anything, and say so
+# Firewall — open every port a PEER needs to reach on this node: the vLLM
+# HTTP port itself (DECODE_PORT), the NIXL side-channel port (the
+# out-of-band handshake letting the two vLLM engines exchange memory
+# descriptors — F2), and the LMCache MP daemon port (LMCACHE_MP_PORT).
+#
+# There is no NVMe-oF target anymore (old default port 4420) — the KV
+# storage tier is a local char-device passthru, not a network service, so
+# there is nothing to open a firewall hole FOR on that leg at all.
+#
+# Act only if a host firewall is actually enforcing anything, and say so
 # plainly if neither ufw nor firewalld is active rather than guessing at
-# iptables rules. Without this, the side-channel handshake (F2) can fail
-# exactly the way an unreachable loopback default does — silently, until
-# the peer actually tries to connect.
+# iptables rules. Without the NIXL port specifically, the side-channel
+# handshake (F2) can fail exactly the way an unreachable loopback default
+# does — silently, until the peer actually tries to connect.
 # ─────────────────────────────────────────────────────────────────────────────
-step "Firewall (${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp, NIXL side channel <- ${PREFILL_NAME})"
+step "Firewall (vLLM ${DECODE_PORT}, NIXL side channel ${NIXL_SIDE_CHANNEL_PORT_DECODE}, LMCache MP ${LMCACHE_MP_PORT})"
+declare -A _fw_ports=(
+    ["${DECODE_PORT}"]="vLLM HTTP (decode)"
+    ["${NIXL_SIDE_CHANNEL_PORT_DECODE}"]="NIXL side channel <- ${PREFILL_NAME}"
+    ["${LMCACHE_MP_PORT}"]="LMCache MP daemon"
+)
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"; then
-    ufw allow "${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp" comment "NIXL side channel (kvstack, decode)"
-    ok "ufw: opened ${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp"
+    for _port in "${!_fw_ports[@]}"; do
+        ufw allow "${_port}/tcp" comment "kvstack: ${_fw_ports[${_port}]}"
+        ok "ufw: opened ${_port}/tcp (${_fw_ports[${_port}]})"
+    done
 elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-    firewall-cmd --permanent --add-port="${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp"
+    for _port in "${!_fw_ports[@]}"; do
+        firewall-cmd --permanent --add-port="${_port}/tcp"
+    done
     firewall-cmd --reload
-    ok "firewalld: opened ${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp"
+    for _port in "${!_fw_ports[@]}"; do
+        ok "firewalld: opened ${_port}/tcp (${_fw_ports[${_port}]})"
+    done
 else
     info "neither ufw nor firewalld is active — no firewall changes made" \
          " (if some other mechanism blocks" \
-         " ${NIXL_SIDE_CHANNEL_PORT_DECODE}/tcp, e.g. raw iptables/nftables" \
-         " rules or an upstream security group, open it there manually)"
+         " ${DECODE_PORT}/${NIXL_SIDE_CHANNEL_PORT_DECODE}/${LMCACHE_MP_PORT}" \
+         "/tcp, e.g. raw iptables/nftables rules or an upstream security" \
+         " group, open them there manually)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,6 +321,27 @@ else
     warn "target ${TARGET_HOST}:${NVMF_TRSVCID} not reachable yet — fine if" \
          " SMC3 hasn't started its NVMe-oF target; start-vllm.sh will" \
          " refuse to launch vLLM until this is up."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KV storage device (leg B), KV_BACKEND=XNVME_KV only — the LOCAL Pensando
+# DSC char device, not the network target checked above.
+# setup_nixl_kv_env() (lib.sh) already implements exactly the checks this
+# needs: XNVME_DEV exists (or resolves by NQN), and it is NOT the boot drive
+# (i.e. it has no matching /dev/nvmeXnY block device) — see that function's
+# comment for the full hazard writeup (writing KV opcodes at the running
+# OS disk). Calling it here, rather than re-deriving the same guard, means
+# a fix to that logic only has to happen in one place. For KV_BACKEND=
+# SPDK_NVMe_KV this is a no-op check — the SPDK path has no local device to
+# validate, only the target reachability already checked above.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${KV_BACKEND}" = "XNVME_KV" ]; then
+    step "KV storage device (XNVME_DEV=${XNVME_DEV})"
+    setup_nixl_kv_env "decode"
+    ok "XNVME_DEV=${XNVME_DEV} present and safe (see setup_nixl_kv_env in lib.sh)"
+else
+    log "KV_BACKEND=${KV_BACKEND} — no local KV device to validate" \
+        " (target reachability above is leg B's actual check)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -130,26 +130,27 @@ for _label in "${!PEERS[@]}"; do
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Raw TCP throughput on the storage leg (this host <-> TARGET_HOST), via
-# iperf3 if present. Soft/advisory: requires an iperf3 SERVER already
-# running on the peer (this script does not start one — starting a listener
-# on a remote node from a "read-only, run from anywhere" verify script would
-# be a bigger blast-radius action than this tree's other scripts take), so
-# a failure here just as plausibly means "no iperf3 server on the peer" as
+# Raw TCP throughput on every leg relevant to this host (compute leg to the
+# other of prefill/decode, and/or the storage leg to SMC3), via iperf3 if
+# present. Soft/advisory: requires an iperf3 SERVER already running on the
+# peer (this script does not start one — starting a listener on a remote
+# node from a "read-only, run from anywhere" verify script would be a
+# bigger blast-radius action than this tree's other scripts take), so a
+# failure here just as plausibly means "no iperf3 server on the peer" as
 # "the network is slow" — hence check_soft, not check.
 # ─────────────────────────────────────────────────────────────────────────────
 if [ "${SKIP_THROUGHPUT}" -eq 1 ]; then
     step "Throughput (skipped: --skip-throughput)"
-elif [ "${THIS_ROLE}" = "target" ]; then
-    step "Throughput (skipped: this host IS the storage target — run this" \
-         " check from prefill or decode instead, with an iperf3 server" \
-         " already started here on ${TARGET_HOST})"
+elif [ "${#PEERS[@]}" -eq 0 ]; then
+    step "Throughput (skipped: no peer resolved for this host)"
 else
-    step "Raw TCP throughput on the storage leg (-> ${TARGET_HOST})"
-    if command -v iperf3 >/dev/null 2>&1; then
-        _out="$(timeout 15 iperf3 -c "${TARGET_HOST}" -t 5 -J 2>/dev/null || true)"
-        if [ -n "${_out}" ] && command -v python3 >/dev/null 2>&1; then
-            _mbps="$(printf '%s' "${_out}" | python3 -c '
+    for _label in "${!PEERS[@]}"; do
+        read -r _ip _port <<< "${PEERS[${_label}]}"
+        step "Raw TCP throughput on the leg -> ${_label}"
+        if command -v iperf3 >/dev/null 2>&1; then
+            _out="$(timeout 15 iperf3 -c "${_ip}" -t 5 -J 2>/dev/null || true)"
+            if [ -n "${_out}" ] && command -v python3 >/dev/null 2>&1; then
+                _mbps="$(printf '%s' "${_out}" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -158,36 +159,68 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null || true)"
-            if [ -n "${_mbps}" ]; then
-                log "  measured: ${_mbps} Gbps"
-                # DSC3-2Q400 / POLLARA-1Q400 are 400G-class NICs (see
-                # config/cluster.env's topology comment). A 400G NIC that
-                # negotiates full duplex and isn't starved by CPU/PCIe
-                # should clear well over 100 Gbps on a single iperf3 stream
-                # in most cases, and a LOT more with parallel streams; a
-                # result in the 10G-class range (roughly <=15) on hardware
-                # provisioned for 400G is not "a bit slow", it's a strong
-                # signal of a negotiation/driver/cabling problem (wrong
-                # speed auto-negotiated, a bad SFP/cable, or traffic
-                # accidentally routed over a management NIC instead of the
-                # data-plane NIC) and should be run down before trusting any
-                # KV-transfer benchmark on this leg.
-                check_soft "storage-leg throughput >= 100 Gbps (400G-class NIC floor)" \
-                    bash -c "python3 -c \"import sys; sys.exit(0 if float('${_mbps}') >= 100 else 1)\""
+                if [ -n "${_mbps}" ]; then
+                    log "  measured: ${_mbps} Gbps"
+                    # The fabric NICs (Pensando DSC3-2Q400, ionic_0..7 /
+                    # benicNp1) are MEASURED 400 Gb/s links (HANDOFF.md §15.6:
+                    # `ethtool` reports Speed: 400000Mb/s on all 8 ports on
+                    # both nodes; `/sys/class/infiniband/ionic_2/ports/1/rate`
+                    # reads "400 Gb/sec (4X NDR)"). ib_write_bw (RC,
+                    # cross-node) measured 41,898 MiB/s (~351 Gb/s, ~88% of
+                    # line rate) at 8 MiB messages — see §15.5. iperf3/TCP
+                    # will not reach that ceiling (TCP over a RoCE-capable
+                    # NIC still pays kernel-stack overhead that RDMA
+                    # bypasses), but a healthy 400G NIC on this fabric should
+                    # still clear well over 100 Gbps on a single stream; a
+                    # result in the 10G-class range (roughly <=15) is a
+                    # strong signal of a negotiation/driver/cabling/wrong-NIC
+                    # problem and should be run down before trusting any
+                    # KV-transfer benchmark on this leg.
+                    check_soft "throughput -> ${_label} >= 100 Gbps (400G-class NIC floor)" \
+                        bash -c "python3 -c \"import sys; sys.exit(0 if float('${_mbps}') >= 100 else 1)\""
+                else
+                    warn "  iperf3 ran but JSON output could not be parsed"
+                fi
             else
-                warn "  iperf3 ran but JSON output could not be parsed"
+                warn "  iperf3 client could not reach an iperf3 SERVER on" \
+                     " ${_ip} (not started, or blocked) — start" \
+                     " 'iperf3 -s' there first to get a throughput number." \
+                     " This is advisory only; not a hard failure."
             fi
         else
-            warn "  iperf3 client could not reach an iperf3 SERVER on" \
-                 " ${TARGET_HOST} (not started, or blocked) — start" \
-                 " 'iperf3 -s' there first to get a throughput number." \
-                 " This is advisory only; not a hard failure."
+            warn "  iperf3 not installed — advisory throughput check skipped." \
+                 " Install iperf3 to get a quantitative floor check on this leg."
         fi
-    else
-        warn "  iperf3 not installed — advisory throughput check skipped." \
-             " Install iperf3 to get a quantitative floor check on this leg."
-    fi
+    done
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LMCache MP daemon port (local, same-host). LMCACHE_MP_HOST is loopback BY
+# DESIGN (config/cluster.env's LMCACHE_MP_HOST comment: the daemon shares
+# the host's IPC namespace with the vLLM process it serves — this is a
+# same-host rendezvous, not a cross-node leg), so this is a local
+# port-reachability check, not a network-topology one — it lives here
+# rather than in scripts/verify/20-verify-nixl-plugin.sh because 20- is
+# specifically scoped to the NIXL/XNVME_KV storage-leg plugin and never
+# touches LMCache at all; this is the network-layer script, and "is the
+# port this host's vLLM will dial even open" is a network-layer question.
+# Advisory only (check_soft): the daemon may legitimately not be started
+# yet at the point this script runs (e.g. verifying host networking before
+# ever starting any service), so a closed port here is not on its own a
+# cluster defect.
+# ─────────────────────────────────────────────────────────────────────────────
+case "${THIS_ROLE}" in
+    prefill|decode)
+        step "LMCache MP daemon port (local, same-host rendezvous)"
+        _lmcache_mp_host="${LMCACHE_MP_HOST#tcp://}"
+        check_soft "LMCache MP daemon reachable at ${_lmcache_mp_host}:${LMCACHE_MP_PORT}" \
+            wait_for_port "${_lmcache_mp_host}" "${LMCACHE_MP_PORT}" 3
+        ;;
+    *)
+        step "LMCache MP daemon port (skipped: not a compute node — this is a" \
+             " same-host loopback rendezvous, not something a jump host can check)"
+        ;;
+esac
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RDMA fabric checks — HARD checks in KV_TRANSPORT=rdma (Phase 2), SKIPPED
@@ -195,6 +228,39 @@ fi
 # comment and lib.sh's setup_ucx_env: rdma mode deliberately does not fall
 # back to tcp, so a broken RDMA fabric must fail loudly here rather than
 # silently degrading the moment vLLM actually starts.
+#
+# ${PEERS} above already contains exactly the cross-node peer(s) relevant
+# to whichever role this host is (or all three, from a jump host) —
+# TARGET_RDMA_DEV is checked the same way as PREFILL_RDMA_DEV/
+# DECODE_RDMA_DEV below.
+#
+# MEASURED baseline (docs/HANDOFF.md §15, 2026-09-16, after the routing fix
+# and firmware update): these are 400 Gb/s links (`ethtool` reports
+# Speed: 400000Mb/s on all 8 ports on both nodes; NOT the 200 Gb/s this
+# repo asserted before that was measured and corrected — see §15.6).
+# Static routes now exist for all 8 fabric pairs (30.1.N.0/24 <->
+# 30.2.N.0/24, both directions) and cross-node RC pingpong/ib_write_bw
+# both work: ib_write_bw (RC, cross-node, -d ionic_2 -x 1 -F, 5000 iters)
+# reached 41,898 MiB/s (~351 Gb/s, ~88% of 400G line rate) at 8 MiB
+# messages. If you run a real (non-connectivity-only) ib_write_bw pair by
+# hand against this baseline, treat a result well under that as suspect.
+#
+# HOW TO CONFIRM TRAFFIC ACTUALLY CROSSED (§15.7 — do not use rx_bytes):
+# `/sys/class/net/<netdev>/statistics/rx_bytes` is USELESS for RoCE —
+# RoCE bypasses the kernel netdev path entirely, so this counter barely
+# moves even across a multi-GiB transfer (measured: ~1.9 KB moved during
+# a 1.95 GiB transfer). `ionic`'s own `hw_counters/` under
+# /sys/class/infiniband/<dev>/ports/1/ exposes only ERROR counters, no
+# byte counters. The instrument that actually works is MAC-level
+# `ethtool -S <netdev> | grep octets_rx_ok` READ ON THE RECEIVING NODE —
+# and it LAGS by roughly 5 seconds; settling for only ~3s before reading
+# it produced a false "did not cross" verdict in §15.7. This script does
+# not attempt an automated crossing-proof (that requires a coordinated,
+# multi-second-settled counter diff on the PEER, which is out of scope
+# for a single-host connectivity check) — an operator who wants that
+# proof should run ib_write_bw for real (not the 10s connectivity probe
+# below) and diff `ethtool -S` octets_rx_ok on the receiver before/after,
+# with a settle of several seconds after the transfer completes.
 # ─────────────────────────────────────────────────────────────────────────────
 if [ "${KV_TRANSPORT}" != "rdma" ]; then
     step "RDMA fabric checks (skipped: KV_TRANSPORT=${KV_TRANSPORT})"

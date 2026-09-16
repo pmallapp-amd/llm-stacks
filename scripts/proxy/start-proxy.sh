@@ -24,7 +24,15 @@ banner_config
 # shellcheck source=/dev/null
 source "${STACK_ROOT}/etc/env.sh"
 
+# Plural (fleet) vars alongside the singular ones: disagg_proxy.py's
+# EndpointPool reads PREFILL_HOSTS/PREFILL_PORTS/DECODE_HOSTS/DECODE_PORTS
+# first and falls back to the singular only if those are unset/empty.
+# cluster.env already defaults the plurals to the singular for 1P1D, so
+# exporting both here just makes sure that default actually reaches the
+# proxy's environment — going to NPMD is then only a matter of setting the
+# plurals to a multi-entry, space-separated list before sourcing env.sh.
 export PREFILL_HOST PREFILL_PORT DECODE_HOST DECODE_PORT PROXY_PORT
+export PREFILL_HOSTS PREFILL_PORTS DECODE_HOSTS DECODE_PORTS
 
 start_bg "disagg-proxy" \
     python "${REPO_ROOT}/scripts/proxy/disagg_proxy.py"

@@ -68,16 +68,39 @@ missing kv_transfer_params handoff follows the SAME philosophy: it is
 logged and counted (prefill_no_handoff), never fatal — the direct leg not
 firing just means decode falls back to its own LMCache lookup/recompute,
 not that the request fails.
+
+FLEET / N-prefill-M-decode UPGRADE SEAM: today this is 1P1D — one prefill
+instance, one decode instance. Both fleets are modeled as an EndpointPool
+(round-robin over a list[Endpoint]) fed from config/cluster.env's plural
+PREFILL_HOSTS/PREFILL_PORTS and DECODE_HOSTS/DECODE_PORTS, which already
+default to single-entry lists built from the singular PREFILL_HOST/
+PREFILL_PORT/DECODE_HOST/DECODE_PORT. Going to NPMD means:
+
+  1. Add entries to PREFILL_HOSTS/PREFILL_PORTS and/or DECODE_HOSTS/
+     DECODE_PORTS in config/cluster.env (or the creds file) — space
+     separated, e.g. PREFILL_HOSTS="p1.example p2.example p3.example".
+  2. Nothing else. The pool and its round-robin select() already handle
+     any N/M — this module does not need structural changes.
+  3. One real per-instance knob to remember when standing up the new
+     instances themselves (not this proxy's concern, but the reason NPMD
+     is a values change and not just "point more hosts at one config"):
+     each prefill/decode instance's NIXL side-channel port
+     (NIXL_SIDE_CHANNEL_PORT_PREFILL / _DECODE in cluster.env) must be
+     unique per instance of that role — base port + instance index — or
+     two instances on the same host collide on the out-of-band handshake
+     port before RDMA ever gets involved.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import json
 import logging
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from aiohttp import (
@@ -102,6 +125,117 @@ REQUEST_ID_HEADER = "X-Request-Id"
 COMPLETION_PATHS = ("/v1/completions", "/v1/chat/completions")
 
 
+@dataclass(frozen=True)
+class Endpoint:
+    """One upstream vLLM instance (a single prefill or decode member of the
+    fleet). Frozen + hashable so it can key EndpointPool.request_counts
+    directly instead of needing a synthetic string key.
+    """
+
+    host: str
+    port: int
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
+def _split_list_env(value: str) -> list[str]:
+    """Space-separated env var -> list of non-empty tokens. Matches how
+    cluster.env's plural PREFILL_HOSTS/PREFILL_PORTS etc. are documented
+    and quoted (bash word-splitting on an unquoted variable), so a value
+    of "h1 h2 h3" parses the same way here as it does when a shell script
+    iterates over it with `for h in ${PREFILL_HOSTS}`.
+    """
+    return [tok for tok in value.split() if tok]
+
+
+def _parse_fleet(
+    hosts_var: str,
+    single_host_var: str,
+    ports_var: str,
+    single_port_var: str,
+    default_host: str,
+    default_port: int,
+    role: str,
+) -> list[Endpoint]:
+    """Build a role's fleet from the plural env vars, falling back to the
+    singular ones when the plurals are absent/empty — mirroring
+    config/cluster.env's own PREFILL_HOSTS="${PREFILL_HOSTS:-${PREFILL_HOST}}"
+    fallback, done again here so this proxy is also correct when run
+    standalone (without start-proxy.sh's export of the plurals) or against
+    an older env that only ever set the singular.
+    """
+    hosts = _split_list_env(os.environ.get(hosts_var, ""))
+    if not hosts:
+        hosts = _split_list_env(os.environ.get(single_host_var, default_host))
+
+    ports = _split_list_env(os.environ.get(ports_var, ""))
+    if not ports:
+        ports = _split_list_env(os.environ.get(single_port_var, str(default_port)))
+
+    # Broadcast a single port across N hosts (the common NPD case: many
+    # prefill hosts, all vLLM instances on the same port) or a single host
+    # across N ports (many instances co-located on one host, distinct
+    # ports) — either way 1P1D (both lists length 1) is unaffected.
+    if len(hosts) > 1 and len(ports) == 1:
+        ports = ports * len(hosts)
+    elif len(ports) > 1 and len(hosts) == 1:
+        hosts = hosts * len(ports)
+    elif len(hosts) != len(ports):
+        log.warning(
+            "%s: %s has %d entries but %s has %d — pairing element-wise "
+            "and dropping the excess; fix the env so these match",
+            role,
+            hosts_var,
+            len(hosts),
+            ports_var,
+            len(ports),
+        )
+        n = min(len(hosts), len(ports))
+        hosts, ports = hosts[:n], ports[:n]
+
+    return [Endpoint(host=h, port=int(p)) for h, p in zip(hosts, ports)]
+
+
+class EndpointPool:
+    """Round-robin selection over one role's fleet (all-prefill or
+    all-decode). At N=1 next() on a 1-element itertools.cycle always
+    returns that same element, so behaviour is identical to the old
+    single-endpoint Config at 1P1D — this is what makes the fleet a
+    values-only upgrade rather than a structural one.
+
+    select() is called once per client request per role (see
+    handle_completion) — P and D are selected INDEPENDENTLY of each other,
+    each from its own pool, and each selection is reused for that whole
+    request's lifecycle rather than re-selected mid-request (so a single
+    client request always talks to exactly one prefill instance and one
+    decode instance, never a mix).
+
+    Thread-safety: this process runs as a single-threaded aiohttp
+    web.run_app (asyncio event loop, no executor/thread pool handling
+    requests — see Stats' docstring for the same reasoning about its
+    plain-int counters). next() on itertools.cycle plus the dict increment
+    below both run to completion within one event-loop tick with no
+    `await` in between, so they are already atomic with respect to every
+    other coroutine; no threading.Lock is needed here. If this server ever
+    became multi-threaded, this method is exactly the seam that would need
+    one (guarding both the cycle's internal state and request_counts).
+    """
+
+    def __init__(self, endpoints: list[Endpoint]) -> None:
+        if not endpoints:
+            raise ValueError("EndpointPool requires at least one endpoint")
+        self.endpoints = endpoints
+        self._cycle = itertools.cycle(endpoints)
+        self.request_counts: dict[Endpoint, int] = {ep: 0 for ep in endpoints}
+
+    def select(self) -> Endpoint:
+        endpoint = next(self._cycle)
+        self.request_counts[endpoint] += 1
+        return endpoint
+
+
 class Config:
     """All values overridable via env var, matching config/cluster.env's
     naming — this process is normally launched by start-proxy.sh, which
@@ -111,10 +245,35 @@ class Config:
     """
 
     def __init__(self) -> None:
-        self.prefill_host = os.environ.get("PREFILL_HOST", "prefill.invalid")
-        self.prefill_port = int(os.environ.get("PREFILL_PORT", "8100"))
-        self.decode_host = os.environ.get("DECODE_HOST", "decode.invalid")
-        self.decode_port = int(os.environ.get("DECODE_PORT", "8200"))
+        # The fleet, per role — see EndpointPool's docstring and this
+        # module's "FLEET / N-prefill-M-decode UPGRADE SEAM" note above.
+        # Today (1P1D) each pool has exactly one Endpoint, built from the
+        # singular PREFILL_HOST/PORT and DECODE_HOST/PORT via cluster.env's
+        # own PREFILL_HOSTS="${PREFILL_HOSTS:-${PREFILL_HOST}}" fallback
+        # (mirrored again in _parse_fleet so this proxy is correct even
+        # when run standalone, without cluster.env sourced).
+        self.prefill_pool = EndpointPool(
+            _parse_fleet(
+                "PREFILL_HOSTS",
+                "PREFILL_HOST",
+                "PREFILL_PORTS",
+                "PREFILL_PORT",
+                "prefill.invalid",
+                8100,
+                "prefill",
+            )
+        )
+        self.decode_pool = EndpointPool(
+            _parse_fleet(
+                "DECODE_HOSTS",
+                "DECODE_HOST",
+                "DECODE_PORTS",
+                "DECODE_PORT",
+                "decode.invalid",
+                8200,
+                "decode",
+            )
+        )
         self.proxy_port = int(os.environ.get("PROXY_PORT", "8000"))
 
         # Priming request budget: max_tokens=1 still has to run the FULL
@@ -148,14 +307,6 @@ class Config:
         # vLLM rename would silently disable disaggregation rather than
         # error — see config/cluster.env's PD_HANDOFF_FIELD.
         self.pd_handoff_field = os.environ.get("PD_HANDOFF_FIELD", "kv_transfer_params")
-
-    @property
-    def prefill_base(self) -> str:
-        return f"http://{self.prefill_host}:{self.prefill_port}"
-
-    @property
-    def decode_base(self) -> str:
-        return f"http://{self.decode_host}:{self.decode_port}"
 
 
 class Stats:
@@ -204,6 +355,7 @@ async def _prime_prefill(
     session: ClientSession,
     cfg: Config,
     stats: Stats,
+    endpoint: Endpoint,
     path: str,
     body: dict[str, Any],
     req_id: str,
@@ -212,6 +364,10 @@ async def _prime_prefill(
     the prefill node so it runs the prompt forward pass and stages its KV
     blocks for a remote decode. Never raises — a prefill failure is
     logged and counted, not propagated, per this module's docstring.
+
+    `endpoint` is the single prefill instance the caller already selected
+    from cfg.prefill_pool for this request (see handle_completion) — P is
+    selected independently of D, once, before either upstream call is made.
 
     Returns the value of cfg.pd_handoff_field from prefill's JSON response
     (NixlConnector's P->D handoff metadata), or None if prefill failed,
@@ -260,7 +416,7 @@ async def _prime_prefill(
     timeout = ClientTimeout(total=cfg.prefill_timeout_sec)
     try:
         async with session.post(
-            f"{cfg.prefill_base}{path}",
+            f"{endpoint.base_url}{path}",
             json=primed,
             headers={REQUEST_ID_HEADER: req_id},
             timeout=timeout,
@@ -336,6 +492,7 @@ async def _prime_prefill(
 async def _stream_decode_response(
     session: ClientSession,
     cfg: Config,
+    endpoint: Endpoint,
     request: web.Request,
     path: str,
     body: dict[str, Any],
@@ -346,6 +503,12 @@ async def _stream_decode_response(
     non-streaming bodies through the same aiohttp.web.StreamResponse so
     there is exactly one code path regardless of the client's `stream` flag
     — no buffering step that would defeat token-by-token SSE delivery.
+
+    `endpoint` is the single decode instance the caller already selected
+    from cfg.decode_pool for this request (see handle_completion) — it is
+    selected exactly once, before this call, and reused for this whole
+    call: there is no re-selection mid-stream, so a request never talks to
+    more than one decode instance.
     """
     timeout = ClientTimeout(
         total=None,
@@ -353,7 +516,7 @@ async def _stream_decode_response(
         sock_read=cfg.decode_read_timeout_sec,
     )
     async with session.post(
-        f"{cfg.decode_base}{path}",
+        f"{endpoint.base_url}{path}",
         json=body,
         headers={REQUEST_ID_HEADER: req_id},
         timeout=timeout,
@@ -415,7 +578,20 @@ def make_app(cfg: Config, stats: Stats) -> web.Application:
             )
 
         path = request.path
-        log.info("[%s] %s (prompt priming -> %s, then -> %s)", req_id, path, cfg.prefill_base, cfg.decode_base)
+
+        # Select P and D INDEPENDENTLY, once each, before either upstream
+        # call — never re-selected mid-request. At 1P1D each pool has one
+        # endpoint so this is a no-op selection; at NPMD this is the one
+        # and only load-balancing decision this request makes.
+        prefill_ep = cfg.prefill_pool.select()
+        decode_ep = cfg.decode_pool.select()
+        log.info(
+            "[%s] %s (prompt priming -> %s, then -> %s)",
+            req_id,
+            path,
+            prefill_ep.base_url,
+            decode_ep.base_url,
+        )
 
         # Priming and the real decode request are intentionally sequential,
         # not concurrent: the whole point is for prefill's KV chunks to
@@ -423,7 +599,7 @@ def make_app(cfg: Config, stats: Stats) -> web.Application:
         # lookup runs. Running them concurrently would race decode's lookup
         # against prefill's store and reintroduce the same miss-every-time
         # failure mode this proxy exists to avoid.
-        handoff = await _prime_prefill(session, cfg, stats, path, body, req_id)
+        handoff = await _prime_prefill(session, cfg, stats, prefill_ep, path, body, req_id)
 
         # Thread the handoff into decode's request body (F1) — this is
         # what actually triggers a direct NixlConnector load. A separate
@@ -434,7 +610,9 @@ def make_app(cfg: Config, stats: Stats) -> web.Application:
             decode_body[cfg.pd_handoff_field] = handoff
 
         try:
-            return await _stream_decode_response(session, cfg, request, path, decode_body, req_id)
+            return await _stream_decode_response(
+                session, cfg, decode_ep, request, path, decode_body, req_id
+            )
         except (ClientConnectorError, ServerTimeoutError, asyncio.TimeoutError) as exc:
             stats.decode_failures += 1
             log.error("[%s] decode request failed (%s: %s) — this IS fatal, "
@@ -447,13 +625,17 @@ def make_app(cfg: Config, stats: Stats) -> web.Application:
 
     async def _proxy_to_decode_get(request: web.Request) -> web.Response:
         """Simple GET pass-through to decode for /v1/models and /health —
-        no priming needed, these don't touch the KV cache at all.
+        no priming needed, these don't touch the KV cache at all. Still
+        goes through the decode pool's round-robin select() so these
+        health/model-list calls also spread across an NPMD decode fleet
+        rather than always hitting one instance.
         """
         cfg: Config = request.app["cfg"]
         session: ClientSession = request.app["session"]
+        decode_ep = cfg.decode_pool.select()
         timeout = ClientTimeout(total=cfg.health_timeout_sec)
         try:
-            async with session.get(f"{cfg.decode_base}{request.path}", timeout=timeout) as upstream:
+            async with session.get(f"{decode_ep.base_url}{request.path}", timeout=timeout) as upstream:
                 data = await upstream.read()
                 # NOTE: passed via `headers=`, not the `content_type=` kwarg
                 # — aiohttp's Response(content_type=...) parses that string
@@ -481,11 +663,13 @@ def make_app(cfg: Config, stats: Stats) -> web.Application:
         stats: Stats = request.app["stats"]
         session: ClientSession = request.app["session"]
 
-        async def probe(base: str) -> dict[str, Any]:
+        async def probe(endpoint: Endpoint) -> dict[str, Any]:
             timeout = ClientTimeout(total=cfg.health_timeout_sec)
             t0 = time.time()
             try:
-                async with session.get(f"{base}/health", timeout=timeout) as resp:
+                async with session.get(
+                    f"{endpoint.base_url}/health", timeout=timeout
+                ) as resp:
                     await resp.read()
                     return {
                         "healthy": resp.status < 400,
@@ -495,13 +679,27 @@ def make_app(cfg: Config, stats: Stats) -> web.Application:
             except Exception as exc:  # noqa: BLE001 - status probe must never raise
                 return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
 
-        prefill_health, decode_health = await asyncio.gather(
-            probe(cfg.prefill_base), probe(cfg.decode_base)
+        async def describe_pool(pool: EndpointPool) -> list[dict[str, Any]]:
+            # Fleet report: every endpoint in the pool, its live health,
+            # and its round-robin request count so an operator can see
+            # balancing actually happening once N/M > 1.
+            healths = await asyncio.gather(*(probe(ep) for ep in pool.endpoints))
+            return [
+                {
+                    "base_url": ep.base_url,
+                    "request_count": pool.request_counts[ep],
+                    **health,
+                }
+                for ep, health in zip(pool.endpoints, healths)
+            ]
+
+        prefill_endpoints, decode_endpoints = await asyncio.gather(
+            describe_pool(cfg.prefill_pool), describe_pool(cfg.decode_pool)
         )
         return web.json_response(
             {
-                "prefill": {"base_url": cfg.prefill_base, **prefill_health},
-                "decode": {"base_url": cfg.decode_base, **decode_health},
+                "prefill": {"endpoints": prefill_endpoints},
+                "decode": {"endpoints": decode_endpoints},
                 "stats": stats.as_dict(),
             }
         )
@@ -533,10 +731,10 @@ def main() -> None:
     app = make_app(cfg, stats)
 
     log.info(
-        "disagg_proxy starting on 0.0.0.0:%d (prefill=%s decode=%s)",
+        "disagg_proxy starting on 0.0.0.0:%d (prefill fleet=%s decode fleet=%s)",
         cfg.proxy_port,
-        cfg.prefill_base,
-        cfg.decode_base,
+        [ep.base_url for ep in cfg.prefill_pool.endpoints],
+        [ep.base_url for ep in cfg.decode_pool.endpoints],
     )
     web.run_app(app, host="0.0.0.0", port=cfg.proxy_port, print=None)
 
