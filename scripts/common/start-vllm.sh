@@ -126,7 +126,9 @@ fi
 ok "LMCache MP daemon reachable"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Refuse to start unless the remote KV target is ALSO actually reachable.
+# Refuse to start unless the KV storage tier ALSO has a live path to the
+# backing store. What "live path" means is backend-dependent — see the
+# per-backend case below.
 #
 # WHY this is a hard gate, not a warning: LMCache's NIXL storage backend is
 # one of several storage tiers (local_cpu is another, and it's on by
@@ -138,20 +140,59 @@ ok "LMCache MP daemon reachable"
 # deployment right up until someone benchmarks cross-node cache hit rate and
 # finds it's always zero. Refusing to start is the only failure mode that
 # can't be mistaken for success. This gate is IN ADDITION to the LMCache MP
-# daemon gate above, not instead of it — both are now required: the daemon
-# must be up on THIS host AND the KV target must be reachable over the
-# network, since a healthy daemon says nothing about whether SMC3 answers.
+# daemon gate above, not instead of it — both are required: the daemon must
+# be up on THIS host AND the KV tier must have a path to the store, since a
+# healthy daemon says nothing about whether the store is reachable. Note
+# that path is NOT always "over the network from this host" — under
+# XNVME_KV it is a local char device and the network hop belongs to the
+# DSC; the case below is what encodes that difference.
 # ─────────────────────────────────────────────────────────────────────────────
-info "checking NVMe-oF target reachability: ${TARGET_HOST}:${NVMF_TRSVCID}"
-if ! wait_for_port "${TARGET_HOST}" "${NVMF_TRSVCID}" 30; then
-    die "NVMe-oF target ${TARGET_HOST}:${NVMF_TRSVCID} is not reachable" \
-        " after 30s. Refusing to start: a silent fallback to local-only" \
-        " caching is the worst failure mode here (see this script's" \
-        " comment above) because the server would otherwise start" \
-        " successfully and LOOK like it works. Start the target first:" \
-        " scripts/target/03-start-kv-target.sh"
-fi
-ok "target reachable"
+# WHICH reachability check is correct depends on WHO opens the NVMe-oF
+# connection, and that differs by backend. Corrected 2026-09-16 after
+# measuring the live path (docs/HANDOFF.md §16.8's "local DSC" option is
+# what this lab actually runs):
+#
+#   SPDK_NVMe_KV — the HOST is the NVMe-oF initiator. It dials
+#     ${NVMF_TRADDR}:${NVMF_TRSVCID} itself through the SPDK initiator, so a
+#     TCP connect from this host is exactly the right liveness probe.
+#
+#   XNVME_KV — the host is NOT an initiator at all. The Pensando DSC is.
+#     The host's only contact with the KV store is the local PCIe char
+#     device the DSC presents (${XNVME_DEV}, csi=0x1); the DSC opens and
+#     maintains the NVMe-oF/TCP session to the target from its OWN address
+#     on the storage fabric, which the host has no route to. Measured on
+#     this lab: the target's SPDK listens on 1.1.0.2:4420 and its
+#     established peers are the two DSCs (1.1.0.1, 1.1.0.3) — never a host
+#     address. A TCP probe from here therefore tests a path that is not
+#     supposed to exist, and fails on a perfectly healthy deployment.
+#     The device node is the correct host-visible proxy for "the KV tier
+#     has somewhere to go"; the DSC-to-target session is the DSC's
+#     responsibility and is not observable from this side.
+case "${KV_BACKEND}" in
+    XNVME_KV)
+        info "checking DSC-presented KV device: ${XNVME_DEV}"
+        [ -c "${XNVME_DEV}" ] || die "KV device ${XNVME_DEV} is not a char" \
+            " device on this node. Refusing to start: a silent fallback to" \
+            " local-only caching is the worst failure mode here (see this" \
+            " script's comment above). Note this backend does NOT dial the" \
+            " target from this host — the DSC does — so a missing device" \
+            " node here means the DSC is not presenting its KV namespace," \
+            " not that the target is down."
+        ok "KV device ${XNVME_DEV} present"
+        ;;
+    *)
+        info "checking NVMe-oF target reachability: ${NVMF_TRADDR}:${NVMF_TRSVCID}"
+        if ! wait_for_port "${NVMF_TRADDR}" "${NVMF_TRSVCID}" 30; then
+            die "NVMe-oF target ${NVMF_TRADDR}:${NVMF_TRSVCID} is not" \
+                " reachable after 30s. Refusing to start: a silent fallback" \
+                " to local-only caching is the worst failure mode here (see" \
+                " this script's comment above) because the server would" \
+                " otherwise start successfully and LOOK like it works." \
+                " Start the target first: scripts/target/03-start-kv-target.sh"
+        fi
+        ok "target reachable"
+        ;;
+esac
 
 # ─────────────────────────────────────────────────────────────────────────────
 # vLLM process environment.
