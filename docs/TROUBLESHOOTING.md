@@ -283,6 +283,14 @@ different versions).
 
 ### Stock upstream SPDK on the target: `bdev_kvmalloc_create` RPC not found
 
+> **Updated:** there is no `KV_SPDK_REPO`/`SPDK_TARGET_FLAVOR` fork any
+> more — `scripts/target/02-build-spdk-kv.sh` always builds stock
+> `${SPDK_UPSTREAM_REPO}`@`${SPDK_TARGET_REF}` and applies
+> `patches/spdk/0002-*.patch`/`0003-*.patch` on top automatically. See
+> `BRINGUP.md` §3.2. The symptom and root mechanism below (no
+> `bdev_kvmalloc` module without those two patches) are unchanged; only the
+> fix is different now.
+
 **Symptom:** `scripts/target/02-build-spdk-kv.sh`'s "Verifying build
 artifacts" step reports `libspdk_bdev_kvmalloc.a` missing, or — if that
 check were bypassed — `scripts/target/03-start-kv-target.sh` dies with
@@ -290,67 +298,96 @@ check were bypassed — `scripts/target/03-start-kv-target.sh` dies with
 reports no `SPDK_NVMe_KV`-command-set namespace despite the subsystem
 existing.
 
-**Cause:** `SPDK_TARGET_FLAVOR=upstream` was set (or `KV_SPDK_REPO` pointed
-at something that isn't actually the kv_spdk fork). As of SPDK v26.05 the
-NVMe-KV **initiator** API is upstream, but the **target** side is not:
-there is no `bdev_kvmalloc` (or any KV bdev) module anywhere under
-`module/bdev/`, and `lib/nvmf/ctrlr_bdev.c` still dispatches only NVM
-command-set opcodes (READ/WRITE/FLUSH/DSM/WRITE_ZEROES) — no KV opcode
-routing exists to reach. A stock v26.05 `spdk_tgt` builds fine and simply
-cannot serve a KV namespace; this is expected behavior for that flavor, not
-a broken build — see `docs/ARCHITECTURE.md` §7.
+**Cause:** patch 0002 (`bdev/kvmalloc`) did not actually apply to
+`${SPDK_TARGET_SRC}` — either it was skipped incorrectly, or `git am`
+failed and was silently ignored somewhere upstream of this check. As of
+SPDK v26.05 the NVMe-KV **initiator** API is upstream, but the **target**
+side is not: there is no `bdev_kvmalloc` (or any KV bdev) module anywhere
+under `module/bdev/` on a stock tree, and `lib/nvmf/ctrlr_bdev.c` still
+dispatches only NVM command-set opcodes (READ/WRITE/FLUSH/DSM/WRITE_ZEROES)
+without patch 0003 — no KV opcode routing exists to reach. A stock,
+unpatched `nvmf_tgt` builds fine and simply cannot serve a KV namespace;
+this is expected behavior for an unpatched tree, not a broken build — see
+`docs/ARCHITECTURE.md` §7.
 
-**Fix:** set `SPDK_TARGET_FLAVOR=fork` (the default) and supply
-`KV_SPDK_REPO`/`KV_SPDK_REF` pointing at the actual kv_spdk fork:
+**Fix:** re-run the build and read its patch-application output closely:
 ```bash
 # [SMC3]
-KV_SPDK_REPO=<fork-url> KV_SPDK_REF=<ref> scripts/target/02-build-spdk-kv.sh --force-clone
+scripts/target/02-build-spdk-kv.sh --force-clone
 ```
-Confirm afterward: `ls "${SPDK_TARGET_SRC}/build/lib/libspdk_bdev_kvmalloc.a"`
-must exist. If it still doesn't after a clean clone of the URL you believe
-is the fork, that URL isn't the fork — this repo cannot verify `KV_SPDK_REPO`
-independently (it isn't vendored here — see README gap #2).
+`02-build-spdk-kv.sh`'s own `_patch_already_applied()` detects 0001/0004 as
+already-merged upstream **by content** and skips them — that's expected and
+harmless. If `git am` fails applying 0002 or 0003, the script aborts the
+`am` and dies with a clear message: `SPDK_TARGET_REF` has likely moved far
+enough that the surrounding code shape changed, and the patch needs a
+manual rebase — see `patches/spdk/README.md` for per-patch Gerrit status
+and Change-Ids; 0002/0003 may also simply have merged upstream by the time
+you read this, in which case the content-detection should pick that up
+automatically. Confirm afterward:
+`ls "${SPDK_TARGET_SRC}/build/lib/libspdk_bdev_kvmalloc.a"` must exist.
 
 ---
 
-### `nvmf_create_transport` rejecting or ignoring `io_unit_size` on >=26.05
+### `nvmf_create_transport` iobuf/SGL sizing
 
-**Symptom:** on a target built from SPDK `>=26.05`, `nvmf_create_transport`
-either rejects `-u "${NVMF_IO_UNIT_SIZE}"` outright, or accepts it but
-`04-verify-target.sh`'s `io_unit_size` check (a `check_soft`, not `check`,
-on this version) reports the transport's reported `io_unit_size` doesn't
-match what was requested.
+> **Updated:** the earlier version of this entry described an RPC-sequence
+> bring-up (`nvmf_create_transport --help`-probed
+> `--iobuf-small-cache-size`/`--iobuf-large-cache-size` flags, driven by
+> `NVMF_IOBUF_SMALL_CACHE_SIZE`/`NVMF_IOBUF_LARGE_CACHE_SIZE`) that no
+> longer exists. `scripts/target/03-start-kv-target.sh` now applies the
+> entire target configuration atomically via a single `--json` file
+> (`lib-kv-rpc.sh`'s `kv_target_gen_json_config`), which embeds a fixed
+> `iobuf_set_options` call using `NVMF_SMALL_POOL_COUNT`/
+> `NVMF_LARGE_POOL_COUNT`/`NVMF_SMALL_BUFSIZE`/`NVMF_LARGE_BUFSIZE` directly
+> — there is no `rpc.py ... --help` probing step to fail or silently skip
+> any more.
 
-**Cause:** SPDK v26.05 deprecated `io_unit_size` (and `buf-cache-size`,
-`num-shared-buffers`) in `nvmf_create_transport` to no-ops — the transport
-now sizes its buffers from the iobuf pool instead
-(`--iobuf-small-cache-size`/`--iobuf-large-cache-size`, driven by
-`NVMF_IOBUF_SMALL_CACHE_SIZE`/`NVMF_IOBUF_LARGE_CACHE_SIZE` in
-`config/cluster.env`). `scripts/target/lib-kv-rpc.sh`'s
-`kv_target_build_transport_args()` probes `rpc.py nvmf_create_transport
---help` for those two flags before passing them (this repo does not vendor
-kv_spdk, so its exact RPC surface on a given build isn't verified
-statically) — if the fork's RPC surface names them differently, or doesn't
-expose them at all, this is silently skipped, which itself is not a
-failure but does mean the iobuf sizing may not be what you expect.
+**Symptom:** `nvmf_tgt` fails to come up (`scripts/target/04-verify-target.sh`
+reports the `max_io_size`/`max_io_qpairs_per_ctrlr` transport check failing,
+or `nvmf_get_transports` doesn't show the expected sizing at all).
 
-**Fix:** this is informational, not a hard failure, on `>=26.05` — the
-`/16` SGL ratio (`kv_target_check_sgl()`) and any residual `io_unit_size`
-behavior are both no longer a reliable predictor of transport-creation
-success on this version. If `nvmf_create_transport` genuinely fails:
+**Cause:** almost always the SGL ratio, not iobuf cache sizing — see
+`kv_target_check_sgl()`: `NVMF_MAX_IO_SIZE / NVMF_LARGE_BUFSIZE` must be
+`<= 16` (note the denominator is `NVMF_LARGE_BUFSIZE`, **not**
+`NVMF_IO_UNIT_SIZE` — see the "SGL length exceeds max io size" and "Target
+won't start after raising `max_io_size`" entries above, which cover this in
+full). `kv_target_check_sgl()` runs and `die()`s on a bad ratio **before**
+`nvmf_tgt` is even started, so if the process itself won't come up at all,
+check `${LOG_DIR}/kv-target.log` for the JSON config actually being
+rejected (a typo'd key in a hand-edited `config/cluster.env`, or a genuinely
+incompatible SPDK version if `SPDK_TARGET_REF` was pinned to something
+unusual) rather than an iobuf-cache-flag mismatch.
+
+**Fix:**
 ```bash
-# [SMC3] — see what this specific tree's RPC actually accepts
-"${SPDK_TARGET_SRC}/scripts/rpc.py" -s "${SPDK_RPC_SOCK}" nvmf_create_transport --help
+# [SMC3] — see what this specific tree's RPC actually reports, read-only
+"${SPDK_TARGET_SRC}/scripts/rpc.py" -s "${SPDK_RPC_SOCK}" nvmf_get_transports
 ```
-and adjust `NVMF_IOBUF_SMALL_CACHE_SIZE`/`NVMF_IOBUF_LARGE_CACHE_SIZE`, or
-fall back to setting `NVMF_MAX_IO_SIZE`/`NVMF_IO_UNIT_SIZE` more
-conservatively, based on what that `--help` output actually documents for
-this build. This does **not** change `KV_MAX_VALUE_SIZE`'s validated
-default (524288) — see `docs/ARCHITECTURE.md` §7.
+Adjust `NVMF_MAX_IO_SIZE`/`NVMF_LARGE_BUFSIZE`/`NVMF_SMALL_POOL_COUNT`/
+`NVMF_LARGE_POOL_COUNT` in `config/cluster.env` to change what the next
+`--restart` applies — there is nothing to hand-tune via `rpc.py` directly
+any more; the JSON config is the only source of truth (see `BRINGUP.md`
+§3.3).
 
 ---
 
 ### RDMA plugin build (`-Denable_rdma=true`) fails because the initiator's SPDK tree wasn't built `--with-rdma`
+
+> **This build option no longer exists — read before following this
+> entry.** `plugins/nvme-kv`'s `-Denable_rdma` meson option and
+> `prepare-spdk-libs.sh`'s `libspdk_nvme_rdma_only.a` split have been
+> **removed entirely**: the storage leg (NVMe-oF to SMC3) is TCP-only,
+> unconditionally, by design (see the README's Status table and
+> `config/cluster.env`'s `KV_TRANSPORT` comment — "if a storage-leg RDMA
+> transport is ever needed, that is new work to validate from scratch, not
+> a flag flip on code nobody has run"). `05-build-spdk-initiator.sh` and
+> `02-build-spdk-kv.sh` no longer accept `--with-rdma`/`SPDK_WITH_RDMA`
+> either. If you're hitting a build failure trying to pass
+> `-Denable_rdma=true` today, the fix is to **not** pass it — that flag is
+> simply unrecognized by current `meson_options.txt`. The RDMA phase this
+> repo actually supports is the **compute leg only**
+> (`KV_TRANSPORT=rdma`'s `NixlConnector`/UCX path) — see `BRINGUP.md` §9.
+> The rest of this entry is retained for historical context only.
 
 **Symptom:** `meson setup build-nvme-kv -Denable_rdma=true ...` configures
 successfully but `ninja -C build-nvme-kv` fails at the link step with an
@@ -618,17 +655,32 @@ it, before the next start).
 
 ---
 
-### `KeyError: 'LMCacheConnectorV1'`
+### `KeyError: 'LMCacheMPConnector'` or `MultiConnector`
 
-**Symptom:** vLLM raises `KeyError: 'LMCacheConnectorV1'` deep inside
-`vllm.distributed.kv_transfer.kv_connector.factory`, after both packages
-installed cleanly and vLLM starts constructing its connector.
+**Symptom:** vLLM raises a `KeyError` (or an equivalent connector-resolution
+failure) deep inside `vllm.distributed.kv_transfer.kv_connector.factory`,
+against `LMCacheMPConnector` or while constructing `MultiConnector`'s
+children, after both packages installed cleanly and vLLM starts
+constructing its connector.
+
+**This is not, any more, `KeyError: 'LMCacheConnectorV1'`.** This repo used
+to run LMCache's in-process, single-connector mode
+(`LMCacheConnectorV1`), and a version mismatch against that class name was
+this exact failure's old shape. That mode is **gone**: this cluster now
+always runs `MultiConnector[NixlConnector, LMCacheMPConnector]`
+(`scripts/common/gen-kv-transfer-config.sh`, `NixlConnector` always
+`connectors[0]` — see `config/cluster.env`'s "Compute leg (P->D)" section),
+so if you see a `LMCacheConnectorV1` reference in a *live* traceback today,
+something is bypassing this repo's generator entirely (a hand-rolled
+`--kv-transfer-config`) — that's a different bug, not this one.
 
 **Cause:** a version mismatch between the installed `vllm` and `lmcache`
-packages. The vLLM `KVConnector` plugin API and LMCache's
-`LMCacheConnectorV1` implementation of it move independently; there is no
-error at `pip install` time to catch a mismatched pair, only at connector
-construction time.
+packages. The vLLM `KVConnector` plugin API and LMCache's connector
+implementations of it (`LMCacheMPConnector` now, `LMCacheConnectorV1`
+previously) move independently; there is no error at `pip install` time to
+catch a mismatched pair, only at connector construction time — the class
+name in the resulting error just reflects whichever connector this repo is
+actually asking the factory to build.
 
 **Fix:** re-install the pinned pair together, never independently:
 ```bash
@@ -642,6 +694,176 @@ mismatch within one node.
 
 ---
 
+### LMCache MP daemon fails to start (or vLLM refuses to start because it can't reach one)
+
+**Symptom:** either `scripts/common/start-lmcache-daemon.sh` itself dies, or
+`scripts/common/start-vllm.sh` (via `scripts/prefill/03-start-prefill.sh` /
+`scripts/decode/03-start-decode.sh`) dies with `LMCache MP daemon
+<host>:<port> is not reachable after 30s. Refusing to start`.
+
+**Cause:** LMCache now runs as a **separate host process** (MP mode) on
+each compute node, reached over a ZMQ control channel at
+`LMCACHE_MP_HOST:LMCACHE_MP_PORT` (`tcp://127.0.0.1:6557` by default) —
+nothing about vLLM itself spawns it. `scripts/common/start-vllm.sh` treats
+this as a **hard gate, not a warning**: without it, `MultiConnector` would
+still start fine (`LMCacheMPConnector` is just one of its two children) and
+serve every request with the LMCache leg of the KV path silently absent —
+exactly the failure mode this gate exists to make impossible to miss. The
+daemon itself can fail to start for several independent reasons, most
+commonly:
+
+- No venv yet (`scripts/common/20-build-vllm-lmcache.sh` not run).
+- The `--l2-adapter` JSON it builds from `KV_BACKEND`/`XNVME_DEV`/`KV_TRID`
+  fails its own pre-flight validation
+  (`25-validate-lmcache-config.sh --l2-adapter-json`) — commonly because
+  `KV_BACKEND=XNVME_KV` (the default) and the kernel NVMe-oF session to
+  SMC3 was never established (see the next entry below) or didn't survive
+  a reboot (see the "`nvme connect` does not survive a reboot" entry), so
+  `setup_nixl_kv_env`/`resolve_xnvme_kv_dev` cannot resolve `XNVME_DEV` and
+  the daemon script dies before ever spawning the process.
+- A stale `/dev/shm/lmcache_*` segment from a previous killed run (see the
+  "Stale `/dev/shm/lmcache_*` crashes on restart" entry below — it applies
+  to the daemon just as much as to `vllm-{prefill,decode}`).
+
+**Fix:**
+```bash
+# [SMC1 or SMC2] — run it standalone first, this is what 03-start-*.sh calls
+# automatically, but running it by hand surfaces the exact failure
+scripts/common/start-lmcache-daemon.sh
+# or, to watch it live instead of via start_bg's background log:
+scripts/common/start-lmcache-daemon.sh --foreground
+```
+Read the printed `L2 (role=...): {...}` line and the tail of
+`${LOG_DIR}/lmcache-mp-daemon.log` — a validation failure names the exact
+bad key; an unresolved `XNVME_DEV` means go re-run
+[`BRINGUP.md` §4.5](BRINGUP.md#45-connect-to-the-kv-target-nvme-connect)'s
+`nvme connect` step first.
+
+---
+
+### LMCache MP daemon up, but the storage tier never attaches
+
+**Symptom:** the daemon starts cleanly, its ZMQ port is reachable, vLLM
+starts and serves every request successfully — and a live cache-hit test
+still comes back with zero LMCache hit tokens, or `scripts/verify/30-verify-kv-roundtrip.sh`
+never crosses the network. Editing `nixl_backend`/`nixl_backend_params` in
+`${STACK_ROOT}/etc/lmcache-{prefill,decode}.yaml` (generated by
+`scripts/common/gen-lmcache-config.sh`) and restarting **changes nothing**.
+
+**Cause:** this is the single most important trap this refactor
+introduces. Under MP mode, LMCache's YAML `extra_config` block
+(`enable_nixl_storage`, `nixl_backend`, `nixl_backend_params`,
+`nixl_pool_size`) is generated, and even *validated*
+(`25-validate-lmcache-config.sh`) — but it is **not consumed by anything**:
+not by vLLM's process, not by the MP daemon. That surface belongs
+exclusively to the in-process `LMCacheConnectorV1` path
+(`lmcache/v1/storage_backend/nixl_storage_backend.py`), which this cluster
+does not use. **The KV storage tier is attached daemon-side**, via
+`scripts/common/start-lmcache-daemon.sh`'s repeatable `--l2-adapter <JSON>`
+flag (type `nixl_store`, e.g.
+`{"type":"nixl_store","backend":"XNVME_KV","backend_params":{"dev_uri":"/dev/ng1n1"},"pool_size":2000000}`)
+— built fresh from `KV_BACKEND`/`XNVME_DEV`/`KV_TRID` every time the daemon
+starts, entirely independent of the YAML file. An earlier investigation
+(`docs/HANDOFF.md` §12.1) read this same fact backwards and concluded MP
+mode "cannot reach the NIXL storage backend at all" — that conclusion is
+**withdrawn** (§16 there): MP mode reaches it fine, just through this
+different, CLI-flag-based surface, not the YAML.
+
+**Fix:** stop looking at the YAML. Confirm what the **daemon** actually
+launched with:
+```bash
+# [SMC1 or SMC2]
+grep -A2 "L2 (role=" "${LOG_DIR}/lmcache-mp-daemon.log" | tail -5
+```
+and cross-check `KV_BACKEND`/`XNVME_DEV`/`KV_TRID` in `config/cluster.env`
+against what's actually reachable (`nvme list-subsys` for `XNVME_KV`; `ss
+-tnp | grep :4420` for `SPDK_NVMe_KV`). Then confirm end to end with:
+```bash
+scripts/verify/30-verify-kv-roundtrip.sh
+```
+If you need to change which backend/device the daemon attaches, that's a
+`config/cluster.env` (`KV_BACKEND`/`XNVME_DEV`) change plus a daemon
+restart (`scripts/common/stop-lmcache-daemon.sh` then
+`scripts/common/start-lmcache-daemon.sh`) — never a YAML edit.
+
+---
+
+### `nvme connect` does not survive a reboot
+
+**Symptom:** after a reboot of SMC1 or SMC2 (or after SMC3's `nvmf_tgt` was
+restarted/reset), `scripts/common/start-lmcache-daemon.sh` or
+`scripts/common/start-vllm.sh` dies with `KV_BACKEND=XNVME_KV but XNVME_DEV
+is still empty`, or `setup_nixl_kv_env`/`resolve_xnvme_kv_dev` reports no
+character device matches `NVMF_SUBNQN`. Everything worked in a previous
+session; nothing in `config/cluster.env` changed.
+
+**Cause:** the kernel NVMe-oF/TCP initiator session established by `nvme
+connect` (`BRINGUP.md` §4.5) has **no `--persistent` flag and no systemd
+unit** wired up anywhere in this repo — it is a known, unfixed gap, not a
+regression you caused. It does not survive a reboot of the **compute**
+node that ran `nvme connect`, and it also stops working if **SMC3** itself
+rebooted or `nvmf_tgt` was restarted/reconfigured, since the controller the
+session points at no longer exists. A reboot comes back *quietly
+unequipped*: no error at boot time, just a missing device the next time
+something tries to use it.
+
+**Fix:** treat this as a standing item in your per-reboot checklist for
+**both** roles, on **either** node rebooting:
+```bash
+# [SMC3] — if the target rebooted or nvmf_tgt was restarted, bring it back
+# up first (it does not survive either)
+scripts/target/03-start-kv-target.sh
+scripts/target/04-verify-target.sh
+
+# [SMC1] and [SMC2] — re-run BRINGUP.md §4.5 before starting anything else
+nvme connect -t "${NVMF_TRTYPE,,}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" \
+    -n "${NVMF_SUBNQN}" -q "${NVMF_HOSTNQN_PREFILL}"   # or _DECODE on SMC2
+nvme list-subsys   # confirm the controller re-attached
+```
+Do **not** hand-pin `XNVME_DEV` to whatever `/dev/ngXnY` path it happened to
+land on last time — the index is not stable across reconnects (see
+`config/cluster.env`'s `XNVME_DEV` comment); let `resolve_xnvme_kv_dev()`
+re-resolve it by `NVMF_SUBNQN` the next time `start-lmcache-daemon.sh` or
+`start-vllm.sh` runs.
+
+---
+
+### Confirming RoCE traffic actually crossed the wire: don't trust `rx_bytes`
+
+**Symptom:** you've run a real RDMA data-path test (e.g. `ib_write_bw`)
+between two nodes and want to independently confirm bytes actually crossed
+the fabric — `/sys/class/net/<netdev>/statistics/rx_bytes` on the receiver
+barely moves even though the transfer clearly completed and reported a
+throughput number.
+
+**Cause:** RoCE bypasses the kernel netdev path entirely, so the ordinary
+netdev byte counters are **not instrumented for this traffic at all** —
+measured: ~1.9 KB counted on `rx_bytes` across a 1.95 GiB transfer. The
+`ionic` RDMA device's own `hw_counters/` under
+`/sys/class/infiniband/<dev>/ports/1/` doesn't help either — it exposes
+only **error** counters, no byte counters.
+
+**Fix:** the instrument that actually works is the **MAC-level** counter,
+read on the **receiving** node:
+```bash
+# [receiver] — before the transfer
+ethtool -S <netdev> | grep octets_rx_ok
+
+# ... run the real transfer (ib_write_bw or equivalent) ...
+# wait several seconds — this counter LAGS by roughly 5 seconds; settling
+# for only ~3s produced a false "traffic did not cross" verdict once ...
+
+# [receiver] — after, and diff against the before value
+ethtool -S <netdev> | grep octets_rx_ok
+```
+`scripts/verify/10-verify-network.sh` does **not** attempt this
+automatically (it requires a coordinated, multi-second-settled counter diff
+on the peer, out of scope for a single-host connectivity check) — this is
+a manual step for anyone who wants to independently prove bytes crossed,
+beyond the throughput number `ib_write_bw`/`iperf3` already reported.
+
+---
+
 ### RDMA mode connects anyway over TCP
 
 **Symptom:** `KV_TRANSPORT=rdma` is set, but the compute-leg connection
@@ -649,24 +871,28 @@ appears to still be using TCP instead of failing or using RDMA verbs.
 
 **Cause:** this should not happen by design —
 `scripts/common/lib.sh`'s `setup_ucx_env` **deliberately excludes** `tcp`
-from `UCX_TLS` in RDMA mode (`UCX_TLS="rc_verbs,rc_mlx5,dc,ud,self,sm"`,
-no `tcp`) specifically so that a broken or half-configured RoCE fabric
-fails loudly instead of silently falling back. If you're observing a TCP
-fallback anyway, either something is bypassing `setup_ucx_env` entirely
-(a hand-launched vLLM process, or `UCX_TLS` exported earlier in the
-environment overriding what this function sets), or you're actually
-looking at the **storage leg**, not the compute leg — the storage leg's
-initiator-side RDMA support does not exist yet at all (see `BRINGUP.md`
-§9.1); if `KV_TRANSPORT=rdma` but the plugin was never rebuilt with an RDMA
-transport object, `create_backend()` should fail outright rather than
-connect over TCP, because the TRID string passed to it says
-`trtype:RDMA` and there is no downgrade path — a "successful" connection in
-that state would itself be worth investigating as a bug.
+from `UCX_TLS` in RDMA mode (`UCX_TLS_RDMA`, `config/cluster.env`, currently
+`"ib,rocm,self,sm"` — **not** the older `"rc_verbs,rc_mlx5,dc,ud,self,sm"`,
+which pins a transport the ionic/Pensando provider doesn't expose and fails
+outright on this hardware; see that variable's comment for the full
+writeup, including why `rocm` is a required local memory-domain component,
+not a network transport, and does not reintroduce a TCP path). If you're
+observing a TCP fallback anyway, either something is bypassing
+`setup_ucx_env` entirely (a hand-launched vLLM process, or `UCX_TLS`
+exported earlier in the environment overriding what this function sets),
+or you're actually looking at the **storage leg**, not the compute leg —
+the storage leg is NVMe-oF/**TCP only, unconditionally, by design**
+regardless of `KV_TRANSPORT` (its earlier RDMA groundwork was removed
+entirely — see `BRINGUP.md` §9 and the README's Status table); seeing TCP
+there is correct, not a fallback to investigate.
 
 **Fix:** confirm nothing pre-sets `UCX_TLS` before `setup_ucx_env` runs;
 confirm which leg you're actually observing (`ss -tnp` toward
-`${TARGET_HOST}:${NVMF_TRSVCID}` is the storage leg;
-`${NIXL_SIDE_CHANNEL_PORT}` between SMC1 and SMC2 is the compute leg).
+`${TARGET_HOST}:${NVMF_TRSVCID}` is the storage leg — expected to be TCP
+always; `NIXL_SIDE_CHANNEL_PORT_PREFILL`/`NIXL_SIDE_CHANNEL_PORT_DECODE`
+between SMC1 and SMC2 is the compute leg's NIXL handshake channel — note
+this is the out-of-band descriptor exchange, not the UCX/RDMA data path
+itself, which doesn't have a fixed port to grep for).
 
 ---
 
@@ -676,9 +902,10 @@ confirm which leg you're actually observing (`ss -tnp` toward
 
 | File | Node | grep for |
 |---|---|---|
-| `vllm-prefill.log` | SMC1 | `SPDK_NVMe_KV`, `NIXL_ERR`, `unsupported backend`, `Traceback` |
-| `vllm-decode.log` | SMC2 | `SPDK_NVMe_KV`, `hit tokens`, `NIXL_ERR`, `unsupported backend` |
-| `kv-target.log` | SMC3 | `SPDK_NVMe_KV`, `NIXL_ERR`, `SGL length`, `ENOMEM` |
+| `vllm-prefill.log` | SMC1 | `${KV_BACKEND}` (e.g. `XNVME_KV`), `NIXL_ERR`, `unsupported backend`, `Traceback` |
+| `vllm-decode.log` | SMC2 | `${KV_BACKEND}`, `hit tokens`, `NIXL_ERR`, `unsupported backend` |
+| `lmcache-mp-daemon.log` | SMC1 and SMC2 (one per node — the daemon is per-host, not shared) | `L2 (role=`, `--l2-adapter`, `ZMQ`, `Traceback` |
+| `kv-target.log` | SMC3 | `${KV_BACKEND}`, `NIXL_ERR`, `SGL length`, `ENOMEM` |
 | `disagg-proxy.log` | wherever the proxy runs | request IDs (`X-Request-Id`) to correlate a client request across prefill/decode logs |
 
 ```bash
@@ -703,7 +930,9 @@ the same invocation — source it from a shell that's already sourced
 
 ```bash
 ss -tnp | grep ":${NVMF_TRSVCID}"          # NVMe-oF/TCP connections (initiator or target side)
-ss -tnp | grep ":${NIXL_SIDE_CHANNEL_PORT}" # compute-leg NIXL/UCX side channel
+ss -tnp | grep ":${NIXL_SIDE_CHANNEL_PORT_PREFILL}" # [SMC1] compute-leg NIXL side channel
+ss -tnp | grep ":${NIXL_SIDE_CHANNEL_PORT_DECODE}"  # [SMC2] compute-leg NIXL side channel
+ss -tnp | grep ":${LMCACHE_MP_PORT}"                # [SMC1 or SMC2] LMCache MP daemon (loopback only)
 nvme list-subsys                            # [SMC1/SMC2] confirm NVMe-oF controller attachment
 nvme discover -t tcp -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}"   # [SMC1/SMC2]
 ```

@@ -47,28 +47,41 @@ Addresses and credentials are **not in this repo** — see §3. Stack is
 vLLM + LMCache + NIXL + the two NIXL plugins in `plugins/`, on ROCm.
 Model is Qwen2.5-72B-Instruct at TP=8.
 
-### Two independent legs
+### One stack, two always-on KV paths — not two independent legs
+
+> **Corrected 2026-09-16 — see §17.2 for the full account.** This section
+> used to be titled "Two independent legs," language that implied the two
+> paths below could be stood up separately. They never could be: this
+> repo has composed both, every time, since TODO 0.1 was decided. The
+> "leg A"/"leg B" shorthand this doc used throughout §2–§16 is retired;
+> both paths are always-on parts of **one** stack, described below by what
+> they actually are.
 
 This distinction is the thing to get right; an earlier pass got it wrong and
-built an entire phase plan around the mistake.
+built an entire phase plan around the mistake of treating them as
+independently deployable.
 
-| Leg | Path | Transport | NICs |
+| Path | Route | Transport | NICs |
 |---|---|---|---|
-| **A — P→D transfer** | prefill → decode, direct GPU-to-GPU via NIXL/UCX | TCP now → **RDMA = acceptance** | DSC Ethernet Controller `[1dd8:1002]` (10/node, `ionic` driver) |
-| **B — Shared KV storage** | both compute nodes → target over NVMe-oF | **TCP, permanently by design** | Same `[1dd8:1002]` ID on the target (2 present) — no distinguishing name confirmed |
+| **P→D handoff** | prefill → decode, direct GPU-to-GPU via `NixlConnector`/UCX | TCP now → **RDMA = acceptance** | DSC Ethernet Controller `[1dd8:1002]` (10/node, `ionic` driver) |
+| **Storage tier** | both compute nodes → `LMCacheMPConnector` → the MP daemon → its `nixl_store` L2 adapter → the KV target over NVMe-oF (§17.3, §17.4) | **TCP, permanently by design** | Same `[1dd8:1002]` ID on the target (2 present) — no distinguishing name confirmed |
 
-**Why leg B can only ever be an LMCache tier, never `NixlConnector`'s
-transport itself:** `NixlConnector`'s handshake (`getLocalMD()`) requires
-RDMA-style addressable memory. Storage/KV backends — SPDK_NVMe_KV and
-XNVME_KV alike — return `NIXL_ERR_INVALID_PARAM` there (verified from
-`/root/rixl-bench`'s `11-deploy-qwen-nixl-xnvme.sh`, quoted in full at
-§10.3). A KV backend can therefore never carry the P/D handshake itself; it
-is only reachable as an LMCache storage tier underneath NixlConnector, which
-is exactly what the composition below does.
+**Why the storage tier can only ever be an LMCache tier, never
+`NixlConnector`'s transport itself:** `NixlConnector`'s handshake
+(`getLocalMD()`) requires RDMA-style addressable memory. Storage/KV
+backends — SPDK_NVMe_KV and XNVME_KV alike — return
+`NIXL_ERR_INVALID_PARAM` there (verified from `/root/rixl-bench`'s
+`11-deploy-qwen-nixl-xnvme.sh`, quoted in full at §10.3). A KV backend can
+therefore never carry the P/D handshake itself; it is only reachable as an
+LMCache storage tier underneath NixlConnector, which is exactly what the
+composition below does.
 
-Composed as `MultiConnector[NixlConnector, LMCacheMPConnector]`: NixlConnector
-carries the P/D role and moves KV over RDMA; LMCache stays `kv_both` on both
-sides as a reuse tier, not the transport.
+Composed as `MultiConnector[NixlConnector, LMCacheMPConnector]`, with
+`NixlConnector` fixed as `connectors[0]`: `NixlConnector` carries the P/D
+role and moves KV over RDMA (at acceptance) or TCP (today); LMCache stays
+`kv_both` on both sides as a reuse tier, not the transport. This
+composition is no longer a documented convention to remember — it is the
+only shape this repo's generator can emit; see §17.1.
 
 ---
 
@@ -77,6 +90,10 @@ sides as a reuse tier, not the transport.
 > **Note, 2026-09-16:** this section is a running record and its numbered
 > blockers below are historical — each is annotated with how it resolved.
 > For what is true *now*, see [§9.1](#91-cluster-state-as-handed-over).
+> The "leg A"/"leg B" shorthand used in the historical entries below is
+> retired terminology, kept here unedited because it is what was actually
+> written and measured at the time — see §1 and §17.2 for the current
+> framing (one stack, two always-on KV paths).
 
 `main` is the default branch and in sync with
 `github.com/pmallapp-amd/llm-stacks`. Working tree clean.
@@ -570,9 +587,18 @@ other directly today.
 
 ## 9. How to resume
 
-Rewritten 2026-09-16, end of session 4. Everything above §9 is background
-and evidence; this section is the operational one. If you read nothing
-else, read this.
+Rewritten 2026-09-16 (twice — first at the end of session 4, again later
+the same day once the connector matrix collapsed to one stack and the
+MP daemon existed, §17). Everything above §9 is background and evidence;
+this section is the operational one. If you read nothing else, read this.
+
+> **What changed in this rewrite:** §9.3's old "Track A / Track B" split
+> is gone. Track A (the storage tier) was never something to compose
+> *after* the leg-A baseline — the composition has been one thing since
+> TODO 0.1, and the MP daemon + its `nixl_store` L2 adapter (§17.3, §17.4)
+> are now part of what "bring up the stack" means. RDMA acceptance (§3)
+> remains the one genuinely separate, parallel workstream — it always was
+> an independent transport upgrade for the P→D path, not a second leg.
 
 ### 9.1 Cluster state as handed over
 
@@ -591,7 +617,7 @@ deliberately at the end of the session; the containers carry no
 Both compute nodes rebooted simultaneously just now, which nobody on our
 side initiated — see §9.5.
 
-### 9.2 Check these three things before touching anything
+### 9.2 Check these things before touching anything
 
 Each has cost a run already, and each presents as a failure in whatever
 you were actually testing rather than as itself.
@@ -603,79 +629,119 @@ you were actually testing rather than as itself.
    less than the time your step needs, you will lose the run.**
 2. **Who owns `smc3`.** It is shared and was reconfigured mid-session by
    someone else (§12.5). Our subsystem is gone. Do not restart their
-   target to reclaim it — agree ownership first. TODO 6.18.
+   target to reclaim it — agree ownership first. TODO 6.18. (§16.8/§17.9:
+   the local-DSC option may make this moot for a first proof — evaluate
+   before assuming it still gates everything.)
 3. **`modprobe amdgpu` on both compute nodes.** Currently **needed** —
    both report 0 GPUs as handed over. §9.4.
+4. **Whether the LMCache MP daemon is already up on this node before you
+   run `start-vllm.sh` (or a role script) by hand.** It is idempotent and
+   the role scripts start it automatically, but `start-vllm.sh`'s own gate
+   will `die` with a pointer back to `start-lmcache-daemon.sh` if it isn't
+   reachable — read that message before assuming vLLM itself is broken.
+   §9.4, §17.3.
 
 ### 9.3 What to do, in order
 
-**Step 0 — restore the leg-A baseline.** Do this before any new work,
-even if leg A is not what you came for. It is the one known-good
-reference point on this cluster, it now takes minutes, and every failure
-mode below is easier to attribute against it.
+**Step 0 — bring up the one stack, including its storage tier, and
+confirm the leg-A baseline before anything else.** There is no longer a
+"restore the compute leg, then separately consider the storage tier"
+sequence — the MP daemon and its `nixl_store` L2 adapter are part of what
+starting this stack means now (§17.1, §17.3, §17.4), so bring them up
+first, on both nodes:
 
 ```
-scripts/common/start-vllm-container.sh prefill     # on smc1
-scripts/common/start-vllm-container.sh decode      # on smc2
-python3 scripts/proxy/disagg_proxy.py              # fronting both
+scripts/common/start-lmcache-daemon.sh     # on smc1 AND smc2 (idempotent — safe if already up)
+scripts/prefill/03-start-prefill.sh        # on smc1 -- also starts the daemon itself first if needed
+scripts/decode/03-start-decode.sh          # on smc2 -- same
+scripts/proxy/start-proxy.sh               # fronting both (or: python3 scripts/proxy/disagg_proxy.py)
 ```
+
+`scripts/common/start-vllm-container.sh`, which this step used to point
+at, is **deleted** (§17.1) — it built a bare `NixlConnector` with no
+LMCache at all, had no caller, and could never have run the composition
+this repo actually decided on. Use the role scripts above; `start-vllm.sh`
+underneath them now hard-gates on the daemon being reachable in addition
+to its pre-existing gate on the KV target.
 
 Send one long (≥4000-token) prompt with a per-run nonce through the proxy
 and confirm **decode's `Avg prompt throughput` is 0.0 with
 `External prefix cache hit rate` at 100%**, while prefill's throughput is
-non-zero. That is the §11 result. Anything less is not a baseline.
+non-zero. That is the §11 result — the P→D handoff baseline. **It proves
+the P→D path, not the storage tier**: a healthy daemon and a working
+`--l2-adapter` spec are necessary for vLLM to start at all now (the gate
+above), but starting is not the same as the tier actually serving a hit.
 
-Then pick one of two independent tracks. They do not block each other.
+**To prove the storage tier itself is live**, look for a real LMCache hit
+served from the KV backend — non-zero `need to load:` and non-zero
+`External prefix cache hit rate` **cross-instance or post-eviction**
+(§8's trap), via `scripts/verify/30-verify-kv-roundtrip.sh` or a repeat
+request engineered to miss vLLM's own prefix cache first. **This has not
+yet been run against the composed daemon+L2-adapter path on live
+hardware** — the code and its JSON round-trip are validated (§17.4,
+§17.5), a live hit through it is not. This is TODO 6.10, still the one
+live item in §6, and it is blocked on exactly what it always was:
 
-**Track A — the storage tier (TODO 6.10).** The last item in §6, and the
-original goal of the project. Previously recorded as *blocked by 6.18* —
-needing our KV subsystem back on the shared `smc3` target. **That may no
-longer be the only path — both `smc1` and `smc2` have their own local
-DSC (`/dev/ng1n1`), and a local-DSC XNVME_KV tier does not need `smc3` at
-all. Unproven, nothing deployed or measured yet — evaluate before
-assuming 6.18 still gates this track. See §16.8.**
+- **6.18** — `smc3` is shared and was reconfigured out from under this
+  work once already; agree ownership before touching it again. **Evaluate
+  the local-DSC option first** (§16.8, §17.9) — both `smc1` and `smc2`
+  have their own local Pensando DSC (`/dev/ng1n1`) that does not need
+  `smc3` at all; unproven, nothing deployed against it yet, but it may
+  make 6.18 moot for a first proof.
+- **6.20** — `smc2`'s reboot instability. A composed run needs the node to
+  stay up through model load *and* the daemon startup; check `uptime`
+  first (§9.2).
 
-The exact launch recipe is at **§12.7**, corrected: the composition is
-`MultiConnector[NixlConnector, **LMCacheMPConnector**]` — matching what
-this repo's scripts have emitted all along
-(`scripts/common/gen-kv-transfer-config.sh`) — **not**
-`LMCacheConnectorV1`. §12.1's conclusion that MP "cannot reach the NIXL
-storage backend at all" is **withdrawn** — see §16 for the corrected
-architecture (the distributed L2-adapter path) and the vendor reference
-that proves it.
+**Done, not blocking either of the above:** the `KV_BACKEND=XNVME_KV`
+default flip in `config/cluster.env` (§17.7) is now committed — it decides
+which backend `start-lmcache-daemon.sh`'s `--l2-adapter` spec targets.
 
-**Track B — RDMA acceptance (§3).** Newly viable and not previously
-available. Another party installed the matched 24.04 DSC bundle, so
-`ibv_devinfo` works and **RC queue pairs carry data** (§14). Remaining,
-in order:
+**Separately, and not blocking any of the above — RDMA acceptance (§3).**
+This was never a second leg to compose; it is a transport upgrade for the
+P→D path that has always been independent work. Newly viable and not
+previously available: another party installed the matched 24.04 DSC
+bundle, so `ibv_devinfo` works and **RC queue pairs carry data** (§14).
+Remaining, in order:
 - **3.9** — `UCX_TLS=ib` pulls in UD transports, and **UD QP creation
   fails on this hardware**. Find the transport spec that works, without
   weakening invariant 6's exclusion of `tcp`. Also: the container launch
-  does **not** map `/dev/infiniband` yet, which Phase 2 needs.
-- **3.6** — the IPv4 routing gap, `30.1.N.1/24` vs `30.2.N.1/24`, now the
-  operative blocker again. One lead to measure, not assume: the index-2
-  IPv6 GIDs share `2001:0db8::/32` across both nodes.
-- **3.10** — firmware differs between nodes (`-pi-121` vs `-a-120`).
-  Level it before trusting any cross-node RDMA number.
+  does **not** map `/dev/infiniband` yet, which Phase 2 needs. **This is
+  the sole remaining RDMA-stack blocker** — 3.6 (routing) is closed and
+  3.10 (firmware skew) is downgraded to tidiness, both per §15.
+- **3.6** — CLOSED (§15.4). Left here only as a reminder to re-measure if
+  the shared fabric changes again (§9.5) — do not assume a closed item
+  stays closed on this cluster.
+- **3.10** — downgraded to tidiness (§15.1); `smc1`'s `ionic_0` is still
+  the lone card on old firmware, level it when convenient.
 
-**Cheap and worth doing whenever — 3.8.** Make `00-preflight.sh` assert
-`ibv_devinfo` actually returns a device instead of merely existing, and
-surface libibverbs' `couldn't load driver` warning. That warning names
-the exact missing provider and would have made §13 self-diagnosing
-instead of costing two sessions.
+**3.8 — DONE, 2026-09-16.** `00-preflight.sh` now asserts `ibv_devinfo`
+actually enumerates a device rather than merely existing, and surfaces
+libibverbs' `couldn't load driver` warning verbatim when it fires — the
+exact signature that hid §13 for two sessions. Still `check_soft` in
+Phase 1 by design (TCP needs no verbs); the hard check for
+`KV_TRANSPORT=rdma` was already covered separately by `require_rdma_access`
+(`lib.sh`, dies if no port reports `PORT_ACTIVE` — TODO 1.9), not by this
+change. Nothing further to do here.
 
 ### 9.4 The per-boot ritual — none of this survives a reboot
 
 1. **`modprobe amdgpu`** on both compute nodes. `modprobe.blacklist=amdgpu`
    is still on the 24.04 cmdline, so GPUs never autoload.
-   `01-host-prep.sh` and `start-vllm-container.sh` do this automatically
-   (opt-out `AMDGPU_AUTOLOAD=0`). TODO 0.4. **Required right now.**
+   `01-host-prep.sh` does this automatically (opt-out
+   `AMDGPU_AUTOLOAD=0`). TODO 0.4. **Required right now.**
 2. **The KV target.** It does not survive a reboot of `smc3` — but as
    handed over the problem is different and worse: `smc3` is up, and
    someone else's subsystem is on it. Resolve 6.18 before assuming this
-   step is yours to perform.
+   step is yours to perform. (Or evaluate the local-DSC option, §16.8 —
+   it sidesteps this step entirely if adopted.)
 3. **`nvme connect`** on both compute nodes — no `--persistent`, no
    systemd unit (TODO 6.9). Moot until (2) is resolved.
+4. **Start the LMCache MP daemon on both nodes** —
+   `scripts/common/start-lmcache-daemon.sh` (§17.3). Idempotent, and the
+   role start scripts (`scripts/{prefill,decode}/03-start-*.sh`) call it
+   automatically before launching vLLM — but it does not survive a reboot
+   any more than (1)–(3) do, and `start-vllm.sh`'s gate will `die`, not
+   silently proceed, if it isn't up.
 
 What does **not** need redoing: the DSC/RDMA userspace fix is a package
 install and survived this reboot (`ibv_devinfo` → 8 devices on both nodes
@@ -710,7 +776,8 @@ Not hypothetical — each cost real time on this project.
 | A correct completion proves **nothing**. Two separate defects produced perfect output at plausible latency while transferring zero KV. Read the two engine throughput counters or you have measured nothing. | §11 |
 | `UCX_NET_DEVICES` unset makes UCX advertise the first TCP device it enumerates — an unroutable fabric NIC. `<auto>` was not a default, it was the bug. | §11.2 |
 | `max_local_cpu_size` is **per TP worker**. At TP=8, `80` means 640 GiB of pinned memory. It took a node down. | §12.3 |
-| `LMCacheMPConnector` silently ignores `enable_nixl_storage` / `nixl_backend` / `nixl_backend_params`. Not rejected — ignored. | §12.1 |
+| `LMCacheMPConnector` silently ignores `enable_nixl_storage` / `nixl_backend` / `nixl_backend_params`. Not rejected — ignored. True, and it is the RIGHT config surface (`--l2-adapter`, daemon-side) that was missing from this doc, not a capability gap in the connector — see the next row and §17.4/§17.6. | §12.1 |
+| The YAML `gen-lmcache-config.sh` emits (`enable_nixl_storage`, `nixl_backend`, `nixl_backend_params`) is not what configures the live storage tier under MP mode. The backend is set on the **daemon** via a repeatable `--l2-adapter <JSON>` CLI flag; the YAML only matters for the in-process `LMCacheConnectorV1` path this repo does not run. Reading "the YAML has the right keys" as "the tier is configured" is exactly the mistake that produced §12.1. | §17.4, §17.6 |
 | vLLM's own prefix cache sits upstream of every connector. A valid reuse number must be cross-instance or post-eviction. | §8 |
 | `nixl_rocm._api.create_backend()` has no `return` — it is always `None`. Checking it is a test incapable of failing. | §11.3 |
 | `ibv_rc_pingpong`'s Mbit/s figure is latency-bound loopback, not throughput. There is **no** RDMA throughput number on this cluster. | §14.2 |
@@ -1366,6 +1433,18 @@ vLLM side entirely — it belongs on the daemon side under MP, which this
 repo has not yet stood up. §16.5 is the authoritative recipe until this
 repo runs it and can record the daemon-side config directly.
 
+> **ANSWERED, 2026-09-16 — see §17.5.** The "known unknown" two paragraphs
+> up is now closed with evidence, not left open: `get_plugin_params()`
+> confirms XNVME_KV declares `max_value_size = 32768` (this paragraph's
+> guess was right about that much), but the 10-MiB-chunk-vs-32-KiB-ceiling
+> tension itself does not apply on the daemon-side path this repo
+> actually runs — that reasoning was about the in-process
+> `LMCacheEngineConfig.chunk_size`, a layer the MP path never touches. On
+> the MP/L2-adapter path the pool tiles at `--l1-align-bytes` (4096 B by
+> default), which stays far under either backend's ceiling, so the split
+> described here never engages. Do not carry the "~320 parts" arithmetic
+> above forward as if it were a live risk on the path this repo runs.
+
 ### 12.8 `smc2` (decode) became reboot-unstable during this session — read before planning any long run
 
 Recorded prominently because it invalidates the assumption every
@@ -1974,6 +2053,14 @@ is `-a-120` on both nodes, i.e. it avoids `smc1`'s lone `-pi-121` card
 
 ## 16. MAJOR CORRECTION: §12.1's headline conclusion is WRONG — `LMCacheMPConnector` DOES carry the KV tier, and a local-DSC path may unblock Track A (2026-09-16)
 
+> **Implemented, 2026-09-16 — see §17.** The L2-adapter path this section
+> identifies only in outline (§16.1) is now actual, running code:
+> `scripts/common/start-lmcache-daemon.sh` builds and validates the
+> `--l2-adapter` JSON described there, and §17.5 answers the
+> `max_value_size`/split question §16.1's `mem_split_n` note raised but
+> did not settle. Read this section for the *why*; read §17 for the
+> *what's actually implemented now*.
+
 **§12.1 is wrong.** It concluded `LMCacheMPConnector` "cannot carry the KV
 tier at all" and that the correct child is `LMCacheConnectorV1`. That
 conclusion has been steering this project's docs away from the connector
@@ -2161,3 +2248,356 @@ assumed; this is one more instance of that same pattern.
   automatic closure — the local-DSC option is unproven and 6.18 (the
   `smc3` ownership question) remains true on its own terms if the
   remote-target design is kept instead.
+
+---
+
+## 17. The matrix is collapsed to one stack, the MP daemon exists, and §12.7's `max_value_size` question is answered (2026-09-16)
+
+Commits `c055f7d` and `0b75adb`, plus a follow-up commit carrying the
+`config/cluster.env` edit (§17.7), turn §16's outline into running code. Nothing here was
+measured on live hardware against `smc3` or the local DSC — that live
+composed run is still gated on 6.18/6.20 exactly as §12.9 left it. What
+changed is that the code this repo runs no longer has a matrix of
+postures to get wrong, the daemon §12.1 said "nothing spawns" now has a
+launcher, and one of §12.7's open questions is closed by evidence rather
+than by further guessing.
+
+### 17.1 The connector matrix is gone — one composition, and the order is enforced in code, not chosen by a flag
+
+This repo used to expose three switches — `PD_ENABLED` (whether the outer
+connector was `MultiConnector` at all, or a lone `LMCacheConnectorV1`),
+`PD_CONNECTOR`, and `PD_LMCACHE_FIRST` (child order) — eight combinations,
+of which exactly one was ever the intended architecture. All three are
+deleted, along with the `LMCacheConnectorV1` single-connector code path
+they could select. There is now exactly one shape
+`scripts/common/gen-kv-transfer-config.sh` can emit:
+
+```
+MultiConnector[NixlConnector, LMCacheMPConnector]
+```
+
+with `NixlConnector` hardcoded as `connectors[0]`. This is not a style
+preference: `MultiConnector.get_num_new_matched_tokens` walks its children
+in list order and assigns the **entire** load to the first child reporting
+a non-zero match (`multi_connector.py:387-400`, quoted in full in the
+generator's own header comment). If `LMCacheMPConnector` were listed
+first, any decode request whose prefix is already in the local L2 tier
+would be satisfied by LMCache before `NixlConnector` is even asked, and
+the direct P→D remote-prefill pull this whole architecture exists to
+measure would be silently skipped whenever the L2 tier has anything
+cached — which is most of the time once a storage tier is live. This was
+§12.1's one surviving finding, reaffirmed at §16.9, and it is now
+expressed as a hardcoded order in `gen-kv-transfer-config.sh`, not a
+variable an operator (or a future session) can flip back.
+
+Also deleted as part of the same cleanup: `scripts/common/
+start-vllm-container.sh` and its `patch-vllm-nixl-pkg.sh` helper. Both
+were orphaned (no caller) and both built a bare `NixlConnector` with no
+LMCache at all — a configuration this repo's own composition decision
+(§1, TODO 0.1) never sanctioned, and one that §9.3 had been pointing
+resume-time operators at as the "baseline" restore step. It no longer is;
+see the rewritten §9.
+
+### 17.2 The "leg A / leg B" framing is retired — they were never independently deployable
+
+§1's "Two independent legs" framing (and this doc's running use of "leg
+A"/"leg B" throughout §2–§16) implied two things that could, in
+principle, be stood up separately. They never could be: the composition
+decided at TODO 0.1 and unchanged since is `MultiConnector[NixlConnector,
+LMCacheMPConnector]`, both children present, every time. What the old
+framing was actually pointing at are two always-on KV paths inside **one**
+stack:
+
+- **The P→D handoff** — `NixlConnector` over UCX, prefill pushing decode's
+  remote-prefill pull, TCP today / RDMA at acceptance (§3, §9).
+- **The storage tier** — `LMCacheMPConnector` → the MP daemon (§17.3) →
+  its `nixl_store` L2 adapter (§17.4) → `smc3` (or, per §16.8, a local
+  DSC).
+
+§1 is corrected in place to say this (not left as a contradiction to
+this section); see the note there pointing back here.
+
+### 17.3 The MP daemon now exists — this closes §12.1's "nothing spawns it"
+
+§12.1 correctly identified that `LMCacheMPConnector` needs a separately
+launched daemon reached over ZMQ, and correctly noted nothing in this
+repo started one. **That was true of this repo's scripts, not of the
+component** (§16.3 already said as much in the abstract; this is the
+concrete fix). `scripts/common/start-lmcache-daemon.sh` /
+`stop-lmcache-daemon.sh` now exist, are wired into
+`scripts/{prefill,decode}/03-start-*.sh` (called first, idempotently,
+before `start-vllm.sh`) and into `scripts/{prefill,decode}/99-stop.sh`.
+They are deliberately **not** numbered like `scripts/common/`'s
+`00-preflight.sh` / `10-build-stack.sh` / `20-build-vllm-lmcache.sh` /
+`25-validate-lmcache-config.sh` sequence — those numbers mean ordered
+one-time build/setup steps, and this is runtime lifecycle, same category
+as `start-vllm.sh`, `deploy.sh`, and `tune-tcp.sh`, none of which carry a
+number either. (The scripts briefly existed as `30-start-lmcache-daemon.sh`
+/ `31-stop-lmcache-daemon.sh` in `c055f7d`; renamed in `0b75adb` once this
+distinction was made explicit — recorded so the rename doesn't look like
+churn.)
+
+The entry point was **read**, not guessed, from the installed package
+inside `rocm-aic:mp-pd-ionic2609`:
+
+- `lmcache_server` (`lmcache/v1/server/__main__.py`) is a decoy — an
+  older, separate raw-socket remote-cache server (`STORE`/`RETRIEVE`/
+  `EXIST`/`HEALTH` over a bare TCP socket), not MP mode, not what
+  `LMCacheMPConnector` talks to.
+- The `lmcache` console script's `server` subcommand
+  (`lmcache/cli/commands/server.py`'s `ServerCommand.execute`) calls
+  `lmcache.v1.multiprocess.http_server.run_http_server(...)` directly.
+  That module is also directly runnable (`if __name__ == "__main__":` at
+  `lmcache/v1/multiprocess/http_server.py:279`), and this is exactly what
+  the package's **own** reference launcher,
+  `lmcache/lmcache_frontend/run_mp_server_with_frontend.sh`, invokes.
+  `start-lmcache-daemon.sh` runs the same module the same way, verified
+  against both ends of the ZMQ handshake: the server does
+  `bind_url=f"tcp://{mp_config.host}:{mp_config.port}"`
+  (`lmcache/v1/multiprocess/server.py`), and the client
+  (`lmcache_mp_connector.py`) reads `lmcache.mp.host`/`lmcache.mp.port` out
+  of `kv_transfer_config`'s `extra_config` — exactly the keys
+  `gen-kv-transfer-config.sh` already emitted (§16.6).
+
+`LMCACHE_MP_PORT` moves to **6557** to match that reference (was an
+unverified placeholder before). `LMCACHE_MP_HOST` stays loopback
+(`tcp://127.0.0.1`) **by design, not by omission** — `config/cluster.env`'s
+comment now states why: vLLM and the daemon are two processes on the
+**same** host, so they share an IPC namespace, and `MemoryObjMetadata
+.address` — a raw pointer — has to survive the ZMQ crossing between them.
+That only works within one host's address space; loopback is the only
+correct value here, not a default nobody chose deliberately.
+
+`start-vllm.sh` gained a hard gate on the daemon's ZMQ port being
+reachable (`wait_for_port`, 30 s, `die`s with a pointer to
+`start-lmcache-daemon.sh` on timeout) — alongside its pre-existing gate on
+`smc3` (or the resolved KV target) being reachable. Both gates are
+required, not alternatives: a healthy daemon on this host says nothing
+about whether the far end of the storage tier answers, and vice versa.
+
+### 17.4 The KV tier attaches daemon-side via a repeatable `--l2-adapter` JSON spec
+
+This is the mechanism §16 identified only in outline ("the distributed
+L2-adapter path... a config surface this section never examined"). Every
+flag and key below was **read from the installed lmcache 0.5.3** in
+`rocm-aic:mp-pd-ionic2609`, and the JSON specs were round-tripped through
+that same installed parser before being trusted.
+
+- `http_server.parse_args` composes `add_storage_manager_args`, which
+  calls `add_l2_adapters_args`
+  (`lmcache/v1/distributed/l2_adapters/config.py:402-441`), adding a
+  **repeatable** `--l2-adapter <JSON>` flag (`action="append"`).
+  `parse_args_to_l2_adapters_config` `json.loads`s each one and dispatches
+  on a `"type"` key to a registered config class.
+- `NixlStoreL2AdapterConfig` self-registers as `"nixl_store"`
+  (`nixl_store_l2_adapter.py:1071`, registration at `:1167`) and requires
+  `backend`, `backend_params`, and `pool_size` — `pool_size` has no
+  default, so an operator cannot forget it silently.
+- Emitted for the two backends this repo knows, matching each plugin's
+  actual `backend_params` shape:
+
+  ```
+  XNVME_KV      {"type":"nixl_store","backend":"XNVME_KV",
+                 "backend_params":{"dev_uri":"..."},"pool_size":2000000}
+  SPDK_NVMe_KV  {"type":"nixl_store","backend":"SPDK_NVMe_KV",
+                 "backend_params":{"trid":"...","kv_slot_offset":"..."},
+                 "pool_size":2000000}
+  ```
+
+  Both round-trip through the installed parser, including the exact
+  `parse_args_to_config` path `http_server` itself calls — this was
+  checked against the installed classes, not asserted from reading the
+  source alone. `scripts/common/25-validate-lmcache-config.sh` gained
+  `--l2-adapter-json` to run exactly this check in about a second, and
+  `start-lmcache-daemon.sh` calls it on every spec it builds before ever
+  spawning the daemon subprocess.
+- **Static `nixl_store`, not `nixl_store_dynamic`.** The dynamic adapter
+  is file-oriented — it requires `backend_params["file_path"]`, calls
+  `os.makedirs`, and registers `mem_type="FILE"` — and has nothing to do
+  with a KV-keyed backend. The static adapter's `_VALID_NIXL_BACKENDS`
+  includes both `SPDK_NVMe_KV` and `XNVME_KV`; its `_FILE_BACKENDS`
+  deliberately excludes them, so neither ever needs a `file_path`. Both
+  route through `init_storage_handlers_object()` with `mem_type="OBJ"` —
+  the same OBJ (not FILE) routing §12.2 already established this LMCache
+  build uses for these two backend names on the in-process path.
+- `backend_params` is forwarded **verbatim** to
+  `nixl_agent.create_backend(backend, backend_params)`
+  (`nixl_store_l2_adapter.py:201`) — the same NIXL plugin init path
+  `gen-kv-transfer-config.sh`'s `NixlConnector` side and
+  `gen-lmcache-config.sh`'s in-process YAML both use. Each plugin's C++
+  constructor prefers an **env var** over this dict over its own
+  compiled-in default: `NIXL_XNVME_DEV` over `dev_uri`
+  (`plugins/xnvme-kv/xnvme_kv_backend.cpp:508-520`), `NIXL_KV_TRID` over
+  `trid` (`plugins/nvme-kv/spdk_nvme_kv_backend.cpp:602-611`). `lib.sh`'s
+  `setup_nixl_kv_env` exports those env vars with the NQN resolution and
+  the boot-drive guard attached (§16.7), so it wins either way —
+  `start-lmcache-daemon.sh` puts the same resolved value in
+  `backend_params` too, deliberately redundant rather than a second
+  source of truth that could drift from the env var.
+
+### 17.5 §12.7's `max_value_size` question — ANSWERED, and the earlier worry was aimed at the wrong layer
+
+§12.7 asked, as an untested known-unknown: does XNVME_KV actually declare
+`max_value_size` via `get_plugin_params`, and if a 10 MiB LMCache page
+hits a 32 KiB per-value ceiling, does the multipart split absorb it? Both
+halves are now answered, and the second half's premise turns out not to
+apply on the path this repo actually runs.
+
+- **Yes, both backends declare it, queried live against the installed
+  plugins in `rocm-aic:mp-pd-ionic2609` via `nixl_agent.get_plugin_params()`:
+  XNVME_KV declares `max_value_size = 32768`, SPDK_NVMe_KV declares
+  `524288`.**
+- **But the split never engages on the MP/L2-adapter path, and §12.7's
+  10-MiB-chunk-vs-32-KiB-ceiling worry was analysing a different layer.**
+  The `page_size` handed to `init_storage_handlers_object` is
+  `l1_memory_desc.align_bytes` — i.e. `--l1-align-bytes`, which defaults
+  to **4096** and is not overridden by `start-lmcache-daemon.sh`. 4096 is
+  far below both declared ceilings (32768 and 524288), so
+  `_resolve_mem_split()` resolves `mem_split_n = 1` for both backends at
+  this daemon's default page size: **the adapter-level split never
+  engages.** §12.7's "10 MiB chunk against a 32 KiB ceiling" tension was
+  reasoning about the **in-process** `LMCacheEngineConfig.chunk_size` —
+  the `LMCacheConnectorV1`/`StorageManager` layer §12.1 originally (and
+  wrongly) concluded was the only way in. On the MP path this repo
+  actually runs, the adapter never sees a whole LMCache chunk as one
+  storage unit at all — only 4096-byte tiles, well under either ceiling.
+  XNVME_KV's own internal multipart splitting inside the plugin itself
+  (the "32 KiB parts" proven in TODO 6.12) is a separate, lower layer and
+  is unaffected by any of this.
+- **`pool_size` counts 4 KiB pool slots, one per raw L1 page — never one
+  per LMCache chunk.** This is why the vendor's own tested default is
+  2,000,000, not something matched to L1 capacity: their own comment
+  records that an L1-size-matched value (5,242,880 at a 20 GiB default L1
+  / 4096 B) was still spinning at 100% CPU with zero forward progress
+  after ten-plus minutes, while 2,000,000 comes up in about 90 s.
+  `LMCACHE_L2_POOL_SIZE` defaults to 2,000,000 for the same reason;
+  raising it needs its own startup-time re-check, not a capacity
+  calculation.
+- **The single-region-L1 constraint does not fire here either.**
+  `_HYBRID_L1_SINGLE_REGION_L2_ADAPTERS` lists `nixl_store`, but
+  `validate_storage_manager_config` only enforces that constraint when a
+  hybrid DRAM+Device-DAX L1 is also configured (`--l1-devdax-path` plus a
+  matching DAX L2 adapter). `start-lmcache-daemon.sh` passes neither, so
+  plain pinned-DRAM L1 is unconditionally the single-region case and the
+  constraint is inert. Recorded so nobody adds a DAX/GDS L1 tier here
+  without re-reading this first.
+
+### 17.6 The YAML-vs-daemon trap, now documented where it can't be missed again
+
+§12.1's original error was reading "these YAML keys are ignored under MP"
+as "MP cannot reach the backend" (§16.3/§16.4's diagnosis). That trap is
+now stated plainly in the code that would otherwise re-invite it:
+`gen-lmcache-config.sh`'s header states, as of this change, that **none**
+of the `extra_config` keys it emits (`enable_nixl_storage`, `nixl_backend`,
+`nixl_backend_params`, the `nixl_buffer_*` fields) are consumed by
+anything running on this repo's actual path — confirmed by grepping the
+installed `lmcache_mp_connector.py` for any reference to
+`LMCACHE_CONFIG_FILE` / `LMCacheEngineConfig` / `lmcache_get_or_create_config`
+and finding none. The YAML is **not deleted** — it remains correct
+documentation of the same `backend_params` shape (`trid` vs `dev_uri`)
+the `--l2-adapter` JSON now also emits, it still exercises
+`25-validate-lmcache-config.sh`'s introspection checks against the same
+installed `nixl_storage_backend.py`, and it is what the in-process
+`LMCacheConnectorV1` path would read if this repo ever needed it again.
+It is simply, now, explicitly labelled as inert on the path that is
+actually live, so the next reader cannot make §12.1's mistake by staring
+at this file alone.
+
+### 17.7 KV_BACKEND: XNVME_KV is now the canonical default; SPDK_NVMe_KV is kept, deliberately, not deleted
+
+`config/cluster.env`'s `KV_BACKEND` default flips from `SPDK_NVMe_KV` to
+**`XNVME_KV`** — the working tree and `HEAD` both carry this edit now.
+The rationale is measured history, not a preference:
+
+- The CSI-1 kernel blocker that made XNVME_KV unusable is **closed**: on
+  5.15 `nvme connect` logged `unknown csi 1` and created no device node at
+  all; on 6.8 it logs `block device for nsid 1 not supported (csi 1)` and
+  **does** create the generic char device (§10.4's re-test, TODO 6.8), and
+  the path was then proven end-to-end (§10.5, TODO 6.12).
+- It needs no `vfio-pci`, no hugepages, and no DPDK/SPDK version pairing —
+  removing a whole class of the failures §10.4 and §12 record for the
+  from-source SPDK path.
+- The `rocm-aic` image already ships the XNVME_KV plugin in all three of
+  LMCache's hardcoded backend tuples (§12.2), so no allowlist patch is
+  required for it either.
+
+**SPDK_NVMe_KV is deliberately kept fully wired** — the build step, the
+plugin, `lib.sh`'s arm, the `--l2-adapter` spec (§17.4), and the verify
+ladder all still branch on it — rather than deleted, so the comparison
+between the two remains available and a regression in one can be
+attributed against the other. Switching `KV_BACKEND` still requires
+draining the namespace exactly as before (§7 invariant 5); that has not
+changed.
+
+### 17.8 A wrong turn during this same consolidation, corrected before it landed: smc3 was nearly deleted
+
+Recorded honestly, per this repo's own rule (§13.4/§16.4) that a wrong
+turn belongs in the open rather than quietly absent from the history. An
+early pass of this exact consolidation misread a design note about "two
+separate nodes" — meaning two physically distinct compute nodes, each
+needing its own instance of everything — as "two nodes total," and on
+that misreading deleted `smc3`, the SPDK target tree, and the storage-tier
+scripting wholesale, leaving only the P→D leg. That was wrong and was
+reverted **in full** before it ever reached a committed state, so it does
+not appear as a revert in `git log` — it is recorded here instead, because
+the mistake and its correction are exactly the kind of thing this doc
+exists to keep visible.
+
+**`smc3` stays.** It is the physical KV store; both compute nodes reach it
+over NVMe-oF; `XNVME_DEV` is empty by default and resolved at runtime by
+subsystem NQN (`resolve_xnvme_kv_dev()`, §6's Verified entry), not pinned
+to a path. Nothing about §16.8's local-DSC option changes this — that
+option is still unproven and evaluated separately, not a replacement
+decided by this correction.
+
+### 17.9 1P1D → xPyD: the fleet-shape seam, implemented and tested against fakes, not yet run on more than one real pair
+
+`config/cluster.env` grows `PREFILL_HOSTS`/`PREFILL_PORTS`/`DECODE_HOSTS`/
+`DECODE_PORTS` (plural, space-separated) alongside the existing singular
+`PREFILL_HOST`/`DECODE_HOST`, defaulting to the singulars so 1P1D is
+unchanged in behaviour. `scripts/proxy/disagg_proxy.py` replaces its four
+scalar endpoint variables with an `EndpointPool` per role and a
+round-robin `select()`; at N=1 this returns the same endpoint every time,
+by construction. Going to xPyD means adding entries to the plural
+variables and giving each additional instance its own NIXL side-channel
+port (base port + instance index) — not restructuring the proxy itself. P
+and D are selected independently per request, a request keeps its decode
+endpoint for its whole lifecycle, and `/status` reports per-endpoint
+request counts so balancing is observable rather than assumed.
+
+The risk in this refactor was §11.1's handoff semantics — the exact thing
+two prior sessions burned time proving — and it was tested, not
+eyeballed, against fake upstreams: the priming request body, the
+`min_tokens`/`stream_options` drop on the priming copy only, the handoff
+threading into decode, §11.4's empty-dict-is-absent rule, the
+`prefill_no_handoff` counter, and the swallow-prefill/502-on-decode
+asymmetry all have passing tests. **What this has not been run against
+is real hardware with more than one prefill or decode instance** — every
+live measurement in this doc (§11, §12, §15) is still N=1. Treat the
+fleet shape as implemented and unit-tested, not as proven at scale.
+
+### 17.10 What this changes
+
+- **§12.1's ordering finding stands, now in code, not just in docs** —
+  `NixlConnector` as `connectors[0]` is no longer a convention to
+  remember, it is the only shape `gen-kv-transfer-config.sh` can emit
+  (§17.1).
+- **§12.1's "nothing spawns it" is closed** — `start-lmcache-daemon.sh` /
+  `stop-lmcache-daemon.sh` exist and are wired into role start/stop
+  (§17.3).
+- **§16's L2-adapter outline is now implemented**, with the exact JSON
+  shape, file:line evidence, and validation path at §17.4. See the
+  forward-pointer added at §16.
+- **§12.7's `max_value_size` open question is answered** at §17.5. See
+  the forward-pointer added at §12.7.
+- **The "leg A / leg B" framing is retired** (§17.2); §1 is corrected in
+  place with a pointer here.
+- **§9 is rewritten** to drop the Track A/Track B split — there is one
+  stack to bring up, with RDMA acceptance (§3) as the one genuinely
+  separate remaining workstream.
+- **`KV_BACKEND` default is now `XNVME_KV`**, committed (§17.7).
+- **Still not done by any of this**: an actual live LMCache hit served
+  through the composed daemon+L2-adapter path against real hardware.
+  6.18 (`smc3` ownership) and 6.20 (`smc2` reboot instability) gate that
+  exactly as they did before this session — nothing here required
+  touching either.

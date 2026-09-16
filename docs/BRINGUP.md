@@ -27,15 +27,24 @@ Gather before starting — nothing below can complete without these:
 
   See the README's "Credentials / lab setup" section for the full
   mechanism (multi-lab, `--show`, `CREDS_FILE`).
-- **`KV_SPDK_REPO`** — the git URL (and, if not `main`/default branch,
-  `KV_SPDK_REF`) for the kv_spdk fork, needed **only for the SMC3 target**
-  (`SPDK_TARGET_FLAVOR=fork`, the default — as of SPDK v26.05 the NVMe-KV
-  *initiator* API is upstream, but `bdev_kvmalloc` and the nvmf KV opcode
-  routing the target needs are not; see `docs/ARCHITECTURE.md` §7). Not
-  vendored in this repo — see README gap #2 and
-  `scripts/target/02-build-spdk-kv.sh`'s own error message if this is
-  missing. SMC1/SMC2 do **not** need this — they build a stock upstream SPDK
-  tree via `scripts/common/05-build-spdk-initiator.sh`.
+- **No fork to gather.** SMC3's target-side SPDK tree needs
+  `bdev_kvmalloc` and the nvmf KV opcode routing, which are not yet
+  upstream — but this repo carries them as `patches/spdk/0002-*.patch` /
+  `0003-*.patch`, applied automatically by `scripts/target/02-build-spdk-kv.sh`
+  on top of a stock clone of `SPDK_UPSTREAM_REPO`@`SPDK_TARGET_REF`. There is
+  no `KV_SPDK_REPO`/`SPDK_TARGET_FLAVOR` variable to set and nothing to
+  vendor ahead of time — see §3.2 below and `patches/spdk/README.md` for the
+  per-patch Gerrit status. SMC1/SMC2 build their own stock upstream SPDK
+  tree the same way, via `scripts/common/05-build-spdk-initiator.sh` (§5.1)
+  — the NVMe-KV *initiator* API has been upstream since v26.05.
+- **The KV storage backend.** `KV_BACKEND` (`config/cluster.env`) defaults
+  to `XNVME_KV` — a kernel NVMe-oF/TCP session (`nvme connect`, §4.5 below)
+  plus `libxnvme`'s `io_uring_cmd` passthru against the resulting KV
+  namespace char device. `SPDK_NVMe_KV` (the userspace SPDK initiator) is
+  kept fully wired as an alternative (`KV_BACKEND=SPDK_NVMe_KV`) but is no
+  longer the default. Both plugins are built unconditionally by
+  `scripts/common/10-build-stack.sh` regardless of which one you select —
+  see §5.2.
 - **`HF_TOKEN`** — a HuggingFace token; the default `MODEL`,
   `Qwen/Qwen2.5-72B-Instruct`, is gated.
 - **Model choice** — confirm `MODEL`/`TP_SIZE`/`GPU_MEM_UTIL`/`MAX_MODEL_LEN`
@@ -144,9 +153,12 @@ for why.
 scripts/target/01-host-prep.sh
 ```
 
-Installs apt deps for building kv_spdk, allocates `HUGEPAGE_COUNT` (default
-8192 × 2 MiB = 16 GiB) hugepages at the sysfs node (not
-`/proc/sys/vm/nr_hugepages`), loads `nvme_tcp nvme_fabrics vfio_pci
+Installs apt deps for building kv_spdk; allocates hugepages **only if**
+`TARGET_HUGE_PAGES > 0` (default: `0` — `nvmf_tgt` runs `--no-huge`,
+malloc-backed DPDK EAL memory, matching `rocm-aic/target.sh`'s proven
+configuration exactly, so the default here allocates **none**; do not
+confuse this with `HUGEPAGE_COUNT`, which is the SMC1/SMC2 initiator-side
+variable used in §4, not this node's); loads `nvme_tcp nvme_fabrics vfio_pci
 uio_pci_generic`, runs `scripts/common/tune-tcp.sh`, inventories the two
 POLLARA-1Q400 NICs and RDMA device presence, opens `NVMF_TRSVCID` (4420) in
 whatever firewall is actually active (or says explicitly that neither
@@ -154,60 +166,68 @@ whatever firewall is actually active (or says explicitly that neither
 `STACK_ROOT`/`LOG_DIR`/`RUN_DIR`.
 
 Expected output: a `Summary` step reporting
-`hugepages: <N>/8192`, the storage-leg interfaces toward SMC1 and SMC2, and
-`KV_TRANSPORT=tcp NVMF_TRSVCID=4420`. If hugepages report short by more than
-10%, **reboot this host before continuing** (the script prints this warning
-itself) — see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#hugepage-allocation-short-of-requested).
+`hugepages: <N>/<TARGET_HUGE_PAGES>` (`0/0` in the default configuration —
+that is correct, not a failure), the storage-leg interfaces toward SMC1 and
+SMC2, and `KV_TRANSPORT=tcp NVMF_TRSVCID=4420`. If you've set
+`TARGET_HUGE_PAGES>0` and it reports short by more than 10%, **reboot this
+host before continuing** (the script prints this warning itself) — see
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#hugepage-allocation-short-of-requested).
 
 The memlock limits file it writes only takes effect in a **new** login
 session — if you plan to run `03-start-kv-target.sh` in the same shell,
 start a fresh shell/session first.
 
-### §3.2 Build the target-side SPDK tree (the fork)
+### §3.2 Build the target-side SPDK tree (upstream + the two open KV patches)
 
 ```bash
-KV_SPDK_REPO=<fork-url> [KV_SPDK_REF=<ref>] scripts/target/02-build-spdk-kv.sh
+scripts/target/02-build-spdk-kv.sh
 ```
 
-`SPDK_TARGET_FLAVOR=fork` (the default) is **required** here: as of SPDK
-v26.05 the NVMe-KV *initiator* API is upstream, but `bdev_kvmalloc` and
-`lib/nvmf/ctrlr_bdev.c`'s KV opcode routing are not (see
-[`ARCHITECTURE.md` §7](ARCHITECTURE.md#7-spdk-upstream-initiator-forked-target))
-— a stock tree cannot serve a KV namespace, full stop. (Setting
-`SPDK_TARGET_FLAVOR=upstream` builds a stock `${SPDK_UPSTREAM_REPO}`@`${SPDK_VERSION}`
-tree instead; the script still runs, but step 3 below deliberately fails its
-own artifact check on it — useful only to prove the "not upstream" claim to
-yourself, not a real bring-up path.)
+**There is no fork.** This clones stock `${SPDK_UPSTREAM_REPO}`@`${SPDK_TARGET_REF}`
+(default `master`) into `${SPDK_TARGET_SRC}` — full history, not shallow,
+since `SPDK_TARGET_REF` may be an arbitrary SHA — then `git submodule update
+--init --recursive`, then applies `patches/spdk/000{1,2,3,4}-*.patch` from
+`${SPDK_PATCH_DIR}` with `git am`. These are upstream-**bound** NVIDIA
+patches on a public Gerrit queue (`https://review.spdk.io/q/topic:kv`), not
+a private tree — see `config/cluster.env`'s SPDK section and
+`patches/spdk/README.md` for per-patch status:
 
-Clones `KV_SPDK_REPO`@`KV_SPDK_REF` (if `SPDK_TARGET_SRC` doesn't already
-have `include/spdk/nvme_kv.h`), `git submodule update --init --recursive`,
-then `./configure --without-shared --with-nvmf --with-uring --disable-tests
---disable-unit-tests --disable-examples` (plus `--with-rdma=${SPDK_RDMA_PROVIDER:-verbs}`
-when `SPDK_WITH_RDMA=1`, the default — see §9.2) `&& make`.
-`--without-shared` matters: it's what prevents DPDK's vendored build from
-emitting both `librteX.a` and `librteX.so` side by side, which is the root
-cause behind the plugin's silent-dlopen-failure class of bug (see
-`TROUBLESHOOTING.md`).
+| Patch | Status |
+|---|---|
+| 0001 nvme: recognize KV namespaces | merged upstream 2026-08-25 |
+| 0002 bdev/kvmalloc | **open** — this is the one that actually matters |
+| 0003 nvmf: KV namespace support | **open**, depends on 0002 |
+| 0004 nvme: KV unit tests | merged upstream 2026-08-25 |
+
+The script detects 0001/0004 as already-present **by content** (not by
+assuming based on `SPDK_TARGET_REF`) and skips them cleanly — applying an
+already-merged patch would fail `git am` outright. 0002/0003 are the ones
+that must actually apply for this build to produce a KV-capable target.
+
+Then `./configure --with-nvmf --without-shared --disable-tests
+--disable-unit-tests --disable-examples && make`. There is no `--with-rdma`
+here (or anywhere in this repo's SPDK builds any more) — the storage leg is
+NVMe-oF/**TCP only**, unconditionally, by design; see the README's Status
+table and `config/cluster.env`'s `KV_TRANSPORT` comment. `--without-shared`
+matters: it's what prevents DPDK's vendored build from emitting both
+`librteX.a` and `librteX.so` side by side, which is the root cause behind
+the plugin's silent-dlopen-failure class of bug (see `TROUBLESHOOTING.md`).
 
 Expected output: a `Verifying build artifacts` step confirming
-`libspdk_nvme.a`, `libspdk_bdev_kvmalloc.a` (its **absence** specifically
-means either the wrong SPDK fork was built, or `SPDK_TARGET_FLAVOR=upstream`
-was requested deliberately — stock upstream SPDK has no `bdev_kvmalloc`
-module at all, on any version), `libspdk_sock_posix.a`, `spdk_tgt`,
-`include/spdk/nvme_kv.h`, `isa-l/.libs/libisal.a`, and
-`dpdk/build/lib/librte_eal.a` all present, then
-`Generating split archives (prepare-spdk-libs.sh)` producing
-`libspdk_nvme_tcp_only.a`, `libspdk_nvme_pcie_only.a`,
-`libspdk_sock_posix_only.a` (and `libspdk_nvme_rdma_only.a` if `nvme_rdma.o`
-is present — see §9.2) in `${SPDK_TARGET_SRC}/build/lib`. Finally reports
-the built SPDK version and, if `SPDK_INITIATOR_FLAVOR=upstream`, warns if
-this target tree looks older than v26.05 (the two trees are independent, but
-worth flagging so version-skew questions aren't confusing later).
+`libspdk_nvme.a`, `libspdk_bdev_kvmalloc.a` (its **absence** means patch 0002
+did not apply — re-run with `--force-clone` or check
+`${SPDK_PATCH_DIR}/0002-*.patch` applies cleanly to `SPDK_TARGET_REF`
+by hand), `libspdk_sock_posix.a`, `nvmf_tgt` (**not** `spdk_tgt` — that is
+not the binary a `--with-nvmf` build produces), `include/spdk/nvme_kv.h`,
+`isa-l/.libs/libisal.a`, and `dpdk/build/lib/librte_eal.a` all present, then
+`Generating split archives (prepare-spdk-libs.sh)` — only useful if
+`SPDK_INITIATOR_FLAVOR=fork` ever reuses this exact tree on SMC1/SMC2 (see
+the note after §3.4); a no-op otherwise. Finally reports the built SPDK
+version.
 
 If this fails: see
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#stock-upstream-spdk-on-the-target-bdev_kvmalloc_create-rpc-not-found)
-and the script's own error text (it explains the `libspdk_bdev_kvmalloc.a`
-missing case specifically, including the `SPDK_TARGET_FLAVOR=upstream` case).
+and the script's own error text.
 
 ### §3.3 Start the target
 
@@ -215,31 +235,33 @@ missing case specifically, including the `SPDK_TARGET_FLAVOR=upstream` case).
 scripts/target/03-start-kv-target.sh
 ```
 
-Runs `kv_target_check_sgl` first (the `NVMF_MAX_IO_SIZE`/`NVMF_IO_UNIT_SIZE`
-÷ 16 arithmetic — see §9.2/Configuration) **before** touching the process at
-all, so a bad ratio fails immediately with the arithmetic shown rather than
-after `spdk_tgt` is already up. On SPDK pre-v26.05 a bad ratio is a hard
-`die()`; on `>=26.05` (the default here) it's a `warn()` instead, since
-`io_unit_size` is a deprecated no-op on that version and the ratio may no
-longer be the real ceiling — see
-[`ARCHITECTURE.md` §7](ARCHITECTURE.md#7-spdk-upstream-initiator-forked-target).
-Starts `spdk_tgt` under `start_bg` (detached, PID-tracked, logged to
-`${LOG_DIR}/kv-target.log`), waits for the RPC socket (`${SPDK_RPC_SOCK}`,
-default `/var/tmp/spdk.sock`), then applies the RPC sequence
-(`lib-kv-rpc.sh`'s `kv_target_apply_config`): create the `NVMF_TRTYPE`
-transport (passing `--iobuf-small-cache-size`/`--iobuf-large-cache-size`
-from `NVMF_IOBUF_SMALL_CACHE_SIZE`/`NVMF_IOBUF_LARGE_CACHE_SIZE` on
-`>=26.05`, probed against `nvmf_create_transport --help` first since the
-fork's exact RPC surface isn't vendored here), create the `bdev_kvmalloc`
-namespace (`KV_BDEV_NAME`, `KV_BDEV_SIZE_GB`), create the subsystem
-(`NVMF_SUBNQN`), attach the namespace, attach the listener
-(`NVMF_TRADDR:NVMF_TRSVCID`).
+Runs `kv_target_check_sgl` first (the `NVMF_MAX_IO_SIZE`/`NVMF_LARGE_BUFSIZE`
+÷ 16 arithmetic — note the denominator is `NVMF_LARGE_BUFSIZE`, the iobuf
+pool's large-buffer size, **not** `NVMF_IO_UNIT_SIZE`, which no longer
+governs the SGL ceiling) **before** touching the process at all, so a bad
+ratio fails immediately with the arithmetic shown rather than after
+`nvmf_tgt` is already up, then `kv_target_sanity_check_traddr` (warns if
+`NVMF_TRADDR` isn't actually a local address on this host — a listener bound
+to an address nothing can reach otherwise surfaces as a connection timeout
+on SMC1/SMC2, nowhere near this script).
 
-Flags: `--foreground` (runs `spdk_tgt` attached, Ctrl-C to stop — RPC config
-does NOT run automatically in this mode), `--restart` (stop first if
-already running), `--skip-config` (start the process but leave RPC state
-untouched — useful after a crash where the config was already applied and
-should not be re-applied).
+Generates `${STACK_ROOT}/etc/kv-target.json` — the **single source of
+truth** for this launch, applied by `nvmf_tgt --json` atomically at process
+start (transport, `bdev_kvmalloc`, subsystem, namespace, and listener all in
+one file, regenerated deterministically from `config/cluster.env` on every
+start including a `--restart`). There is no separate `rpc.py` sequence to
+run or to drift out of step with `scripts/target/50-reset-namespace.sh`
+any more — `rpc.py` is used only for read-only inspection, in
+`scripts/target/04-verify-target.sh`. Starts `nvmf_tgt` (binary name
+`nvmf_tgt`, **not** `spdk_tgt`) under `start_bg` (detached, PID-tracked,
+logged to `${LOG_DIR}/kv-target.log`), waits for the RPC socket
+(`${SPDK_RPC_SOCK}`, default `/var/tmp/spdk.sock`), then confirms
+`spdk_get_version` responds.
+
+Flags: `--foreground` (runs `nvmf_tgt` attached to this shell, `--json`
+config still applied atomically at startup — there is no separate RPC step
+to run from a second shell any more), `--restart` (stop first if already
+running, then regenerate and re-apply the JSON against a fresh process).
 
 Expected output ends with:
 
@@ -250,12 +272,12 @@ ok  kv-target up
     verify from SMC1/SMC2: nvme discover -t tcp -a ${TARGET_HOST} -s 4420
 ```
 
-If it fails: check `bdev_kvmalloc_create`'s exact RPC argument names first —
-`lib-kv-rpc.sh`'s `create_kv_bdev()` tries one plausible argument form and,
-on failure, prints `rpc.py`'s own `--help` for the command and tells you to
-set `KV_BDEV_CREATE_ARGS` to override (this repo does not vendor kv_spdk, so
-its exact RPC surface cannot be verified ahead of time — see README gap #2).
-See also [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#sgl-length-exceeds-max-io-size).
+If it fails: the most common cause is the `max_io_qpairs_per_ctrlr`/SGL
+arithmetic — see
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#sgl-length-exceeds-max-io-size).
+If `nvmf_tgt` doesn't create the RPC socket at all within 60s, check
+`${LOG_DIR}/kv-target.log` for a `bdev_kvmalloc_create` rejection (patch
+0002 from §3.2 not actually applied) or a hugepage/memlock failure (§3.1).
 
 ### §3.4 Verify the target
 
@@ -265,12 +287,17 @@ scripts/target/04-verify-target.sh
 
 Hard checks: `kv-target` process running, RPC responds
 (`spdk_get_version`), subsystem present with exactly 1 namespace, transport
-reports the configured `max_io_size`/`io_unit_size`, TCP port
-`NVMF_TRSVCID` listening, free hugepages > 0. Soft check: local `nvme
+reports the configured `max_io_size`/`max_io_qpairs_per_ctrlr` (**the single
+most important check in this file** — a wrong RPC key spelling silently
+keeps SPDK's default of 127 qpairs, which breaks P/D invisibly the moment
+both roles attach), TCP port `NVMF_TRSVCID` listening, and — **only if**
+`TARGET_HUGE_PAGES>0` — free hugepages > 0 (skipped entirely, informational,
+under the default `TARGET_HUGE_PAGES=0`). Soft check: local `nvme
 discover` lists the subnqn (advisory — `nvme-cli` may not be relevant on a
 pure target). Ends by printing the exact commands to run from SMC1/SMC2 to
 verify remotely (`nvme discover ...` and a one-liner that constructs a
-`nixl_agent` and prints `get_plugin_params('SPDK_NVMe_KV')`).
+`nixl_agent` and prints `get_plugin_params('SPDK_NVMe_KV')` — substitute
+`XNVME_KV` if that's your `KV_BACKEND`).
 
 All hard checks passing is the go/no-go for proceeding to §5.
 
@@ -340,6 +367,52 @@ explains that `start-vllm.sh` will fall back to UCX's own autodetection —
 pin these once you've identified the compute-leg interface from this step's
 output (see §0).
 
+## §4.5 Connect to the KV target (`nvme connect`)
+
+`[SMC1]` and `[SMC2]`, identical shape, after §3 (target up) and §4 (this
+host's `nvme_tcp`/`nvme_fabrics` kernel modules loaded) — and **before**
+anything below that touches `KV_BACKEND`. Nothing in this repo's scripts
+issues `nvme connect` for you: `scripts/common/lib.sh`'s
+`setup_nixl_kv_env`/`resolve_xnvme_kv_dev` (called by both
+`scripts/common/start-lmcache-daemon.sh` and `scripts/common/start-vllm.sh`,
+§7 below) require the kernel NVMe-oF/TCP initiator session to SMC3 to
+**already exist** — on `KV_BACKEND=XNVME_KV` (the default) they die with an
+explicit message telling you to check `nvme list-subsys` if it doesn't.
+
+```bash
+# [SMC1]
+nvme connect -t "${NVMF_TRTYPE,,}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" \
+    -n "${NVMF_SUBNQN}" -q "${NVMF_HOSTNQN_PREFILL}"
+
+# [SMC2]
+nvme connect -t "${NVMF_TRTYPE,,}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" \
+    -n "${NVMF_SUBNQN}" -q "${NVMF_HOSTNQN_DECODE}"
+```
+
+Confirm the controller attached:
+
+```bash
+nvme list-subsys              # expect a controller against ${NVMF_SUBNQN}
+```
+
+On `KV_BACKEND=XNVME_KV` (the default), the kernel also creates a generic
+character device for the KV namespace (e.g. `/dev/ng1n1`) — **do not** go
+hunting for it or hand-pin `XNVME_DEV` to a guessed path.
+`scripts/common/lib.sh`'s `resolve_xnvme_kv_dev()` matches the correct
+device by `${NVMF_SUBNQN}` at runtime, automatically, the next time
+`setup_nixl_kv_env` runs (i.e. when you start the daemon or vLLM in §7);
+this step only needs the *session* to exist. **Never** hand-pin
+`XNVME_DEV=/dev/ng0n1` on SMC1/SMC2 — that index is the Micron OS boot
+drive, not the KV namespace, and `config/cluster.env`'s `XNVME_DEV` comment
+explains exactly what happens if a KV backend is pointed at it.
+
+> **This connection does NOT survive a reboot of SMC1/SMC2** — there is no
+> `--persistent` flag and no systemd unit wired up for it. Re-run this
+> section after every compute-node reboot, before starting the daemon or
+> vLLM (§7) — see
+> [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#nvme-connect-does-not-survive-a-reboot)
+> and §10's restart procedure below.
+
 ## §5 Build the stack on both compute nodes
 
 `[SMC1]` and `[SMC2]`, independently. Two scripts, run in order.
@@ -359,9 +432,10 @@ release (see `docs/ARCHITECTURE.md` §7). `SPDK_INITIATOR_FLAVOR=fork`
 instead expects `${SPDK_SRC}` to already be populated by the rsync in the
 "Only if `SPDK_INITIATOR_FLAVOR=fork`" note under §3.
 
-Configures `--without-shared --with-uring` (plus `--with-rdma=${SPDK_RDMA_PROVIDER:-verbs}`
-when `SPDK_WITH_RDMA=1`, the default — see §9.1), builds, then **verifies the
-KV API is actually present** — `nm -g "${SPDK_SRC}/build/lib/libspdk_nvme.a"`
+Configures `--without-shared --with-uring --disable-tests
+--disable-unit-tests --disable-examples` (no `--with-rdma` — the storage
+leg is NVMe-oF/TCP only, unconditionally; see §9), builds, then **verifies
+the KV API is actually present** — `nm -g "${SPDK_SRC}/build/lib/libspdk_nvme.a"`
 for `spdk_nvme_kv_store`/`spdk_nvme_kv_retrieve`/`spdk_nvme_kv_exist`, plus a
 grep for `KEY_DOES_NOT_EXIST` in `include/spdk/nvme_spec.h` — and dies with a
 clear message (rather than letting a too-old tree fail obscurely at the
@@ -407,12 +481,18 @@ steps, each individually skippable (`--skip-apt`, `--skip-ucx`,
    `${SPDK_SRC}/build/lib/libspdk_nvme.a` — this step no longer builds a
    fallback SPDK tree itself; if that file is missing it dies immediately
    with the exact command to run (`scripts/common/05-build-spdk-initiator.sh`).
-   Builds with `-Denable_rdma=false` (the default — see §9.1; this is a
-   plugin-level meson option, not exposed by this script directly).
-5. **`plugins/xnvme-kv`** (`XNVME_KV`, optional) — skipped automatically if
-   `libxnvme` headers/libs aren't found (expected on this cluster; it isn't
-   the storage-leg backend here — see `ARCHITECTURE.md` §6). Set
-   `XNVME_INCDIR`/`XNVME_LIBDIR` to force-enable.
+   There is no RDMA build variant of this plugin any more — the storage leg
+   is NVMe-oF/TCP only, unconditionally (see §9 and the README's Status
+   table); an earlier `-Denable_rdma` meson option and its
+   `libspdk_nvme_rdma_only.a` split archive have been removed entirely.
+5. **`plugins/xnvme-kv`** (`XNVME_KV`) → installed into `${NIXL_PLUGIN_DIR}`.
+   **Not optional any more**: `XNVME_KV` is `KV_BACKEND`'s default, so a
+   missing `libxnvme` headers/lib here is a hard `die`, not a skip —
+   install `libxnvme` first (`https://github.com/xnvme/xnvme`) or set
+   `XNVME_INCDIR`/`XNVME_LIBDIR` explicitly if it's not on the default
+   search path. (Both plugins are always built regardless of which one
+   `KV_BACKEND` selects, so `SPDK_NVMe_KV` stays available as the
+   alternative — see §0.)
 6. **Summary** — lists `${NIXL_PLUGIN_DIR}`'s contents.
 
 **The mandatory `ldd` self-containment check** (step 4, immediately after
@@ -463,9 +543,17 @@ Creates `${VENV}`, installs `torch` from the ROCm wheel index
 dependency resolution can't silently pull a CUDA-tagged torch), then pins
 `vllm==${VLLM_VERSION}` (default `0.28.0`) and `lmcache==${LMCACHE_VERSION}`
 (default `0.5.4`) together — these two versions are pinned as a pair
-deliberately; see the script's comment on the
-`KeyError: 'LMCacheConnectorV1'` failure mode this avoids. Installs
-`aiohttp` (used by the proxy). Installs the `nixl` → `nixl_rocm` shim package
+deliberately: the vLLM `KVConnector` plugin API and LMCache's own connector
+implementations of it move independently, and a mismatched pair fails only
+at connector-construction time, not at `pip install` time. This cluster
+constructs `MultiConnector[NixlConnector, LMCacheMPConnector]` (§7.2 below),
+so a version mismatch here now surfaces as a `KeyError` against
+`LMCacheMPConnector` (or `MultiConnector` itself failing to resolve one of
+its children) deep in `vllm.distributed.kv_transfer.kv_connector.factory`
+— **not** `KeyError: 'LMCacheConnectorV1'`, which was this failure's shape
+back when this repo ran LMCache's in-process single-connector mode; that
+mode is gone (see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#keyerror-lmcachempconnector-or-multiconnector)).
+Installs `aiohttp` (used by the proxy). Installs the `nixl` → `nixl_rocm` shim package
 if needed (the ROCm NIXL build installs its python bindings under
 `nixl_rocm`, not the upstream name `nixl` that LMCache imports
 unconditionally). Ends by writing `${STACK_ROOT}/etc/env.sh` — the
@@ -526,17 +614,40 @@ scripts/common/25-validate-lmcache-config.sh /opt/kvstack/etc/lmcache-prefill.ya
 `gen-lmcache-config.sh` writes `nixl_pool_size: 0` (selects LMCache's
 content-derived-key `NixlDynamicStorageBackend` — see
 `ARCHITECTURE.md` §3; **never** change this away from 0 on this cluster),
-`nixl_backend: "SPDK_NVMe_KV"`, and `nixl_backend_params` (`trid`,
-`max_value_size`, `kv_slot_offset`) sourced straight from `config/cluster.env`.
+`nixl_backend: "${KV_BACKEND}"` (`XNVME_KV` by default), and
+`nixl_backend_params` sourced straight from `config/cluster.env`.
+
+> **This YAML's `extra_config` block (`enable_nixl_storage`, `nixl_backend`,
+> `nixl_backend_params`) is generated, validated — and then IGNORED at
+> runtime.** This cluster runs `LMCacheMPConnector` (MP mode: LMCache is a
+> separate host process, §7.1 below), and under MP mode nothing reads this
+> YAML's `extra_config` at all — that surface belongs to the in-process
+> `LMCacheConnectorV1` path, which this cluster does not use. **The KV
+> storage tier is actually attached daemon-side**, via
+> `scripts/common/start-lmcache-daemon.sh`'s `--l2-adapter <JSON>` flag (see
+> §7.1) — editing `nixl_backend`/`nixl_backend_params` here changes nothing
+> about which storage tier a running daemon uses. This file remains worth
+> generating and validating anyway: it's the same per-backend
+> (`trid`/`dev_uri`) shape the daemon's `--l2-adapter` JSON also uses, and
+> `25-validate-lmcache-config.sh`'s introspection checks below exercise the
+> same installed `NixlStorageConfig`/allowlist code path regardless of which
+> connector ends up reading it. See
+> [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#lmcache-mp-daemon-up-but-the-storage-tier-never-attaches)
+> if you find yourself editing this YAML expecting the storage tier to
+> change — it won't.
 
 `25-validate-lmcache-config.sh` introspects the **installed** LMCache's
 actual source (via `inspect.getsource`, not a hardcoded assumption) to prove
 every key in the generated YAML is both recognized and routed to the NIXL
 storage backend, and that `validate_nixl_backend()`/the OBJ mem_type check
-both now accept `SPDK_NVMe_KV` (i.e. that §6.2's patch actually took). It
+both now accept `${KV_BACKEND}` (i.e. that §6.2's patch actually took). It
 also constructs a throwaway `nixl_agent` and echoes back the **live**
-plugin's `get_plugin_params("SPDK_NVMe_KV")` so you can eyeball it against
-what's in the YAML.
+plugin's `get_plugin_params("${KV_BACKEND}")` so you can eyeball it against
+what's in the YAML. The same script also has a second, unrelated mode —
+`25-validate-lmcache-config.sh --l2-adapter-json <JSON>` — that validates a
+daemon `--l2-adapter` spec directly against the installed adapter classes in
+about a second, instead of finding out it's malformed 30s into a daemon
+start; `start-lmcache-daemon.sh` (§7.1) calls this automatically.
 
 Expected final line: `PASS: all generated keys are recognized by the
 installed LMCache.` Any `FAIL`/`IGNORED` line above that must be resolved
@@ -545,7 +656,50 @@ before starting vLLM — see
 
 ## §7 Start prefill, decode, proxy
 
-### §7.1 Prefill
+### §7.1 Start the LMCache MP daemon (SMC1 and SMC2)
+
+LMCache runs in **MP mode**: a separate host process (`lmcache-mp-daemon`)
+on each compute node, reached over a ZMQ control channel at
+`LMCACHE_MP_HOST:LMCACHE_MP_PORT` (loopback, `tcp://127.0.0.1:6557` by
+default — same-host only, by design; see `config/cluster.env`'s
+`LMCACHE_MP_HOST` comment). `scripts/prefill/03-start-prefill.sh` and
+`scripts/decode/03-start-decode.sh` (§7.2/§7.3 below) both call this
+automatically before launching vLLM — it's idempotent, so running it here
+by hand first is optional, useful mainly if you want to watch its own log
+separately or debug it with `--foreground`:
+
+```bash
+# [SMC1] and [SMC2] — identical shape, role auto-detected from this host's
+# address (LMCACHE_DAEMON_ROLE=prefill|decode to override)
+scripts/common/start-lmcache-daemon.sh
+```
+
+Requires `scripts/common/20-build-vllm-lmcache.sh` (§6.1, needs `lmcache`
+importable in `${VENV}`) and — since `nvme connect` (§4.5) is what makes
+`KV_BACKEND=XNVME_KV`'s device resolvable — that step to have already run.
+Resolves this role's KV storage device/TRID (`setup_nixl_kv_env`, same
+function `start-vllm.sh` uses), builds a `--l2-adapter` JSON spec of type
+`nixl_store` (e.g. `{"type":"nixl_store","backend":"XNVME_KV","backend_params":{"dev_uri":"/dev/ng1n1"},"pool_size":2000000}`
+on `KV_BACKEND=XNVME_KV`), validates that spec with
+`25-validate-lmcache-config.sh --l2-adapter-json` **before** ever spawning
+the daemon, then launches `lmcache.v1.multiprocess.http_server` under
+`start_bg` and waits up to 30s for the ZMQ port to open.
+
+Expected output ends with:
+
+```
+ok  lmcache-mp-daemon up, ZMQ reachable at 127.0.0.1:6557
+```
+
+If it refuses to start, see
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#lmcache-mp-daemon-fails-to-start-or-vllm-refuses-to-start-because-it-cant-reach-one).
+Coming up cleanly does **not** by itself prove the storage tier actually
+works — confirm with a real round-trip
+(`scripts/verify/30-verify-kv-roundtrip.sh`, §8) — a bad device path or an
+unreachable target still starts this daemon healthy and only shows up as a
+failed (or silently-empty) store/load later.
+
+### §7.2 Prefill
 
 `[SMC1]`:
 
@@ -553,18 +707,39 @@ before starting vLLM — see
 HF_TOKEN=<token> scripts/prefill/03-start-prefill.sh
 ```
 
-This is a thin wrapper that pins `require_host "${PREFILL_HOST}" "prefill"`
-and `exec`s `scripts/common/start-vllm.sh prefill`. That shared script, in
-order: sources `${STACK_ROOT}/etc/env.sh`, calls `setup_nixl_kv_env prefill`
-and `setup_ucx_env` (from `lib.sh`), generates + validates the LMCache
-config for this role (pass `--skip-validate` only for debugging the
-validator itself — **not recommended**, see the script's own warning),
-**refuses to start if SMC3's NVMe-oF port isn't reachable within 30s** (a
-hard gate, not a warning — see the script's comment on why a silent
-local-only fallback is the worst failure mode here), then launches
-`vllm.entrypoints.openai.api_server` with `--kv-transfer-config
-{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_producer",...}` under
-`start_bg`, and waits up to 1800s for `/health` to return 2xx.
+This is a thin wrapper that pins `require_host "${PREFILL_HOST}" "prefill"`,
+calls `scripts/common/start-lmcache-daemon.sh` (§7.1 — idempotent, so this
+is a convenience, not the only thing that starts it), then `exec`s
+`scripts/common/start-vllm.sh prefill`. That shared script, in order:
+sources `${STACK_ROOT}/etc/env.sh`, calls `setup_nixl_kv_env prefill` and
+`setup_ucx_env` (from `lib.sh`), generates + validates the LMCache config
+for this role (pass `--skip-validate` only for debugging the validator
+itself — **not recommended**, see the script's own warning), **refuses to
+start unless the LMCache MP daemon is reachable at
+`LMCACHE_MP_HOST:LMCACHE_MP_PORT` within 30s** (a hard gate — see the
+script's comment on why a silently-absent LMCache leg, not a failure to
+start, is the worst outcome here), **and refuses to start unless SMC3's
+NVMe-oF port is also reachable within 30s** (same reasoning, for the
+storage leg), then launches `vllm.entrypoints.openai.api_server` with
+`--kv-transfer-config`:
+
+```json
+{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[
+  {"kv_connector":"NixlConnector","kv_role":"kv_producer"},
+  {"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":6557}}
+]}}
+```
+
+(`"kv_role":"kv_consumer"` on the `NixlConnector` entry for decode instead —
+see §7.3.) `NixlConnector` is always `connectors[0]` and this is **not**
+configurable: `MultiConnector.get_num_new_matched_tokens()` assigns the
+entire load to the first child connector that reports a non-zero match, so
+if `LMCacheMPConnector` were listed first, decode's local L2 tier would win
+the match ahead of `NixlConnector` ever being asked, and the direct P→D
+remote-prefill pull this whole architecture exists to measure would be
+silently skipped whenever the L2 tier has anything at all cached — see
+`scripts/common/gen-kv-transfer-config.sh`'s header comment. Under
+`start_bg`, waits up to 1800s for `/health` to return 2xx.
 
 Expected output ends with:
 
@@ -582,7 +757,7 @@ still hasn't come up. Confirm the weights are already on local disk under
 dominate the wall clock and look indistinguishable from a hang (see §0's
 note on pre-staging the download).
 
-### §7.2 Decode
+### §7.3 Decode
 
 `[SMC2]`:
 
@@ -590,11 +765,12 @@ note on pre-staging the download).
 HF_TOKEN=<token> scripts/decode/03-start-decode.sh
 ```
 
-Identical shape to §7.1 (`kv_role=kv_consumer`, port `DECODE_PORT`). Not
-strictly required that prefill be up first, but the proxy (§7.3) needs
+Identical shape to §7.2 (`NixlConnector`'s `"kv_role":"kv_consumer"`, port
+`DECODE_PORT`) — also starts this node's own LMCache MP daemon first. Not
+strictly required that prefill be up first, but the proxy (§7.4) needs
 decode.
 
-### §7.3 Proxy
+### §7.4 Proxy
 
 `[SMC2]` (or wherever `PROXY_HOST` points — the proxy is host-agnostic, see
 its own docstring):
@@ -641,15 +817,20 @@ earlier ones passed):
    when `KV_TRANSPORT=rdma` — RDMA fabric health (`ibv_devinfo`,
    `rdma link show`, optional `ib_write_bw`/`rping` data-path probe).
    **Pass criteria:** all `check` (not `check_soft`) lines green.
-2. **`20-verify-nixl-plugin.sh [prefill|decode]`** — plugin `.so` exists,
-   `ldd` shows no `librte_*.so`/`libspdk_*.so` DT_NEEDED and nothing
-   unresolved (hard checks — see §5's rationale), then in Python:
-   `nixl_agent().get_plugin_list()` includes `SPDK_NVMe_KV`,
-   `get_plugin_params()`'s `max_value_size` matches `KV_MAX_VALUE_SIZE`, and
-   `create_backend("SPDK_NVMe_KV", {"trid": ...})` actually succeeds (i.e.
-   connects to SMC3). **Pass criteria:** all `check` lines green — this
-   proves NIXL/the plugin/SPDK/the fabric are fine with zero LMCache/vLLM
-   involvement.
+2. **`20-verify-nixl-plugin.sh [prefill|decode]`** — plugin `.so` exists for
+   whichever `KV_BACKEND` selects (`XNVME_KV` by default), `ldd` shows no
+   `librte_*.so`/`libspdk_*.so` DT_NEEDED and nothing unresolved on the
+   `SPDK_NVMe_KV` plugin specifically (hard checks — see §5's rationale;
+   `XNVME_KV` legitimately links `libxnvme.so` dynamically, a different
+   check shape), then in Python: `nixl_agent().get_plugin_list()` includes
+   `${KV_BACKEND}`, `get_plugin_params()`'s `max_value_size` matches
+   `KV_MAX_VALUE_SIZE_EFFECTIVE` (32768 on `XNVME_KV`, 524288 on
+   `SPDK_NVMe_KV` — these are different numbers on purpose, see
+   `config/cluster.env`), and `create_backend("${KV_BACKEND}", {...})`
+   actually succeeds (i.e. connects to SMC3 on `SPDK_NVMe_KV`, or confirms
+   the local `XNVME_DEV` char device on `XNVME_KV`). **Pass criteria:** all
+   `check` lines green — this proves NIXL/the plugin/the fabric are fine
+   with zero LMCache/vLLM involvement.
 3. **`30-verify-kv-roundtrip.sh`** — the single most load-bearing test in
    this tree: a STORE from one OS process and a RETRIEVE from a
    **different** one, using `KV_MAX_VALUE_SIZE * 6` bytes by default
@@ -698,110 +879,69 @@ number, and how to read a negative result (§6 there points back at this
 document's "LMCache hit tokens: 0" troubleshooting entry as the first thing
 to rule out).
 
-## §9 Phase 2: TCP → RDMA
+## §9 Phase 2: TCP → RDMA (compute leg only)
 
-`KV_TRANSPORT=rdma` in `config/cluster.env` is the single switch, but it is
-**not** a drop-in flip yet — read this whole section before setting it.
+`KV_TRANSPORT=rdma` in `config/cluster.env` gates **only** the compute leg
+— the direct P↔D `NixlConnector`/UCX side channel. **The storage leg
+(NVMe-oF to SMC3) is TCP-only, unconditionally, by design, regardless of
+this switch** — a previous pass added storage-tier RDMA groundwork (an
+`-Denable_rdma` meson option on `plugins/nvme-kv`, an `nvme_rdma.o` split
+archive) under the premise that it would eventually be needed; both have
+been **removed entirely**, and `scripts/target/03-start-kv-target.sh` /
+`scripts/common/05-build-spdk-initiator.sh` no longer accept any
+RDMA-related build flag at all. If a storage-leg RDMA transport is ever
+needed, that is new work to validate from scratch, not a flag to flip —
+see the README's Status table and `config/cluster.env`'s `KV_TRANSPORT`
+comment.
 
-### §9.1 Initiator-side: current state
+### §9.1 Current state — read before setting `KV_TRANSPORT=rdma`
 
-**What is implemented:** `plugins/nvme-kv/prepare-spdk-libs.sh` splits
-`nvme_rdma.o` out of `libspdk_nvme.a` into `libspdk_nvme_rdma_only.a`
-whenever that object is present (`ar t "${LIB_DIR}/libspdk_nvme.a" | grep
-'^nvme_rdma\.o$'`) — a clean no-op, not a failure, on a tree that wasn't
-configured `--with-rdma`. `nvme_rdma.o` only exists if the initiator's SPDK
-tree (`scripts/common/05-build-spdk-initiator.sh`) was built with
-`SPDK_WITH_RDMA=1` (the default in `config/cluster.env`, `--with-rdma=verbs`
-unless `SPDK_RDMA_PROVIDER` overrides it). `plugins/nvme-kv/meson.build` has
-an opt-in `-Denable_rdma` option (`meson_options.txt`, default `false`) that,
-when set `true`, adds `libspdk_nvme_rdma_only.a` to the same
-`--whole-archive` group TCP/PCIe/posix are already in (so its
-`SPDK_NVME_TRANSPORT_REGISTER` constructor for the RDMA transport actually
-runs) and appends `-lrdmacm -libverbs` to the link line. `-Denable_rdma=false`
-(the default `10-build-stack.sh` uses) produces a byte-equivalent link line
-to before this option existed — this was a deliberate constraint on the
-implementation, not an accident.
+**Proven, measured (2026-09-16):** the fabric NICs (Pensando DSC3-2Q400,
+`ionic_0..7`) are **400 Gb/s** links (`ethtool` reports `Speed: 400000Mb/s`
+on all 8 ports on both nodes — not the 200 Gb/s an earlier pass recorded
+before this was actually measured). Static routes now exist for all 8
+fabric pairs (`30.1.N.0/24 <-> 30.2.N.0/24`, both directions), and
+cross-node RC `ib_write_bw` reached **41,898 MiB/s (~351 Gb/s, ~88% of
+400G line rate)** at 8 MiB messages — see
+`scripts/verify/10-verify-network.sh`'s RDMA-checks comment for the full
+measurement and how to reproduce it (and for why
+`/sys/class/net/*/statistics/rx_bytes` is **useless** for confirming this
+traffic crossed at all — RoCE bypasses the kernel netdev path; use
+`ethtool -S <netdev> | grep octets_rx_ok` on the **receiver**, settled a
+few seconds after the transfer, instead).
 
-**What remains — this has never been exercised end to end:**
+**Still open — this is the actual blocker, not a build step:** UD queue-pair
+creation still **fails** on this hardware (confirmed both via raw
+`ibv_create_qp` and via NIXL/UCX's own connection setup). NIXL/UCX do
+**not** need `rdma_cm` (which also fails here) — but `setup_ucx_env`'s RDMA
+branch's `UCX_TLS_RDMA` value, `ib,rocm,self,sm` (`config/cluster.env` —
+**not** the older `rc_verbs,rc_mlx5,dc,ud,self,sm`, which pins a transport
+the ionic provider doesn't expose and fails outright), still pulls in UD
+transports as part of "ib" (verbs-only), and those are exactly the ones
+that fail to create on this hardware. Finding a transport spec that avoids
+UD without reintroducing `rc`/`rc_mlx5` (also unsupported here) or silently
+weakening the "must not fall back to tcp" invariant is the open item. Until
+it's resolved, a full `KV_TRANSPORT=rdma` **vLLM** run has not been recorded
+end-to-end against real hardware — the fabric itself is proven; the
+NIXL/UCX path riding on it is not, yet.
 
-1. Rebuild the plugin with RDMA linked in:
+`rocm` in `UCX_TLS_RDMA` is **not optional and not a network transport** —
+it's the local memory-domain component UCX needs to recognize a ROCm/HIP
+device pointer as VRAM at all; omitting it produces a misleading `VRAM
+memory is detected as host by UCX` error that reads like a missing ROCm
+build but isn't. See `config/cluster.env`'s `UCX_TLS_RDMA` comment for the
+full failure-mode writeup.
 
-   ```bash
-   # [SMC1] and [SMC2]
-   cd plugins/nvme-kv
-   rm -rf build-nvme-kv
-   meson setup build-nvme-kv \
-       -Dnixl_path="${NIXL_PREFIX}" -Dspdk_path="${SPDK_SRC}" \
-       -Drocm_path="${ROCM_PATH}" -Denable_vram=true -Denable_rdma=true \
-       --prefix="${NIXL_PREFIX}"
-   ninja -C build-nvme-kv -j "$(nproc)" && ninja -C build-nvme-kv install
-   ```
+### §9.2 Compute leg prerequisites
 
-   (`10-build-stack.sh` itself does not expose a `--enable-rdma` flag today
-   — this is a manual rebuild until/unless that's added.) Confirm
-   `libspdk_nvme_rdma_only.a` actually exists in `${SPDK_SRC}/build/lib`
-   first (§5.1's `05-build-spdk-initiator.sh` produces it only if
-   `SPDK_WITH_RDMA=1` was in effect when that tree was built); if it's
-   missing, see
-   [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#rdma-plugin-build--denable_rdmatrue-fails-because-the-initiators-spdk-tree-wasnt-built---with-rdma).
-2. Re-run the mandatory `ldd` self-containment check by hand against the
-   freshly built `.so` (the same check `10-build-stack.sh` step 4 runs
-   automatically) — an RDMA-linked build pulls in `libibverbs.so`/`librdmacm.so`
-   as genuine shared runtime dependencies, which is expected and fine; only
-   a stray `librte_*.so`/`libspdk_*.so` DT_NEEDED is the bug this check
-   exists to catch.
-3. Set `KV_TRANSPORT=rdma`, bring up the target per §9.2, and confirm
-   `create_backend("SPDK_NVMe_KV", {"trid": "trtype:RDMA ..."})` in
-   `scripts/verify/20-verify-nixl-plugin.sh` actually succeeds rather than
-   failing outright (see §9.4 for why a failure here, not a silent TCP
-   connection, is the expected behavior of an RDMA-unlinked plugin).
-4. A live RoCE fabric between SMC1/SMC2 and SMC3 to actually carry the
-   traffic — see §9.3's RoCE prerequisites, which apply to the storage leg
-   too, not just the compute leg.
-5. A passing `scripts/verify/run-all.sh` and, ideally,
-   `scripts/bench/40-bench-transport-compare.sh` (see
-   [`docs/BENCHMARKING.md`](BENCHMARKING.md)) recorded against real
-   hardware — nothing in this repo has run any of the above yet.
+`[SMC1]` and `[SMC2]`:
 
-Until step 3+ above is actually done, `scripts/target/03-start-kv-target.sh`
-still prints this exact caveat if you set `KV_TRANSPORT=rdma` and start the
-target: it brings the target up on RDMA regardless, but warns that the
-initiators cannot attach unless they were rebuilt with `-Denable_rdma=true`
-against a `--with-rdma`-configured SPDK tree.
-
-### §9.2 Target side
-
-`[SMC3]` — once §9.1's initiator work is done (or if you're validating the
-target side alone first): the target's SPDK fork tree (§3.2) was already
-configured `--with-rdma=${SPDK_RDMA_PROVIDER:-verbs}` if `SPDK_WITH_RDMA=1`
-(the default) was set at build time — no rebuild needed here, unlike the
-initiator side. Set `KV_TRANSPORT=rdma` in `config/cluster.env` (this flips
-`NVMF_TRTYPE` to `RDMA` automatically — see that file's comment), confirm
-`/sys/class/infiniband` is non-empty (`scripts/target/01-host-prep.sh`'s
-step 6 reports this), then:
-
-```bash
-scripts/target/03-start-kv-target.sh --restart
-```
-
-`lib-kv-rpc.sh`'s `kv_target_apply_config` issues
-`nvmf_create_transport -t RDMA ...` instead of `-t TCP` — same RPC sequence,
-different `NVMF_TRTYPE`. Verify with `scripts/target/04-verify-target.sh` as
-in §3.4 (its transport-size check adapts to whatever `NVMF_TRTYPE` is
-configured).
-
-### §9.3 Compute leg
-
-`[SMC1]` and `[SMC2]` — this leg (the direct NIXL/UCX side channel) is
-**closer to ready** than the storage leg: `scripts/common/lib.sh`'s
-`setup_ucx_env` already implements the RDMA branch
-(`UCX_TLS="rc_verbs,rc_mlx5,dc,ud,self,sm"`, deliberately **excluding**
-`tcp`), and `10-build-stack.sh` already builds UCX `--with-verbs`. What's
-still required:
-
+- `10-build-stack.sh` already builds UCX `--with-verbs --with-dm
+  --with-rdmacm` unconditionally (§5.2), so no rebuild is needed to flip
+  `KV_TRANSPORT`.
 - Set `KV_TRANSPORT=rdma` and `PREFILL_RDMA_DEV`/`DECODE_RDMA_DEV` (the
-  `ibv_devinfo`/`rdma link show` device name, e.g. `rocep1s0` — actual name
-  depends on the DSC3 NIC's RoCE device enumeration on this host) in
+  `ibv_devinfo`/`rdma link show` device name — actual name depends on the
+  DSC3 NIC's RoCE device enumeration on this host, e.g. `ionic_2`) in
   `config/cluster.env`. `01-host-prep.sh` hard-fails at prep time if
   `KV_TRANSPORT=rdma` and the corresponding `*_RDMA_DEV` is unset;
   `setup_ucx_env` hard-fails the same way at vLLM-start time as a second
@@ -815,7 +955,7 @@ still required:
   it from `ip link show`).
 - `rdma link show` reporting the expected device(s) as `ACTIVE`.
 
-### §9.4 Acceptance test and what proves RDMA (not a TCP fallback)
+### §9.3 Acceptance test and what proves RDMA (not a TCP fallback)
 
 `[any]`:
 
@@ -824,26 +964,17 @@ scripts/verify/10-verify-network.sh   # RDMA fabric checks are HARD in rdma mode
 scripts/verify/run-all.sh             # full ladder, KV_TRANSPORT=rdma
 ```
 
-The number that proves RDMA is actually in use, not a silent TCP fallback:
-`setup_ucx_env`'s RDMA branch **deliberately excludes `tcp`** from
-`UCX_TLS` specifically so that a broken RoCE fabric fails the compute leg
-loudly (vLLM/NIXLErroring out) rather than silently falling back to TCP —
-see that function's comment in `scripts/common/lib.sh`. For the storage
-leg, `scripts/target/04-verify-target.sh`'s transport check
-(`nvmf_get_transports` reporting `"trtype": "RDMA"`) plus a successful
-`scripts/verify/20-verify-nixl-plugin.sh` run with `NVMF_TRTYPE=RDMA` baked
-into `KV_TRID` is the storage-leg equivalent: if the initiator plugin
-was **not** rebuilt with `-Denable_rdma=true` (the default, and the current
-state of every build this repo has actually run — §9.1),
-`create_backend()` fails outright rather than silently connecting over TCP,
-because the TRID string itself says `trtype:RDMA` and the plugin has no
-fallback path that downgrades a requested transport. Once rebuilt with RDMA
-linked in, the same principle still holds: a broken RoCE fabric should fail
-`create_backend()`, not silently downgrade to TCP — this has not yet been
-observed against real hardware either way.
+The property that proves RDMA is actually in use, not a silent TCP
+fallback: `setup_ucx_env`'s RDMA branch **deliberately excludes `tcp`**
+from `UCX_TLS` specifically so that a broken RoCE fabric fails the compute
+leg loudly (vLLM/NIXL erroring out) rather than silently falling back —
+see that function's comment in `scripts/common/lib.sh`. The storage leg has
+no RDMA mode to compare against any more (§9 above) — `04-verify-target.sh`
+will always report `NVMF_TRTYPE=TCP` there, and that is correct.
 
 There is no committed acceptance run recording actual measured numbers for
-this cluster yet — see the README's Status section and
+a full `KV_TRANSPORT=rdma` vLLM deployment yet — see the README's Status
+table (raw fabric proven; full run not yet recorded) and
 [`docs/BENCHMARKING.md`](BENCHMARKING.md)'s §7/§8 (estimates and an empty
 results log, respectively).
 
@@ -868,18 +999,31 @@ scripts/target/99-stop.sh              # add --release-hugepages to reclaim RAM,
                                         # --clean-config to drop the saved RPC config
 ```
 
-`--clean-shm` (prefill/decode) removes stale `/dev/shm/lmcache_*` and
-`/dev/shm/nixl_*` segments left behind by a killed-not-stopped process —
-see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#stale-devshmlmcache_-crashes-on-restart)
+`scripts/prefill/99-stop.sh`/`scripts/decode/99-stop.sh` also stop **this
+node's own LMCache MP daemon** (`scripts/common/stop-lmcache-daemon.sh`,
+forwarding `--clean-shm` to it) — the daemon is a separate host process
+`03-start-{prefill,decode}.sh` started alongside vLLM (§7.1), not a child of
+the vLLM process, so it does not stop just because `vllm-{prefill,decode}`
+did; you do not need a separate command for it. `--clean-shm` removes stale
+`/dev/shm/lmcache_*` and `/dev/shm/nixl_*` segments left behind by a
+killed-not-stopped process — see
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#stale-devshmlmcache_-crashes-on-restart)
 for why this matters.
 
 **Restart, in the same order as §7** (target does not need §3.1/§3.2
-re-run unless the host rebooted or kv_spdk changed):
+re-run unless the host rebooted or the patches changed;
+`scripts/prefill/03-start-prefill.sh`/`scripts/decode/03-start-decode.sh`
+each start their own node's LMCache MP daemon automatically, §7.1):
 
 ```bash
 # [SMC3]
 scripts/target/03-start-kv-target.sh
 scripts/target/04-verify-target.sh
+
+# [SMC1] and [SMC2] — if either compute node rebooted, re-run §4.5
+# (nvme connect) FIRST: the kernel NVMe-oF session does not survive a
+# reboot, and start-lmcache-daemon.sh / start-vllm.sh will refuse to start
+# without it on KV_BACKEND=XNVME_KV (the default).
 
 # [SMC1]
 scripts/prefill/03-start-prefill.sh
@@ -902,6 +1046,9 @@ scripts/target/04-verify-target.sh
 ```
 
 This deletes every KV object currently stored (the namespace is RAM-backed —
-the data does not survive regardless of whether you run this script) and
-recreates it via the same RPC sequence `03-start-kv-target.sh` uses
-(`lib-kv-rpc.sh`), so the two can never configure the namespace differently.
+the data does not survive regardless of whether you run this script) by
+restarting `nvmf_tgt` (`scripts/target/03-start-kv-target.sh --restart`),
+which regenerates and re-applies the same `--json` config
+(`lib-kv-rpc.sh`'s `kv_target_gen_json_config`) from `config/cluster.env`
+every time — there is no separate RPC teardown/recreate sequence any more
+for the two to drift apart from.

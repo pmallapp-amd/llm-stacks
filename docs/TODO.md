@@ -15,63 +15,90 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | § | Area | Items | Done | Blocked |
 |---|---|---|---|---|
 | 0 | Blocking decisions and follow-ups | 4 | 2 | 2 |
-| 1 | Architecture correction (compute leg) | 13 | 12 | 0 |
+| 1 | Architecture correction (compute leg) | 14 | 12 | 0 |
 | 2 | Hardware bring-up (Phase 1, TCP) | 13 | 5 | 3 |
-| 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 2 | 0 |
-| 4 | Open items and known limitations | 6 | 0 | 0 |
+| 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 3 | 0 |
+| 4 | Open items and known limitations | 6 | 1 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 21 | 12 | 6 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 22 | 12 | 6 |
 
 **Read [HANDOFF §9](HANDOFF.md#9-how-to-resume) first** — it carries the
 cluster state as handed over and the ordered plan. This block is the index.
 
-**Before anything: 6.20, 6.18, and the amdgpu ritual.** `smc2` rebooted seven
-times on 2026-09-15, cycling every 3-13 minutes — shorter than a 72B TP=8
-model load — then held for hours, then rebooted again; nothing explains either
-the instability or the recovery. `smc3` is shared and currently serves
-*another party's* subsystem, so our `nqn.2024-01.io.nixl:kv0` is gone (6.18).
-Both compute nodes were handed over freshly rebooted with **0 GPUs** — TODO
-0.4's `modprobe amdgpu` is required right now.
+**Before anything: 6.20, 6.18, the amdgpu ritual, and the LMCache daemon.**
+`smc2` rebooted seven times on 2026-09-15, cycling every 3-13 minutes —
+shorter than a 72B TP=8 model load — then held for hours, then rebooted
+again; nothing explains either the instability or the recovery. `smc3` is
+shared and currently serves *another party's* subsystem, so our
+`nqn.2024-01.io.nixl:kv0` is gone (6.18). Both compute nodes were handed
+over freshly rebooted with **0 GPUs** — TODO 0.4's `modprobe amdgpu` is
+required right now. **New per-boot step, 2026-09-16:** the LMCache MP
+daemon (`scripts/common/start-lmcache-daemon.sh`) must also be up on both
+nodes before vLLM will start — `scripts/{prefill,decode}/03-start-*.sh`
+call it automatically, but `start-vllm.sh` now hard-gates and `die`s if
+it isn't reachable (HANDOFF §17.3, §9.4).
 
-**Two independent tracks, neither blocking the other.**
+**One stack now, not two tracks.** HANDOFF §17 (2026-09-16) collapses the
+connector matrix this list used to call "Track A" into a single,
+code-enforced composition — `MultiConnector[NixlConnector,
+LMCacheMPConnector]`, `NixlConnector` hardcoded as `connectors[0]`, no
+`PD_ENABLED`/`PD_CONNECTOR`/`PD_LMCACHE_FIRST` switches left to get
+wrong — and gives `LMCacheMPConnector` an actual daemon with a working
+`--l2-adapter` mechanism to attach XNVME_KV/SPDK_NVMe_KV
+(`scripts/common/start-lmcache-daemon.sh`; HANDOFF §17.3/§17.4). **This
+also resolves 4.5's connector-order ambiguity** (there is no longer a
+`PD_LMCACHE_FIRST` to flip — see 4.5) **and HANDOFF §12.7's open
+`max_value_size` question** (HANDOFF §17.5: the split never engages on
+the path this repo actually runs — see 6.4/6.10).
 
-*Track A — 6.10, the storage tier.* The last item in §6 and the project's
-original goal. **MAJOR CORRECTION, 2026-09-16 (HANDOFF §16): the previous
-entry here was wrong.** The composition is
-`MultiConnector[NixlConnector, **LMCacheMPConnector**]` — matching this
-repo's architecture since day one and its own
-`gen-kv-transfer-config.sh` — **not** `LMCacheConnectorV1`.
-`LMCacheMPConnector` reaches XNVME_KV through the distributed L2-adapter
-path (`nixl_store_l2_adapter.py`); HANDOFF §12.1's conclusion that it
-"cannot reach the NIXL storage backend at all" is withdrawn. Recipe at
-HANDOFF §12.7 (also corrected). **Previously recorded as blocked by 6.18**
-(the shared `smc3` target). **That may no longer apply**: both `smc1` and
+**6.10 remains the one live item in §6 — the code is now implemented and
+parser-validated, NOT yet proven on live hardware.** Bringing the
+composed daemon+L2-adapter stack up against `smc3` (or the local DSC) and
+producing an actual LMCache hit through it has not been done. It is
+blocked on exactly what it always was — **6.18** (`smc3` ownership) and
+**6.20** (`smc2`'s reboot instability) — not on any remaining code gap.
+Evaluate the local-DSC option (HANDOFF §16.8) first: both `smc1` and
 `smc2` have their own local Pensando DSC (`/dev/ng1n1`), and a local-DSC
 XNVME_KV tier would not need `smc3` at all — unproven, nothing deployed
-yet, see HANDOFF §16.8. Re-evaluate before treating 6.18 as the only path
-forward.
+yet.
 
-*Track B — §3, RDMA acceptance.* **Firmware updated 2026-09-16 — routing is
-now CLOSED and cross-node RDMA is measured for the first time.** Static
-routes exist for all 8 fabric pairs both directions; cross-node ping is 0%
-loss at ~0.10 ms; `ib_write_bw` cross-node peaks at 41,898 MiB/s (~351
-Gb/s, ~88% of the **400** Gb/s line rate — these NICs are 400 Gb/s NDR, not
-200 Gb/s as an earlier note assumed). **3.6 is closed. 3.10's firmware skew
-is disproved as the cause of break two** (both `-pi-121` and `-a-120` cards
-emit the same `CREATE_QP BAD_ATTR`) and is downgraded to tidiness. **3.9 —
-UD QPs still cannot be created, `rdma_cm` still fails — is now the sole
-remaining RDMA-stack blocker.** NIXL/UCX need neither UD nor `rdma_cm`, so
-this likely does not block leg A over RDMA, but `UCX_TLS=ib` pulls in UD
-transports that will fail. See HANDOFF §15.
+**Backend default — 6.22, done.** `config/cluster.env`'s `KV_BACKEND`
+default is now **XNVME_KV**, matching the decision 6.3 already recorded.
+`SPDK_NVMe_KV` stays fully wired for comparison, not deleted
+(HANDOFF §17.7).
 
-**Cheap, do anytime: 3.8** — make preflight assert `ibv_devinfo` returns a
-device rather than merely existing. That check would have made 3.7
-self-diagnosing instead of costing two sessions.
+**RDMA acceptance — §3, the one genuinely separate remaining workstream.**
+This was never a second "track" to compose with the storage tier; it is
+an independent transport upgrade for the P→D path. **Firmware updated
+2026-09-16 — routing is now CLOSED and cross-node RDMA is measured for
+the first time.** Static routes exist for all 8 fabric pairs both
+directions; cross-node ping is 0% loss at ~0.10 ms; `ib_write_bw`
+cross-node peaks at 41,898 MiB/s (~351 Gb/s, ~88% of the **400** Gb/s
+line rate — these NICs are 400 Gb/s NDR, not 200 Gb/s as an earlier note
+assumed). **3.6 is closed. 3.10's firmware skew is disproved as the
+cause of break two** (both `-pi-121` and `-a-120` cards emit the same
+`CREATE_QP BAD_ATTR`) and is downgraded to tidiness. **3.9 — UD QPs still
+cannot be created, `rdma_cm` still fails — remains the sole remaining
+RDMA-stack blocker and the top open RDMA item.** NIXL/UCX need neither UD
+nor `rdma_cm`, so this likely does not block the P→D path over RDMA, but
+`UCX_TLS=ib` pulls in UD transports that will fail. See HANDOFF §15.
+
+**Done, 2026-09-16: 3.8** — `00-preflight.sh` now asserts `ibv_devinfo`
+actually enumerates a device rather than merely existing, and surfaces
+libibverbs' `couldn't load driver` warning. That surfaced the exact
+signature that made §13/§3.7 hide for two sessions.
 
 **Closed in session 4: 6.11** — leg A transfers KV, decode at 0.0 tokens/s
 prompt throughput and a 100% external prefix cache hit rate, measured through
 this repo's own proxy (HANDOFF §11). Also stale now: 2.8's `ionic_N` → netdev
 mapping, and 6.14's router decision, both reversed with evidence.
+
+**Also new, 2026-09-16 — 1.14.** The 1P1D→xPyD fleet-shape seam
+(`PREFILL_HOSTS`/`DECODE_HOSTS`, `EndpointPool` round-robin, per-instance
+NIXL side-channel ports) is implemented and unit-tested against fake
+upstreams, but has not been run against more than one real prefill or
+decode instance on live hardware — every measurement in this doc is still
+N=1. See 1.14.
 
 ---
 
@@ -162,6 +189,22 @@ rework.
       same endpoint, which vLLM's own prefix cache may serve without consulting
       any connector — see [HANDOFF §8](HANDOFF.md#8-known-measurement-trap). The
       warning and `--confirm-connector-hit` are in place; the restructure is not.
+- [~] **1.14** **NEW, 2026-09-16.** Implement and prove the 1P1D→xPyD
+      fleet-shape seam: plural `PREFILL_HOSTS`/`PREFILL_PORTS`/
+      `DECODE_HOSTS`/`DECODE_PORTS` in `config/cluster.env` (defaulting to
+      the existing singulars, so 1P1D is unchanged), an `EndpointPool` with
+      round-robin `select()` in `scripts/proxy/disagg_proxy.py` replacing
+      the old four scalar endpoint variables, and a per-instance NIXL
+      side-channel port (base port + instance index) for xPyD. **Done:**
+      the code exists and the §11.1/§11.4 handoff-semantics risk in this
+      refactor was tested against fake upstreams (priming body, the
+      `min_tokens`/`stream_options` drop on the priming copy only, handoff
+      threading, the empty-dict-is-absent rule, `prefill_no_handoff`, the
+      swallow-prefill/502-on-decode asymmetry) — see HANDOFF §17.9. **Not
+      done:** this has never been run against more than one real prefill
+      or decode instance on live hardware; every measurement in this doc
+      (§11, §12, §15) is still N=1. Prove it on real xPyD hardware before
+      trusting the fleet shape beyond N=1.
 
 ---
 
@@ -457,8 +500,8 @@ counters rather than inferred from throughput.*
       should be raised with AMD. Also verified incidentally:
       `UCX_IB_GID_INDEX=1` in cluster.env is **correct** — index 1 is the
       IPv4 RoCEv2 GID on every device (previously an unverified default).
-- [ ] **3.8** **Make `00-preflight.sh` actually test RDMA rather than
-      inventory it.** It could not have caught 3.7: its only assertion is
+- [x] **3.8** **Make `00-preflight.sh` actually test RDMA rather than
+      inventory it.** It could not have caught 3.7: its only assertion was
       `check_soft "rdma-core userspace tools present" command -v
       ibv_devinfo`, which checks that the *binary exists*. The inventory
       step runs `ibv_devinfo -l`, and with zero loadable devices that
@@ -474,6 +517,19 @@ counters rather than inferred from throughput.*
       `check_soft` in Phase 1 (TCP needs no verbs) but make it a hard
       check when `KV_TRANSPORT=rdma`. Use `timeout` — 3.2 records that an
       unopenable device presents as a ~90 s hang, not an error.
+
+      **DONE, 2026-09-16.** `00-preflight.sh` now runs `ibv_devinfo -l`
+      capturing stderr, asserts at least one device is enumerated
+      (`check_soft "ibv_devinfo actually enumerates >= 1 RDMA device (not
+      just installed)"`), and surfaces a `couldn't load driver`/`failed to
+      load driver`/`no matching driver` line from libibverbs as an
+      explicit `warn` block naming §13.3, instead of silently discarding
+      stderr. **Not part of this change, but already covers the
+      `KV_TRANSPORT=rdma` hard-check this item also asked for:**
+      `lib.sh`'s `require_rdma_access` (added at 1.9) already `die`s if no
+      RDMA port reports `PORT_ACTIVE` when `KV_TRANSPORT=rdma`, so the
+      hard-check half of this item was satisfied independently, earlier.
+      Nothing further to do here.
 - [ ] **3.9** 🔴 **NOW THE TOP OPEN RDMA ITEM — `UCX_TLS=ib` will pull in UD
       transports that cannot be created on this hardware.** Measured
       2026-09-16 (HANDOFF §14.2): RC QPs work, **UD QP creation fails
@@ -547,9 +603,21 @@ counters rather than inferred from throughput.*
 - [ ] **4.4** Watch Gerrit 27889 / 28298. Both are review-complete and tagged
       `26.09`; when they merge, drop the vendored `patches/spdk/0002` and `0003`
       and move `SPDK_TARGET_REF` to the release tag.
-- [ ] **4.5** Connector-order experiment. `PD_LMCACHE_FIRST=1` is the only
+- [x] **4.5** Connector-order experiment. `PD_LMCACHE_FIRST=1` is the only
       posture in which the L2 tier can win a load; the default gives NixlConnector
       first refusal. Worth measuring once 1.13 makes the number trustworthy.
+
+      **OBSOLETE, 2026-09-16 — there is no longer a posture to experiment
+      with.** `PD_ENABLED`/`PD_CONNECTOR`/`PD_LMCACHE_FIRST` are all
+      deleted; `gen-kv-transfer-config.sh` hardcodes `NixlConnector` as
+      `connectors[0]` and there is no variable left that can put
+      `LMCacheMPConnector` first (HANDOFF §17.1). This is not a decision
+      not to run the experiment — it is that the "first refusal" behavior
+      is no longer configurable at all, for the reason HANDOFF
+      §12.1/§16.9 give: letting LMCache go first would silently skip the
+      P→D remote-prefill pull whenever the L2 tier has anything cached.
+      Closes out the connector-composition ambiguity this item and 6.10's
+      old item 1 both used to carry.
 - [ ] **4.6** `rocm-smi` prints `get_name, Error when calling libdrm` and an
       empty Marketing Name on both compute nodes, measured 2026-09-14 right
       after bringing amdgpu up (0.4). Cause: `libdrm-amdgpu1` is Ubuntu's
@@ -692,6 +760,13 @@ otherwise.*
       wrong-device selection — keep this fact visible even though it's
       handled, because a future host with a differently-numbered local KV
       device could hit it again.
+
+**The default in `config/cluster.env` finally matches this decision,
+       2026-09-16 — see 6.22.** This item decided XNVME_KV back in session
+       2, but `KV_BACKEND`'s actual default stayed `SPDK_NVMe_KV` until now;
+       the flip to `XNVME_KV` (with `SPDK_NVMe_KV` kept fully wired for
+       comparison, not deleted) is now committed — see 6.22 and HANDOFF
+       §17.7.
 - [x] **6.4** **Urgent — check before any storage-leg roundtrip runs.** The
       prebuilt target's transport came up reporting `max_io_size: 131072`
       (128 KiB) — measured 2026-09-15 — not the 16 MiB ceiling HANDOFF §7
@@ -722,6 +797,18 @@ otherwise.*
       not one of the two live items** — but 6.10 and 6.13 both need to
       reconcile `KV_MAX_VALUE_SIZE_EFFECTIVE` against 32768 (not 131072, not
       16 MiB) before trusting the chunk-ceiling guard on this backend.
+
+      **Narrowed, 2026-09-16 — this concern does not apply on the path
+      this repo actually runs.** The 32768/524288 ceilings above are real
+      (confirmed live via `nixl_agent.get_plugin_params()` against the
+      installed plugins), but the daemon-side `--l2-adapter` path
+      (HANDOFF §17.4) tiles storage at `--l1-align-bytes` (4096 B by
+      default), not at the whole LMCache `chunk_size` — so
+      `_resolve_mem_split()` returns `mem_split_n=1` for both backends and
+      the adapter-level split described here never engages (HANDOFF
+      §17.5). This item's ceiling math still matters for the in-process
+      `LMCacheConnectorV1`/`nixl_storage_backend.py` path, which this repo
+      does not run; it is not a live risk for 6.10 as currently composed.
 - [x] **6.5** *(Kernel upgrade sub-plan, step 1 of 4 — PAUSED at user
       instruction this session; nothing installed, not failed.)* Install
       `linux-image-generic-hwe-22.04` candidate `6.8.0-138.138~22.04.1`
@@ -788,7 +875,7 @@ otherwise.*
       work resumes. Automating this (systemd unit, or folding into
       host-prep) is real remaining work, but it is not one of the two live
       items in this section — do it opportunistically once 6.10/6.11 land.
-- [ ] **6.10** 🔴 **THE LIVE ITEM — compose the storage tier under P/D.**
+- [~] **6.10** 🔴 **THE LIVE ITEM — compose the storage tier under P/D.**
       Compose `MultiConnector[NixlConnector, LMCacheMPConnector]` with the
       chosen KV backend as the **live** LMCache storage tier underneath a
       real P/D deployment: LMCache's `nixl_backend = XNVME_KV` (per 6.3),
@@ -920,8 +1007,53 @@ otherwise.*
       `chunk_size` first, and change it on **both** roles (it is part of
       the cache key — invariant 8).
 
+      > **ANSWERED, 2026-09-16 — see HANDOFF §17.5.** The paragraph above
+      > was reasoning about the wrong layer. On the daemon-side
+      > `--l2-adapter` path this repo actually runs, the pool tiles at
+      > `--l1-align-bytes` (4096 B), not at the whole 10 MiB LMCache
+      > chunk, so `mem_split_n=1` for both backends and the ~320-part
+      > split described here never happens. This paragraph's arithmetic
+      > only applies to the in-process `LMCacheConnectorV1` path, which
+      > this repo does not run.
+
       The exact resume recipe, with every element established rather than
       guessed, is written out at **HANDOFF §12.7**.
+
+      **IMPLEMENTED, 2026-09-16 (commits `c055f7d`, `0b75adb`) — the code
+      this item needs now exists and is validated; a live composed run is
+      still not.** What landed:
+
+      - The connector-composition question this item's old item 1 argued
+        about is now moot — `NixlConnector` as `connectors[0]` is
+        hardcoded in `gen-kv-transfer-config.sh`, not a posture to choose
+        (see 4.5, HANDOFF §17.1).
+      - The MP daemon HANDOFF §12.1 said "nothing spawns" now has a
+        launcher: `scripts/common/start-lmcache-daemon.sh` /
+        `stop-lmcache-daemon.sh`, wired into
+        `scripts/{prefill,decode}/03-start-*.sh` and `99-stop.sh`, gated
+        on by `start-vllm.sh` (HANDOFF §17.3).
+      - The KV tier attaches daemon-side via a repeatable `--l2-adapter
+        <JSON>` flag (`nixl_store` type, `{backend, backend_params,
+        pool_size}`), built by `start-lmcache-daemon.sh` from
+        `KV_BACKEND`/`XNVME_DEV`/`KV_TRID` and validated against the
+        installed LMCache parser by `25-validate-lmcache-config.sh
+        --l2-adapter-json` before the daemon ever spawns (HANDOFF §17.4).
+      - This item's own "still untested" paragraph above is now answered
+        (HANDOFF §17.5) — the split never engages on this path.
+      - `gen-lmcache-config.sh`'s header now states plainly that its YAML
+        `extra_config` keys are not read by anything running under MP, so
+        the next reader can't repeat this item's original mistake by
+        staring at that file alone (HANDOFF §17.6).
+
+      **Still not done: an actual live LMCache hit served through this
+      composed path on real hardware.** Nothing above was run against
+      `smc3` or the local DSC — it was validated against the installed
+      parser and a live `get_plugin_params()` query inside
+      `rocm-aic:mp-pd-ionic2609`, not against a running daemon serving a
+      real store/retrieve. This item is blocked on precisely what it
+      always was, **6.18** and **6.20** — not on any remaining code gap.
+      The `KV_BACKEND=XNVME_KV` default flip this item's recipe now assumes
+      is in place in `config/cluster.env` — see **6.22**.
 - [x] **6.11** ✅ **DONE 2026-09-15 (session 4) — leg A carries KV.** Prove
       leg A: a direct P→D NIXL transfer, following the rixl-bench pattern —
       `NixlConnector` only, `kv_role` kv_producer/kv_consumer,
@@ -1289,5 +1421,18 @@ otherwise.*
       tier, flag as a sizing question to confirm before relying on it.
       `nvme list` shows "0.00 B / 0.00 B" for this device only because
       `nuse=0` (unused) — do not read that as an absent namespace.
-      Ties to the newly-available local-DSC option for Track A (6.10,
-      HANDOFF §16.8).
+      Ties to the newly-available local-DSC option for the storage tier
+      (6.10, HANDOFF §16.8).
+- [x] **6.22** ✅ **DONE 2026-09-16 — `KV_BACKEND` default flipped to
+      `XNVME_KV`.** `config/cluster.env`'s default moved from
+      `SPDK_NVMe_KV` to **`XNVME_KV`**, finally matching the backend
+      decision 6.3 recorded back in session 2, so a fresh checkout now
+      picks up XNVME_KV without an override. `SPDK_NVMe_KV` stays fully
+      wired — build step, plugin, `lib.sh` arm, `--l2-adapter` spec,
+      verify ladder — so the comparison between the two backends remains
+      available and a regression in one can be attributed against the
+      other. Rationale at HANDOFF §17.7: the CSI-1 kernel blocker is
+      closed (§10.4's re-test, then proven end to end §10.5), and the
+      path needs no vfio-pci, no hugepages and no DPDK/SPDK version
+      pairing. Note a backend switch still requires draining the
+      namespace — see 4.2 and the `KV_MAX_VALUE_SIZE_*` comments.

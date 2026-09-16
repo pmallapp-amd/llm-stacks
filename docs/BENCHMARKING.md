@@ -191,12 +191,26 @@ should coincide.
 
 ```bash
 scripts/bench/40-bench-transport-compare.sh   # records a run under the CURRENT KV_TRANSPORT
-# ... flip KV_TRANSPORT in config/cluster.env, restart target -> prefill -> decode ...
+# ... flip KV_TRANSPORT in config/cluster.env, restart prefill -> decode ...
 scripts/bench/40-bench-transport-compare.sh   # finds the prior run, diffs automatically
 ```
+`KV_TRANSPORT` gates **only** the compute leg (the direct P→D
+`NixlConnector`/UCX side channel) — the storage leg (SMC3) is NVMe-oF/TCP
+unconditionally regardless of this value, so there is no need to restart
+`scripts/target/03-start-kv-target.sh` when flipping it; only `prefill` and
+`decode` need to be bounced. See `config/cluster.env`'s `KV_TRANSPORT`
+comment and the README's Status table.
+
 Read the `compare_runs.py` output's `ttfr`/`est_ppt`/`e2e_ttft` tables:
 RDMA should show a lower mean, marked significant, at every shape — an
 unmarked or reversed row is worth a second look before calling RDMA a win.
+As of this writing, the raw RoCE fabric between SMC1/SMC2 is measured
+(`ib_write_bw` ~41,898 MiB/s ≈ 351 Gb/s at 8 MiB, on 400 Gb/s-class DSC3
+NICs — see `scripts/verify/10-verify-network.sh`), but a full
+`KV_TRANSPORT=rdma` run through this harness has not yet been recorded end
+to end (open item: UD queue-pair creation still fails on this hardware —
+see `BRINGUP.md` §9.1) — treat §7/§8 below as still-empty until that
+lands.
 
 ### Everything at once
 
