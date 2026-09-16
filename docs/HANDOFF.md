@@ -1723,3 +1723,193 @@ global IPv6 GIDs share a common `2001:0db8::/32`** — `smc1` holds
 is a materially different addressing situation from IPv4 and may be the
 easier one to route. RoCEv2 over the IPv6 GID is legitimate. Do not guess
 a configuration from this; measure whether a route exists first.
+
+---
+
+## 15. Firmware was updated — the UD/`rdma_cm` break survives it, but the routing gap is closed and cross-node RDMA now works, measured for the first time (2026-09-16)
+
+The operator updated firmware for the RDMA device on `smc1` and `smc2` and
+asked for a connectivity re-check. Both nodes rebooted 2026-09-16 06:39
+(~19 min uptime at measurement). Both have **0 GPUs and no containers
+running** — the amdgpu ritual (§9.4) still applies, not addressed here.
+`smc3` was **not examined this session**; nothing below says anything
+about the target.
+
+### 15.1 Firmware skew (TODO 3.10) is now all but levelled — and this DISPROVES firmware as the cause of break two
+
+| | §14.5 | Now |
+|---|---|---|
+| `smc2` | `1.130.0-a-120` | all 8 ports = `1.130.0-a-120` (uniform) |
+| `smc1` | `1.130.0-pi-121` | `ionic_1`..`ionic_7` = `1.130.0-a-120`; **`ionic_0` (`benic1p1`) is still `1.130.0-pi-121`** |
+
+Measured per-port across all 8 devices on both nodes. 15 of the 16 cards
+across the two nodes are now levelled; `smc1`'s `ionic_0` is the lone
+holdout.
+
+**The inference that matters:** `smc1`'s `ionic_0`, still at `-pi-121`,
+and every `-a-120` card on both nodes **both emit the identical
+`CREATE_QP BAD_ATTR` failure** (§15.3). A card on the old firmware and
+cards on the new firmware fail the same way, on the same host, under the
+same driver. Therefore **the firmware skew is not the cause of break
+two.** §14.5 recorded the skew as "worth levelling before trusting any
+cross-node RDMA result" — it has now been levelled (15/16) and nothing
+functional changed. **TODO 3.10 is downgraded to a tidiness item, not a
+blocker.**
+
+Driver and userspace are unchanged from §14.1: `ionic`/`ionic_rdma` DKMS
+`26.06.9.001`, `libionic1` `50.0.26.06.3.001-1`, `libibverbs`
+`50.0-2ubuntu0.2`, kernel `6.8.0-139-generic`, provider
+`libionic-rdmav34.so` present. The stale `libionic-rdmav59.so` orphan is
+still on disk, still harmless. This was a firmware-only change, exactly as
+the operator described.
+
+### 15.2 Break one stays fixed
+
+`ibv_devinfo -l` returns **"8 HCAs found"** on both nodes, no
+provider-load warning. Nothing to add to §14.1.
+
+### 15.3 Break two SURVIVED the firmware update, unchanged
+
+Re-measured, contemporaneous with this boot — driver loads 06:39:57 on
+`smc1` / 06:39:55 on `smc2`, failures immediately after:
+
+- Exactly **8** occurrences of `opcode CREATE_QP (2) error BAD_ATTR (5)`
+  and **8** of `Couldn't create ib_mad QP1` per node — one per device,
+  both nodes.
+
+| Path | Result |
+|---|---|
+| RC QP create + data (loopback, `-d ionic_2 -g 1`) | **WORKS** — `smc1` 9.30 us/iter, `smc2` 10.31 us/iter, 200 iters |
+| UD QP create (`ibv_ud_pingpong`) | **FAILS** — "Couldn't create QP" |
+| `rdma_cm` (`rping`) | **FAILS** — "rdma_connect: Invalid argument" |
+
+Identical on both nodes, and identical to §14.2's matrix — same
+transports pass, same transports fail, same error strings. **§14.2's
+characterisation — "this driver/firmware cannot create UD queue pairs" —
+is confirmed verbatim after a firmware change that levelled 15 of the 16
+cards.** The defect is not firmware-version-specific. Attribute it to the
+driver, or to something common to both firmware builds — not to the
+firmware skew §14.5 flagged. **TODO 3.9 (`UCX_TLS`/UD) remains fully open
+and is now the main RDMA-stack risk** — see §15.9.
+
+### 15.4 THE HEADLINE: the routing gap (TODO 3.6) is CLOSED
+
+Someone configured it between sessions. Static routes now exist for all 8
+fabric pairs, both directions:
+
+```
+smc1:  30.2.N.0/24 via 30.1.N.2 dev benicNp1 proto static
+smc2:  30.1.N.0/24 via 30.2.N.2 dev benicNp1 proto static
+```
+
+Cross-node ping over `benic3p1` succeeds both directions, **0% loss, rtt
+avg ~0.10 ms**.
+
+§14.6 named routing "the actual blocker for Phase 2". That blocker is
+gone. **This was not done by us** — it follows the §13.7/§14.4 pattern of
+the shared hardware changing underneath this project, this time in our
+favour.
+
+### 15.5 First real cross-node RDMA on this cluster
+
+§14.2 said: "there is no RDMA throughput measurement on this cluster, and
+this section does not provide one" — conditional on routing existing and
+firmware being levelled. **Both conditions are now met, so this section
+does provide one.**
+
+Cross-node RC pingpong `smc1`→`smc2` (`ionic_2`, GID idx 1, 1000 iters):
+works. Local GID `::ffff:30.1.3.1`, remote `::ffff:30.2.3.1` — distinct
+GIDs, so unlike §14.2's loopback run **this genuinely crossed the
+fabric**. **14.01 us/iter, client-side.**
+
+`ib_write_bw`, RC, cross-node, `-d ionic_2 -x 1 -F`, 5000 iters, BW
+average:
+
+| msg size | MiB/s | approx Gb/s |
+|---|---|---|
+| 64 KiB | 28,653 | ~240 |
+| 1 MiB | 40,287 | ~338 |
+| 8 MiB | 41,898 | ~351 |
+
+`ib_send_bw` (two-sided), 1 MiB, 5000 iters: **26,918 MiB/s (~226 Gb/s)**.
+
+### 15.6 CORRECTION: these are 400 Gb/s links, not 200 Gb/s
+
+§14.2 asserted: "These are 200 Gb/s NICs, so ~5.9 Gb/s is about 3% of line
+rate." **Measured now: `ethtool` reports `Speed: 400000Mb/s` on all 8
+ports on both nodes, and `/sys/class/infiniband/ionic_2/ports/1/rate`
+reads `"400 Gb/sec (4X NDR)"`.** So the 8 MiB result above (~351 Gb/s) is
+**~88% of line rate** — a healthy fabric number, not the ~3%-of-line-rate
+figure §14.2's premise implied.
+
+This is the **sixth** expired/incorrect fact on this cluster, extending
+the §13.4 / §14.4 tally. The prior 200G figure likely came from the
+§13.7 / §12.6 link-up log lines, which said `200 Gbps` — those describe
+different NICs (§13.7's is a compute-node event during the driver
+investigation, §12.6's is the target's data-plane NICs), and neither was
+the `ionic` fabric link this cluster's RDMA path actually runs over.
+§14.2's 200 Gb/s premise was carried forward from one of those without
+being measured directly against the device the RC/UD tests actually used.
+
+### 15.7 Methodology note: the throughput number was verified independently of `perftest` — and it first produced a false negative
+
+The verification method matters, because it did not work on the first
+attempt, and the way it failed is itself a lesson worth keeping.
+
+- The kernel netdev counter `/sys/class/net/benic3p1/statistics/rx_bytes`
+  is **useless for RoCE** — it moved only ~1.9 KB across a 1.95 GiB
+  transfer, because RoCE bypasses the kernel netdev path entirely. Do not
+  use it to confirm RDMA traffic.
+- `ionic` exposes only **error** counters under
+  `/sys/class/infiniband/ionic_2/ports/1/hw_counters/` — no byte
+  counters there either.
+- What works: MAC-level `ethtool -S benic3p1 | grep octets_rx_ok` **on
+  the receiving node**.
+- These counters **lag by roughly 5 seconds**. A 3-second settle produced
+  a delta of 148 bytes and a spurious "did not cross" verdict. With a
+  longer settle the delta was **2,147,330,651 bytes against 2,097,152,000
+  expected** — a ratio of 1.024, the 2.4% excess being RoCE/Ethernet
+  header overhead. That is positive proof the payload crossed the wire.
+
+**The lesson, in this repo's voice:** an instrument that reads zero is not
+evidence of absence until you have shown the instrument responds at all.
+This nearly became a seventh false conclusion in the same family as
+§13.4's table — the 3-second settle's "did not cross" reading was wrong
+for the same underlying reason those four checks were wrong: a check that
+passed (or in this case, failed) while proving the opposite of what it
+looked like it proved.
+
+### 15.8 GID mapping re-confirmed (the §14.4 expired-fact rule)
+
+`ionic_0..7` → `benic1p1..benic8p1` on **both** nodes, all 8
+ACTIVE/up, `smc1` `30.1.N.1/24` and `smc2` `30.2.N.1/24` — unchanged from
+§14.4. `UCX_IB_GID_INDEX=1` is still correct — index 1 is the IPv4 RoCEv2
+GID. The creds pin `ionic_2:1` is now **additionally justified**: `ionic_2`
+is `-a-120` on both nodes, i.e. it avoids `smc1`'s lone `-pi-121` card
+(§15.1).
+
+### 15.9 Still open / not done this session
+
+- **TODO 3.9 remains the top open RDMA item.** `ucx_info` is **not
+  installed on the hosts** (container-only), so which UCX transport spec
+  works here still could not be determined and still must be measured
+  inside the container with `/dev/infiniband` mapped — which the launch
+  scripts still do not do.
+- **The IPv6 GID lead from §14.6 is a DEAD END for now.** Global v6 GIDs
+  are present (`smc1` `benic3p1` = `2001:db8:3::1/64`, `smc2` `benic3p1` =
+  `2001:db8:b::1/64`) but `ping6` across fails "Network is unreachable".
+  Since IPv4 is now routed (§15.4), this lead is moot — drop it.
+- **GPUs are 0 on both nodes**; the amdgpu modprobe ritual (§9.4) still
+  applies.
+
+**What this changes:**
+
+- **3.6 closed** — the routing gap is gone; cross-node IPv4 works both
+  directions.
+- **3.10 downgraded** to a tidiness item, and disproved as the cause of
+  break two — 15/16 cards levelled, both firmware levels fail UD
+  identically.
+- **3.9 is now the sole RDMA-stack blocker.**
+- **Phase 2 RDMA acceptance is unblocked at the fabric level** and gated
+  only on the UCX transport question (3.9) and mapping `/dev/infiniband`
+  into the containers.

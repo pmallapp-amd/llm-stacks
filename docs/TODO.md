@@ -17,7 +17,7 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 0 | Blocking decisions and follow-ups | 4 | 2 | 2 |
 | 1 | Architecture correction (compute leg) | 13 | 12 | 0 |
 | 2 | Hardware bring-up (Phase 1, TCP) | 13 | 5 | 3 |
-| 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 0 | 0 |
+| 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 2 | 0 |
 | 4 | Open items and known limitations | 6 | 0 | 0 |
 | 5 | Done | 14 | 14 | — |
 | 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 20 | 12 | 6 |
@@ -43,14 +43,18 @@ the composition is `MultiConnector[NixlConnector, **LMCacheConnectorV1**]` —
 day one and which cannot reach the NIXL storage backend at all, silently
 ignoring its config (HANDOFF §12.1).
 
-*Track B — §3, RDMA acceptance.* Newly viable: another party installed the
-matched 24.04 DSC bundle on 2026-09-16, fixing half of 3.7. `ibv_devinfo`
-works on both nodes and **RC queue pairs carry data**. What remains is
-narrower and now exact — **UD QPs cannot be created at all**, so `ib_mad` QP1
-and `rdma_cm` both fail. NIXL/UCX need neither, so this likely does not block
-leg A over RDMA, but `UCX_TLS=ib` pulls in UD transports that will fail
-(3.9). **3.6's routing gap is the operative blocker again**, alongside 3.9 and
-3.10's firmware skew. See HANDOFF §14.
+*Track B — §3, RDMA acceptance.* **Firmware updated 2026-09-16 — routing is
+now CLOSED and cross-node RDMA is measured for the first time.** Static
+routes exist for all 8 fabric pairs both directions; cross-node ping is 0%
+loss at ~0.10 ms; `ib_write_bw` cross-node peaks at 41,898 MiB/s (~351
+Gb/s, ~88% of the **400** Gb/s line rate — these NICs are 400 Gb/s NDR, not
+200 Gb/s as an earlier note assumed). **3.6 is closed. 3.10's firmware skew
+is disproved as the cause of break two** (both `-pi-121` and `-a-120` cards
+emit the same `CREATE_QP BAD_ATTR`) and is downgraded to tidiness. **3.9 —
+UD QPs still cannot be created, `rdma_cm` still fails — is now the sole
+remaining RDMA-stack blocker.** NIXL/UCX need neither UD nor `rdma_cm`, so
+this likely does not block leg A over RDMA, but `UCX_TLS=ib` pulls in UD
+transports that will fail. See HANDOFF §15.
 
 **Cheap, do anytime: 3.8** — make preflight assert `ibv_devinfo` returns a
 device rather than merely existing. That check would have made 3.7
@@ -250,6 +254,14 @@ rework.
       (`ionic_2` is `benic3p1` on both) but was chosen to dodge an
       asymmetry that is gone; any index would now serve. See HANDOFF §14.4,
       and note this is the fifth recorded fact to expire under us.
+
+      **Re-confirmed 2026-09-16, after the firmware update (HANDOFF
+      §15.8):** the symmetric mapping above still holds on both nodes —
+      `ionic_0..7` → `benic1p1..benic8p1`, all 8 ACTIVE/up, `smc1` on
+      `30.1.N.1/24`, `smc2` on `30.2.N.1/24`. The `ionic_2:1` pin is now
+      **additionally justified**, not just still-valid: `ionic_2` is
+      `-a-120` firmware on both nodes, so it also dodges `smc1`'s lone
+      `ionic_0` holdout still on `-pi-121` (§15.1/3.10).
 - [x] **2.9** Pre-stage Qwen2.5-72B-Instruct weights. **Done 2026-09-15.** They
       were already in `/root/.cache/huggingface/hub`; now at
       `/var/tmp/hf/Qwen2.5-72B-Instruct` on both nodes (bind-mounted as `/hf`),
@@ -323,7 +335,7 @@ counters rather than inferred from throughput.*
 - [ ] **3.5** Re-run the verify ladder and
       `scripts/bench/40-bench-transport-compare.sh` for the TCP-vs-RDMA number.
       *blocked by 1.13 if the figure is to mean anything*
-- [ ] **3.6** The P→D fabric has no route yet. Measured 2026-09-14: `smc1`'s
+- [x] **3.6** The P→D fabric has no route yet. Measured 2026-09-14: `smc1`'s
       data-plane addresses are `30.1.N.1/24`, `smc2`'s are `30.2.N.1/24` —
       different `/24`s, differing in the second octet. `ip route get` for an SMC2 fabric
       address from SMC1 falls back to the management default route — there is no fabric route at all. This also
@@ -353,6 +365,17 @@ counters rather than inferred from throughput.*
       IPv4 and may route more easily. RoCEv2 over an IPv6 GID is
       legitimate. Check whether a route exists before configuring
       anything — do not guess, per this item's own standing warning.
+
+      **CLOSED 2026-09-16 — routing exists now, and was not done by us.**
+      Static routes now exist for all 8 fabric pairs, both directions:
+      `smc1` carries `30.2.N.0/24 via 30.1.N.2 dev benicNp1 proto static`;
+      `smc2` carries the mirror `30.1.N.0/24 via 30.2.N.2 dev benicNp1
+      proto static`. Cross-node ping over `benic3p1` succeeds both
+      directions, **0% loss, rtt avg ~0.10 ms**. This follows the
+      §13.7/§14.4 pattern of the shared hardware changing underneath this
+      project — this time in our favour. The IPv6 lead above is now moot;
+      dropped, not pursued. Full detail and the first cross-node RDMA
+      throughput numbers this routing unblocks: HANDOFF §15.4/§15.5.
 - [~] **3.7** **[HALF-RESOLVED 2026-09-16 — see the update at the end of
       this item.]** **The `ionic` RDMA stack is broken on BOTH compute nodes —
       two independent version/ABI mismatches, introduced by the 24.04.5 /
@@ -443,29 +466,42 @@ counters rather than inferred from throughput.*
       `check_soft` in Phase 1 (TCP needs no verbs) but make it a hard
       check when `KV_TRANSPORT=rdma`. Use `timeout` — 3.2 records that an
       unopenable device presents as a ~90 s hang, not an error.
-- [ ] **3.9** **`UCX_TLS=ib` will pull in UD transports that cannot be
-      created on this hardware.** Measured 2026-09-16 (HANDOFF §14.2): RC
-      QPs work, **UD QP creation fails outright** (`Couldn't create QP`),
-      and `rdma_cm` fails with it. The `ib` alias in invariant 6's
-      `UCX_TLS=ib,rocm,self,sm` expands to include `ud_verbs`, and
-      `rc_verbs` uses a UD QP for some connection-establishment modes.
+- [ ] **3.9** 🔴 **NOW THE TOP OPEN RDMA ITEM — `UCX_TLS=ib` will pull in UD
+      transports that cannot be created on this hardware.** Measured
+      2026-09-16 (HANDOFF §14.2): RC QPs work, **UD QP creation fails
+      outright** (`Couldn't create QP`), and `rdma_cm` fails with it. The
+      `ib` alias in invariant 6's `UCX_TLS=ib,rocm,self,sm` expands to
+      include `ud_verbs`, and `rc_verbs` uses a UD QP for some
+      connection-establishment modes.
+
+      **RE-MEASURED after the 2026-09-16 firmware update, UNCHANGED
+      (HANDOFF §15.3):** the firmware update that levelled 15/16 cards did
+      **not** fix this — same 8/8 `CREATE_QP BAD_ATTR`, same UD/`rdma_cm`
+      failures, on both nodes, identical to §14.2's matrix. This rules out
+      firmware skew as the cause (3.10 is downgraded accordingly) and
+      makes this the **sole** remaining RDMA-stack blocker now that 3.6's
+      routing gap is closed — everything else Phase 2 needs at the fabric
+      level now works.
 
       Determine empirically which UCX transport spec works here — likely
       naming RC explicitly instead of the `ib` alias — by enumerating with
       `ucx_info -d` inside the container with `/dev/infiniband` mapped
       (the current launch scripts do **not** map it, which is itself a
-      Phase 2 prerequisite).
+      Phase 2 prerequisite). **Still not measured, 2026-09-16: `ucx_info`
+      is not installed on either host** (container-only), so this must be
+      run inside the container, with `/dev/infiniband` mapped in, not on
+      the bare host.
 
       **Do not simply edit invariant 6 to make this pass.** Its reason —
       never let RDMA acceptance succeed on a silent TCP fallback — is
       still valid, and any replacement must keep `tcp` excluded so a
       half-working fabric fails loudly rather than quietly reporting a
-      good number over the wrong transport. *Parallel to 3.6; both gate
-      3.1.*
-- [ ] **3.10** **DSC firmware differs between the two compute nodes.**
-      `smc1` reports `fw_ver: 1.130.0-pi-121`, `smc2` reports
-      `1.130.0-a-120` — different build suffix and build number, measured
-      2026-09-16. Driver (`26.06.9.001`) and userspace
+      good number over the wrong transport. *3.6 is closed; this is now
+      the only thing gating 3.1.*
+- [x] **3.10** **NO LONGER A BLOCKER — DSC firmware differs between the two
+      compute nodes.** `smc1` reports `fw_ver: 1.130.0-pi-121`, `smc2`
+      reports `1.130.0-a-120` — different build suffix and build number,
+      measured 2026-09-16. Driver (`26.06.9.001`) and userspace
       (`50.0.26.06.3.001-1`) are identical on both, so this is firmware-only
       skew.
 
@@ -473,6 +509,21 @@ counters rather than inferred from throughput.*
       is two-sided and leg A over RDMA is precisely a cross-node RC path,
       so level this before trusting any P↔D RDMA measurement. Recorded,
       not chased.
+
+      **Firmware updated 2026-09-16 — levelled to 15/16, and the level-up
+      DISPROVES this as the cause of break two (HANDOFF §15.1).**
+      Per-port re-measurement across all 8 devices on both nodes: `smc2`
+      is now uniform `1.130.0-a-120` on all 8 ports; `smc1`'s
+      `ionic_1`..`ionic_7` moved to `1.130.0-a-120`, but **`ionic_0`
+      (`benic1p1`) is still `1.130.0-pi-121`** — one holdout card, out of
+      16. The key inference: `smc1`'s `ionic_0` (old firmware) and every
+      `-a-120` card (new firmware, both nodes) **emit the identical
+      `CREATE_QP BAD_ATTR` failure** (§15.3) — a card on the old firmware
+      fails exactly like cards on the new one. **Firmware is therefore
+      disproved as the cause of break two.** Downgraded from a blocker to
+      a tidiness item — level `smc1`'s `ionic_0` when convenient, but
+      nothing in Phase 2 is waiting on it. See TODO 3.9 for what is
+      actually still open.
 
 ---
 
