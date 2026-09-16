@@ -12,24 +12,64 @@
 # usage: gen-lmcache-config.sh <prefill|decode> <output-path>
 #
 # ═══════════════════════════════════════════════════════════════════════════
-# WHICH PROCESS READS THIS FILE — MP mode changes this from earlier builds
+# WHICH PROCESS READS THIS FILE — RESOLVED 2026-09-16, and the answer is
+# "NEITHER ONE, UNDER MP MODE" — READ THIS BEFORE TRUSTING extra_config BELOW
 # ═══════════════════════════════════════════════════════════════════════════
-# LMCache now runs as LMCacheMPConnector's SEPARATE HOST PROCESS (the "MP"
-# daemon, reached over ZMQ at LMCACHE_MP_HOST:LMCACHE_MP_PORT — see
-# config/cluster.env), not in-process inside the vLLM engine. That means the
-# NIXL storage-backend config below (enable_nixl_storage, nixl_backend,
-# nixl_pool_size, nixl_backend_params, the nixl_buffer_* fields) is consumed
-# DAEMON-side: whatever process loads this YAML to construct the LMCache
-# engine's storage backends is the MP daemon, not vLLM's own Python process.
-# This has NOT been independently re-verified against the installed
-# LMCacheMPConnector/daemon entry point for this task — the daemon-reads-this
-# claim follows directly from what MP mode means (a separate process must
-# have ITS OWN engine config to construct ITS OWN storage backends; vLLM's
-# process no longer constructs a LocalCacheEngine at all), but the exact
-# code path the daemon uses to load this specific file was not traced here.
-# If that matters, verify against the installed lmcache package's MP daemon
-# entry point (whatever launches the process on the other end of
-# LMCACHE_MP_HOST:LMCACHE_MP_PORT) before relying on this comment further.
+# This repo runs `LMCacheMPConnector` (MP mode — see docs/HANDOFF.md §16),
+# not `LMCacheConnectorV1`. Under MP mode, THIS FILE'S extra_config block
+# (enable_nixl_storage, nixl_backend, nixl_pool_size, nixl_backend_params,
+# the nixl_buffer_* fields) IS NOT CONSUMED BY ANYTHING — not by vLLM's own
+# process, and not by the MP daemon. This is the exact trap
+# docs/HANDOFF.md §12.1 fell into (and later withdrew, §16) by observing
+# this same fact and wrongly concluding MP couldn't reach the KV backend at
+# all — it can, just through a completely different, CLI-flag-based config
+# surface on the daemon side (scripts/common/start-lmcache-daemon.sh's
+# `--l2-adapter <JSON>`), not through this YAML. Do not re-learn that
+# lesson: read docs/HANDOFF.md §16.1-§16.3 before changing anything here on
+# the theory that "the daemon must read this file somehow."
+#
+# Independently confirmed for this task, directly against the installed
+# lmcache 0.5.3 in rocm-aic:mp-pd-ionic2609:
+#   - `lmcache/integration/vllm/lmcache_mp_connector.py` (LMCacheMPConnector
+#     itself) contains NO reference at all to LMCACHE_CONFIG_FILE,
+#     LMCacheEngineConfig, or lmcache_get_or_create_config() — confirmed by
+#     grepping the installed source; all three hits are in
+#     lmcache_get_or_create_config()'s OWN module and its ONE caller,
+#     `lmcache/integration/vllm/vllm_v1_adapter.py:498`, which backs
+#     LMCacheConnectorV1, not LMCacheMPConnector.
+#   - `lmcache/v1/multiprocess/http_server.py`'s argparse (the MP daemon's
+#     entry point — see scripts/common/start-lmcache-daemon.sh's own
+#     "ENTRY POINT" header) has no `--config-file`/YAML-loading flag of any
+#     kind; every daemon-side value comes from CLI flags
+#     (`--l1-size-gb`, `--eviction-policy`, `--chunk-size`, `--l2-adapter`,
+#     ...). `LMCACHE_CONFIG_FILE` is grep-absent from
+#     lmcache/v1/multiprocess/ and lmcache/v1/distributed/ entirely.
+#
+# scripts/common/start-vllm.sh still calls this generator and still
+# `export`s LMCACHE_CONFIG_FILE into vLLM's own process environment — this
+# was NOT removed by this change (out of this task's scope, and harmless:
+# an unread env var is inert) — but per the above, that export currently
+# does nothing on the code path this repo actually runs. If a future change
+# ever needs LMCacheConnectorV1 (the in-process, non-MP connector) instead
+# of LMCacheMPConnector, THIS is the file/env var that would start being
+# consumed again — see lmcache_get_or_create_config() above for that path's
+# real entry point.
+#
+# What this file's extra_config block IS still good for, and why it is not
+# being deleted:
+#   1. The in-process LMCacheConnectorV1 path, if this repo ever needs it
+#      again (see the note immediately above).
+#   2. scripts/common/25-validate-lmcache-config.sh's introspection checks
+#      (backend-name allowlist, extra_config key recognition) exercise the
+#      SAME installed NixlStorageConfig/nixl_storage_backend.py code this
+#      YAML targets, and remain a cheap, real regression check on THAT
+#      code path independent of which connector ends up loading the YAML.
+#   3. It documents, in one place, the same backend_params shape (trid vs.
+#      dev_uri) that scripts/common/start-lmcache-daemon.sh's
+#      --l2-adapter JSON now also emits for the path that IS live — the two
+#      are deliberately kept in the same per-backend shape so a reader
+#      diffing them sees the same fields, even though only one of the two
+#      is ever read by a running process today.
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # READ THIS BEFORE TOUCHING THIS FILE

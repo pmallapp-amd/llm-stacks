@@ -14,7 +14,7 @@
 # know start-vllm.sh takes a role argument at all.
 #
 # Starts the LMCache MP daemon FIRST (scripts/common/
-# 30-start-lmcache-daemon.sh), not just checks for it: that script is
+# start-lmcache-daemon.sh), not just checks for it: that script is
 # idempotent (no-ops with exit 0 if already running), so calling it here
 # unconditionally is strictly more convenient than failing with a pointer
 # and making the operator run a second command by hand — and
@@ -29,6 +29,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/../common/lib.sh"
 
 require_host "${PREFILL_HOST}" "prefill"
 
-"${REPO_ROOT}/scripts/common/30-start-lmcache-daemon.sh"
+"${REPO_ROOT}/scripts/common/start-lmcache-daemon.sh"
 
 exec "${REPO_ROOT}/scripts/common/start-vllm.sh" prefill "$@"

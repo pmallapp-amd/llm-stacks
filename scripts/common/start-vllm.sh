@@ -7,7 +7,7 @@
 # Node:          SMC1 (prefill) or SMC2 (decode), selected by $1.
 # Prerequisites: scripts/common/20-build-vllm-lmcache.sh; the LMCache MP
 #                daemon already running on THIS node (scripts/common/
-#                30-start-lmcache-daemon.sh); SMC3's NVMe-oF target already
+#                start-lmcache-daemon.sh); SMC3's NVMe-oF target already
 #                listening on NVMF_TRSVCID. This script refuses to start
 #                unless BOTH are reachable — see the wait_for_port gates
 #                below.
@@ -107,7 +107,7 @@ export LMCACHE_CONFIG_FILE="${LMCACHE_CFG}"
 # success. LMCACHE_MP_HOST carries a ZMQ URL scheme (e.g. "tcp://
 # 127.0.0.1") because that's what the client side needs; wait_for_port
 # wants a bare host, so the scheme is stripped here the same way
-# scripts/common/30-start-lmcache-daemon.sh strips it for the server's
+# scripts/common/start-lmcache-daemon.sh strips it for the server's
 # --host flag.
 # ─────────────────────────────────────────────────────────────────────────────
 _LMCACHE_MP_BIND_HOST="${LMCACHE_MP_HOST#tcp://}"
@@ -121,7 +121,7 @@ if ! wait_for_port "${_LMCACHE_MP_BIND_HOST}" "${LMCACHE_MP_PORT}" 30; then
         " LMCache leg is the worst failure mode here (see this script's" \
         " comment above) because the server would otherwise start" \
         " successfully and LOOK like it works. Start the daemon first:" \
-        " scripts/common/30-start-lmcache-daemon.sh"
+        " scripts/common/start-lmcache-daemon.sh"
 fi
 ok "LMCache MP daemon reachable"
 

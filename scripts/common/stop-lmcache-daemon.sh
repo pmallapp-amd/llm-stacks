@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# 31-stop-lmcache-daemon.sh — stop the LMCache MP-mode daemon on THIS node.
+# stop-lmcache-daemon.sh — stop the LMCache MP-mode daemon on THIS node.
 #
-# Node:          any node running scripts/common/30-start-lmcache-daemon.sh
+# Node:          any node running scripts/common/start-lmcache-daemon.sh
 #                (SMC1 prefill or SMC2 decode) — no require_host gate, see
 #                that script's header for why (loopback-only, per-host).
 # Prerequisites: none (safe to run even if lmcache-mp-daemon isn't running).
-# Next step:     scripts/common/30-start-lmcache-daemon.sh to restart.
+# Next step:     scripts/common/start-lmcache-daemon.sh to restart.
 #
-# usage: 31-stop-lmcache-daemon.sh [--clean-shm] [--grace-sec N]
+# usage: stop-lmcache-daemon.sh [--clean-shm] [--grace-sec N]
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -35,7 +35,7 @@ if [ "${CLEAN_SHM}" -eq 1 ]; then
     # document for the vLLM side: a killed-not-stopped process (SIGKILL,
     # OOM, crash) can leave /dev/shm/lmcache_* segments behind (this
     # daemon's --shm-name defaults to auto-allocate — see
-    # scripts/common/30-start-lmcache-daemon.sh), and a restart that
+    # scripts/common/start-lmcache-daemon.sh), and a restart that
     # reuses a stale segment whose size/generation no longer matches can
     # crash the NEW process during its own init.
     step "Removing stale /dev/shm/lmcache_* segments"
