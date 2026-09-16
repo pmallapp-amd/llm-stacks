@@ -23,7 +23,7 @@
 # somehow isn't reachable afterwards, so this is a convenience, not the
 # only thing standing between a missing daemon and a silent LMCache gap.
 #
-# usage: 03-start-decode.sh [--skip-validate]
+# usage: 03-start-decode.sh
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../common/lib.sh"

@@ -4,7 +4,7 @@
 # cross-process key AGREEMENT — exactly what P/D disaggregation requires,
 # and exactly what breaks when a caller's keys carry a per-process uuid4
 # instead of being derived purely from content (see
-# scripts/common/gen-lmcache-config.sh's "THE CONTENT-DERIVED-KEY
+# scripts/common/start-lmcache-daemon.sh's "THE CONTENT-DERIVED-KEY
 # CONSTRAINT" for the LMCache-side version of this same requirement).
 #
 # Node:          SMC1 (prefill) or SMC2 (decode). Can also run --write on

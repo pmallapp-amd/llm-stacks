@@ -83,14 +83,15 @@ described throughout the rest of this document, just invoked from the
 daemon process instead of from an in-process LMCache connector. `pool_size`
 counts `--l1-align-bytes`-sized (default 4096 B) storage slots, **not**
 LMCache chunks — a multi-MiB LMCache page tiles into many pool slots, which
-is why the default is large. A separate config surface,
-`scripts/common/gen-lmcache-config.sh`'s YAML `extra_config` block
-(`enable_nixl_storage`/`nixl_backend`/`nixl_backend_params`), looks like it
-configures the same thing and **does not** — under MP mode that YAML is not
-read by anything; it is the in-process `LMCacheConnectorV1` path's config
-surface, unused by this cluster. Mistaking one surface for the other
-produced a withdrawn conclusion in this project's history (`docs/HANDOFF.md`
-§12.1, corrected in §16) that MP mode could not reach the KV backend at all.
+is why the default is large. This `--l2-adapter` JSON is the *only* LMCache
+storage-tier config surface in this repo: an earlier, separate surface (a
+generated YAML with its own `extra_config.{enable_nixl_storage,nixl_backend,
+nixl_backend_params}` block) belonged to the in-process `LMCacheConnectorV1`
+path, which this cluster never runs, and has since been removed along with
+the rest of that path's dead config (`docs/TODO.md` §6.23). Mistaking that
+now-removed surface for this one produced a withdrawn conclusion in this
+project's history (`docs/HANDOFF.md` §12.1, corrected in §16) that MP mode
+could not reach the KV backend at all.
 
 ### 1.1 Full request flow
 
@@ -270,10 +271,11 @@ reaches a live serving test.
 > the caller: this section (and the historical incident in §2.1) was
 > written against LMCache's in-process `NixlDynamicStorageBackend` /
 > `NixlDynamicStorageAgent` (the `LMCacheConnectorV1` path, configured via
-> `nixl_pool_size: 0` in `gen-lmcache-config.sh`'s YAML). This cluster now
-> runs `LMCacheMPConnector` instead, and the caller into the plugin is the
-> MP daemon's `nixl_store` L2 adapter (§1/§2), configured via
-> `--l2-adapter` JSON, not that YAML. Whether the adapter's object-naming
+> `nixl_pool_size: 0` in a since-removed generated YAML — see
+> `docs/TODO.md` §6.23). This cluster now runs `LMCacheMPConnector`
+> instead, and the caller into the plugin is the MP daemon's `nixl_store`
+> L2 adapter (§1/§2), configured via `--l2-adapter` JSON, not that YAML.
+> Whether the adapter's object-naming
 > scheme is the same content-derived `CacheEngineKey`-based `metaInfo` this
 > section describes, or a different addressing scheme (the daemon's own
 > `get_memory_indices()`/`get_storage_indices()` machinery referenced in
@@ -320,11 +322,11 @@ pool, selected by `nixl_pool_size > 0` — names objects
 `obj_{slot}_{uuid4}[#{part}]`: a pool-slot prefix plus a `uuid4` suffix
 generated independently, and differently, by every process at startup. Two
 processes with the same prompt produce **different** object names under this
-mode, so cross-process/cross-node lookup can never succeed — this is why
-`gen-lmcache-config.sh` hard-requires `nixl_pool_size: 0` in the (now-unread
-under MP mode, see §1) YAML it still generates, and why
-`LMCACHE_NIXL_POOL_SIZE` should never be changed away from `0` if this
-cluster is ever pointed back at `LMCacheConnectorV1`.
+mode, so cross-process/cross-node lookup can never succeed — this is why the
+in-process path's now-removed YAML generator hard-required
+`nixl_pool_size: 0` (see `docs/TODO.md` §6.23), and why that value would
+need to stay `0` if this cluster were ever pointed back at
+`LMCacheConnectorV1`.
 
 ## 4. Memory-tier picture
 

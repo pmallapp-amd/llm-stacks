@@ -168,4 +168,4 @@ if [ "${rc}" -ne 0 ]; then
 fi
 
 ok "patch applied; diff recorded at ${DIFF_OUT}"
-log "next: scripts/common/25-validate-lmcache-config.sh <cfg-file>"
+log "next: scripts/common/start-lmcache-daemon.sh"

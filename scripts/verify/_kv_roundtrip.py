@@ -12,7 +12,7 @@ SAME on-wire key and find the SAME bytes.
 WHY the payload is derived from --nonce + --size rather than passed
 in-band between the two processes: LMCache's real content-derived key
 (NixlDynamicStorageAgent._format_object_key(), see
-scripts/common/gen-lmcache-config.sh's "THE CONTENT-DERIVED-KEY CONSTRAINT"
+scripts/common/start-lmcache-daemon.sh's "THE CONTENT-DERIVED-KEY CONSTRAINT"
 and, for the XNVME_KV-specific key-derivation detail,
 tmp/TOPOLOGY-KV-DATAPATH.md §4.3's "Two key namespaces" section) works
 precisely because BOTH the prefill process that stores a KV chunk and the

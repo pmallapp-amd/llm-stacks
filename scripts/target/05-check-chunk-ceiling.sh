@@ -28,8 +28,10 @@
 # operator could make for an unrelated reason — blows straight through it).
 # Re-run this check whenever MODEL, TP_SIZE, or LMCACHE_CHUNK_SIZE change.
 #
-# CRITICAL: chunk_size is part of the cache key (see gen-lmcache-config.sh
-# and make_key() in plugins/nvme-kv/spdk_nvme_kv_backend.h) — BOTH P/D
+# CRITICAL: chunk_size is part of the cache key (see the in-process
+# LMCacheConnectorV1 YAML surface's chunk_size field, removed along with
+# the rest of that path — TODO 6.23 — and make_key() in
+# plugins/nvme-kv/spdk_nvme_kv_backend.h) — BOTH P/D
 # roles MUST use the SAME LMCACHE_CHUNK_SIZE, or the receiver derives a
 # DIFFERENT key and silently re-prefills instead of hitting the remote
 # cache. This script only validates one side's arithmetic; it does not (and

@@ -1475,6 +1475,30 @@ lives only in that daemon's memory. So the store is **slot-addressed, not
 content-addressed**: a daemon cannot discover a key it did not itself
 write, and the mapping dies with the process.
 
+**Sharpened after the fact — the real constraint is stronger than "the
+index is in memory."** The object names themselves are per-process random.
+`nixl_store_l2_adapter.py:407` builds every storage key as
+
+```python
+key = f"obj_{i}_{uuid.uuid4().hex[0:4]}"
+```
+
+— slot index plus a fresh `uuid4` drawn independently by EVERY daemon at
+startup. Prefill's and decode's names for byte-identical content therefore
+share nothing but the `obj_{i}_` prefix, so the receiver cannot guess the
+writer's suffix. No index-keeping, no existence probe and no plugin change
+can bridge that; it is impossible by construction, not merely unimplemented.
+And there is no escape hatch on this adapter the way there was in-process
+(`pool_size == 0` selecting the content-keyed `NixlDynamicStorageBackend`):
+the MP adapter validates `pool_size` as **"required, >0"**
+(`nixl_store_l2_adapter.py:~1160`), so the static, uuid-suffixed naming is
+the only behaviour available under `nixl_store`.
+
+The full statement of this, with the in-process history it came from, is
+kept in `scripts/common/start-lmcache-daemon.sh` under "THE
+CONTENT-DERIVED-KEY CONSTRAINT" — relocated there when the in-process YAML
+generator that used to hold it was deleted (6.23).
+
 Consequence, and it is architectural rather than a bug to fix here:
 
 - Within one daemon lifetime the L2 tier is a genuine capacity extension
@@ -1546,3 +1570,44 @@ whether the wedge is load-rate or total-bytes triggered, since that
 decides whether widening the pipeline helps or just reaches the wedge
 sooner; (c) raise with the DSC vendor with the stall log above — this is
 DPU-side behaviour, not something the plugin can resolve.
+
+### 6.23 The in-process LMCacheConnectorV1 config surface is removed
+
+The `LMCacheConnectorV1` (in-process) connector path itself was already
+deleted in an earlier change — this repo has run exactly one composition,
+`MultiConnector[NixlConnector, LMCacheMPConnector]` (MP mode), throughout
+6.1-6.22 above. What survived that earlier deletion was its now-dead
+**config** surface: `scripts/common/gen-lmcache-config.sh` (generated an
+LMCache YAML per role), the `LMCACHE_CONFIG_FILE` env var
+`scripts/common/start-vllm.sh` exported pointing at it,
+`LMCACHE_LOCAL_CPU` (`config/cluster.env`, consumed only by that
+generator), and `start-vllm.sh`'s `--skip-validate` flag (gated running
+that YAML through the validator). None of it was reachable from MP mode,
+so this removes all of it:
+
+- `scripts/common/gen-lmcache-config.sh` — deleted.
+- `scripts/common/start-vllm.sh` — no longer generates, validates, or
+  exports a YAML; `--skip-validate` removed (its arg-parsing loop still
+  `die`s on any unrecognized argument).
+- `scripts/common/25-validate-lmcache-config.sh` — the YAML-validation
+  mode (bare `<path-to-lmcache.yaml>` positional argument) removed; the
+  `--l2-adapter-json <JSON>` mode (validates `start-lmcache-daemon.sh`'s
+  live config surface) is untouched and remains the only mode.
+- `config/cluster.env` — `LMCACHE_LOCAL_CPU` removed.
+- `scripts/{prefill,decode}/03-start-*.sh` — `[--skip-validate]` dropped
+  from their `# usage:` lines (they just forward `"$@"`).
+
+**Evidence this surface was dead**, verified directly against the
+installed lmcache 0.5.3 (not re-litigated here — see the task that made
+this change for the full grep/read trail):
+`lmcache/integration/vllm/lmcache_mp_connector.py`
+(`LMCacheMPConnector` itself) never reads `LMCACHE_CONFIG_FILE` — it reads
+everything it needs from `kv_transfer_config.extra_config`, which
+`scripts/common/gen-kv-transfer-config.sh` emits. `LMCACHE_CONFIG_FILE` is
+read only by `lmcache/integration/vllm/utils.py` (the in-process path,
+never instantiated by this repo),
+`lmcache/integration/tensorrt_llm/utils.py` (irrelevant here), and
+`lmcache/v1/config.py` (the loader itself) — none of which sit on the path
+this repo's MP daemon runs. The live storage-tier config surface is, and
+remains, `scripts/common/start-lmcache-daemon.sh`'s `--l2-adapter <JSON>`
+flag — unmodified by this change.

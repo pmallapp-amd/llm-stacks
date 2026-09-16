@@ -13,17 +13,15 @@
 #                below.
 # Next step:     scripts/proxy/start-proxy.sh once both roles are up.
 #
-# usage: start-vllm.sh <prefill|decode> [--skip-validate]
+# usage: start-vllm.sh <prefill|decode>
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ROLE="${1:-}"
 shift || true
-SKIP_VALIDATE=0
 for arg in "$@"; do
     case "${arg}" in
-        --skip-validate) SKIP_VALIDATE=1 ;;
         *) die "unknown argument: ${arg}" ;;
     esac
 done
@@ -71,26 +69,6 @@ setup_pd_env "${ROLE}"
 require_rdma_access "${UCX_NET_DEVICES:-}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Generate + validate the LMCache config for this role.
-# ─────────────────────────────────────────────────────────────────────────────
-LMCACHE_CFG="${STACK_ROOT}/etc/lmcache-${ROLE}.yaml"
-"${REPO_ROOT}/scripts/common/gen-lmcache-config.sh" "${ROLE}" "${LMCACHE_CFG}"
-
-if [ "${SKIP_VALIDATE}" -eq 1 ]; then
-    warn "LMCache config validation SKIPPED (--skip-validate) — you are" \
-         " trusting gen-lmcache-config.sh's assumptions with no proof the" \
-         " installed LMCache actually accepts them. Only use this for" \
-         " debugging the validator itself."
-else
-    "${REPO_ROOT}/scripts/common/25-validate-lmcache-config.sh" "${LMCACHE_CFG}" \
-        || die "LMCache config validation failed for ${LMCACHE_CFG}." \
-               " Fix the reported keys/backend-allowlist issue, or pass" \
-               " --skip-validate to override (NOT recommended — see this" \
-               " script's header comment on what that trades away)."
-fi
-export LMCACHE_CONFIG_FILE="${LMCACHE_CFG}"
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Refuse to start unless the LMCache MP daemon is actually reachable.
 #
 # WHY this is a hard gate, not a warning: LMCacheMPConnector talks to the
@@ -131,8 +109,9 @@ ok "LMCache MP daemon reachable"
 # per-backend case below.
 #
 # WHY this is a hard gate, not a warning: LMCache's NIXL storage backend is
-# one of several storage tiers (local_cpu is another, and it's on by
-# default — see LMCACHE_LOCAL_CPU). If SMC3 is unreachable, LMCache does NOT
+# one of several storage tiers (the daemon's L1 in-DRAM tier is another,
+# and it's always live — see LMCACHE_MAX_LOCAL_CPU_SIZE / the daemon's
+# --l1-size-gb, config/cluster.env). If SMC3 is unreachable, LMCache does NOT
 # fail to start; it just never successfully constructs the NIXL backend
 # path, and every store/retrieve silently falls back to whatever local tiers
 # ARE configured. A vLLM server that starts fine, answers /health, and

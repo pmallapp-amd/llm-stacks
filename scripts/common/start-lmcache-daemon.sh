@@ -98,12 +98,14 @@
 # add_l2_adapters_args()/parse_args_to_l2_adapters_config(), wired into
 # add_storage_manager_args() at lmcache/v1/distributed/config.py:524) — NOT
 # via the extra_config.{enable_nixl_storage,nixl_backend,nixl_backend_params}
-# keys scripts/common/gen-lmcache-config.sh's YAML emits. Those keys belong
-# to the in-process LMCacheConnectorV1/StorageManager path
-# (lmcache/v1/storage_backend/nixl_storage_backend.py) and are silently
-# IGNORED here — nixl_store_l2_adapter.py never reads extra_config at all.
-# See gen-lmcache-config.sh's own header for the corrected statement of
-# which surface applies where; do not resurrect §12.1's withdrawn inference
+# keys the in-process LMCacheConnectorV1 YAML surface emits (removed, see
+# TODO 6.23). Those keys belong to the in-process LMCacheConnectorV1/
+# StorageManager path (lmcache/v1/storage_backend/nixl_storage_backend.py)
+# and are silently IGNORED here — nixl_store_l2_adapter.py never reads
+# extra_config at all. That in-process surface's own header carried the
+# corrected statement of which surface applies where, before it was removed
+# with the rest of that path (TODO 6.23); do not resurrect §12.1's withdrawn
+# inference
 # that MP mode cannot reach XNVME_KV/SPDK_NVMe_KV at all.
 #
 # We use the STATIC "nixl_store" adapter type
@@ -130,14 +132,64 @@
 # backend_params is forwarded VERBATIM to
 # nixl_agent.create_backend(backend, backend_params)
 # (nixl_store_l2_adapter.py:201) — the same NIXL plugin init path
-# gen-kv-transfer-config.sh's NixlConnector side and gen-lmcache-config.sh's
-# in-process YAML both use. Each plugin's C++ constructor prefers an env var
+# gen-kv-transfer-config.sh's NixlConnector side and the in-process
+# LMCacheConnectorV1 YAML surface (removed, see TODO 6.23) both use. Each
+# plugin's C++ constructor prefers an env var
 # over this dict over its own compiled-in default (verified directly in
 # plugins/xnvme-kv/xnvme_kv_backend.cpp:508-520 for XNVME_KV's "dev_uri" and
 # plugins/nvme-kv/spdk_nvme_kv_backend.cpp:602-611 for SPDK's "trid"), so
 # calling setup_nixl_kv_env below (which exports NIXL_XNVME_DEV/NIXL_KV_TRID)
 # and ALSO putting the same resolved value in backend_params is
 # defense-in-depth, not two competing sources of truth.
+#
+# ───────────────────────────────────────────────────────────────────────────
+# THE CONTENT-DERIVED-KEY CONSTRAINT — why this tier CANNOT be shared
+# between nodes or across a restart. Relocated here 2026-09-16 from the
+# in-process LMCacheConnectorV1 YAML surface, which was deleted along with
+# the rest of that config path (TODO 6.23). It was written about the
+# in-process backend's nixl_pool_size; the MP adapter this script actually
+# configures turns out to behave the SAME WAY, for the same reason, and the
+# note is load-bearing enough that losing it with the file would have been a
+# real regression. Restated below against the MP adapter, with the evidence
+# re-measured on the INSTALLED lmcache 0.5.3.
+#
+# The in-process backend chose between two implementations on pool_size:
+#   pool_size == 0 -> NixlDynamicStorageBackend — CONTENT-derived keys
+#                     (_format_object_key() hashes the CacheEngineKey:
+#                     model + chunk-hash + token content, i.e. the SAME
+#                     bytes in every process that sees the same prefix).
+#   pool_size  > 0 -> NixlStaticStorageBackend  — a pool of PRE-ALLOCATED
+#                     slot names carrying a per-process random uuid4.
+#
+# The MP static adapter ("nixl_store", the one this script emits) is the
+# second kind, and it is NOT optional here: pool_size is validated as
+# "required, >0" (nixl_store_l2_adapter.py:~1160), so there is no pool_size=0
+# escape hatch to the content-derived behaviour on this path. Its object
+# names are built at nixl_store_l2_adapter.py:407 as
+#
+#     key = f"obj_{i}_{uuid.uuid4().hex[0:4]}"
+#
+# — slot index plus a fresh uuid4 generated independently by EVERY daemon
+# process at startup. So prefill's and decode's names for byte-identical
+# cached content share nothing but the "obj_{i}_" prefix, and no amount of
+# index-keeping, existence-probing or plugin work can bridge that: the
+# receiver cannot guess the uuid4 the writer happened to draw. This is the
+# measured root cause behind TODO 6.21 (prefill stored 238,903 objects /
+# 978 MB; a restarted decode handed the identical prompt recomputed all of
+# it at 0.0% external hit rate), and it is why restoring the plugin's
+# queryMem() override — correct and worth keeping on its own terms — did not
+# and could not change that result.
+#
+# Consequence to design against, not to "fix" by flipping a value: under
+# this adapter the L2/KV tier is a per-daemon CAPACITY extension (spill past
+# L1), never a shared cache. Cross-node KV movement is the P→D NixlConnector
+# handoff's job. The content-keyed alternative is the separate
+# "nixl_store_dynamic" adapter (nixl_store_dynamic_l2_adapter.py, registered
+# at :871) — rejected here because it is file-oriented: it requires
+# backend_params["file_path"], does os.makedirs(), and registers
+# mem_type="FILE", none of which suits a KV-keyed NVMe device. Revisit only
+# with a measurement.
+# ───────────────────────────────────────────────────────────────────────────
 #
 # pool_size counts --l1-align-bytes-sized (default 4096 B — NOT overridden
 # by this script) storage slots, ONE PER RAW L1 PAGE, never one per LMCache
@@ -237,7 +289,8 @@ fi
 # setup_nixl_kv_env (lib.sh) needs a literal prefill|decode role — not because
 # the L2 adapter's behavior actually differs by role here (kv_slot_offset is
 # a documented no-op under the OBJ/metaInfo path both backends take, same as
-# gen-lmcache-config.sh's in-process YAML — see that generator's comment),
+# the in-process LMCacheConnectorV1 YAML surface's own comment noted before
+# that surface was removed, see TODO 6.23),
 # but because the function's own signature requires it and, for XNVME_KV,
 # resolving+validating XNVME_DEV by subsystem NQN (lib.sh's
 # resolve_xnvme_kv_dev, including its ng0n1-boot-drive guard) is real safety
@@ -264,9 +317,10 @@ fi
 setup_nixl_kv_env "${_ROLE}"
 
 # --l1-align-bytes is deliberately NOT overridden below — every reference
-# this repo has (the vendor's own docker-compose.storage.yml, and this
-# repo's own gen-lmcache-config.sh's KV_MAX_VALUE_SIZE_EFFECTIVE headroom
-# reasoning) leaves it at the built-in default (4096 B), and the
+# this repo has (the vendor's own docker-compose.storage.yml, and the
+# in-process LMCacheConnectorV1 YAML surface's own KV_MAX_VALUE_SIZE_EFFECTIVE
+# headroom reasoning, before that surface was removed — TODO 6.23) leaves it
+# at the built-in default (4096 B), and the
 # "L2 (KV STORAGE) TIER" comment above shows why that default keeps
 # mem_split_n=1 for both backends. LMCACHE_L2_POOL_SIZE's default is the
 # vendor's own tested value — see that same comment.
@@ -277,8 +331,9 @@ case "${_ROLE}" in
     decode)  _SLOT_OFFSET="${KV_SLOT_OFFSET_DECODE}"  ;;
 esac
 
-# Matches gen-lmcache-config.sh's own KV_BACKEND branching — both arms it
-# supports are supported here too. backend_params keys per backend are
+# Matches the in-process LMCacheConnectorV1 YAML surface's own KV_BACKEND
+# branching (removed, see TODO 6.23) — both arms it supported are supported
+# here too. backend_params keys per backend are
 # exactly what each plugin's getParams() advertises (plugins/xnvme-kv/
 # xnvme_kv_plugin.cpp, plugins/nvme-kv/spdk_nvme_kv_plugin.cpp) — see the
 # header comment above for why setup_nixl_kv_env's env vars, not this JSON,

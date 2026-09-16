@@ -260,17 +260,14 @@ scripts/
     10-build-stack.sh        Build UCX + NIXL + both NIXL plugins (SMC1/SMC2); requires 05- first.
     20-build-vllm-lmcache.sh Venv with pinned vLLM + LMCache + NIXL python bindings (SMC1/SMC2).
     25-validate-lmcache-config.sh
-                             Introspects the INSTALLED LMCache to prove a generated YAML is
-                             actually accepted (not just well-formed).
+                             Introspects the INSTALLED LMCache to prove a --l2-adapter JSON spec
+                             (start-lmcache-daemon.sh's, below) is actually accepted (not just
+                             well-formed) — the live, and only, LMCache storage-tier config
+                             surface this repo runs.
     gen-kv-transfer-config.sh
                              Emits the fixed --kv-transfer-config JSON for one role: always
                              MultiConnector[NixlConnector, LMCacheMPConnector], NixlConnector
                              always child[0] — no longer configurable, see Architecture above.
-    gen-lmcache-config.sh    Emits the LMCache YAML for one role (prefill|decode). Under MP mode
-                             its extra_config.{enable_nixl_storage,nixl_backend,...} block is NOT
-                             consumed — that surface belongs to the (unused) in-process
-                             LMCacheConnectorV1 path; the storage tier's real config is
-                             start-lmcache-daemon.sh's --l2-adapter JSON, below.
     start-vllm.sh            Shared body that launches vLLM+LMCache for a role; exec'd by
                              scripts/prefill/03-start-prefill.sh and scripts/decode/03-start-decode.sh.
                              Refuses to start unless the LMCache MP daemon (below) and SMC3 are
@@ -564,11 +561,12 @@ negative result.
    static `.patch` file — see `patches/lmcache/README.md`'s explicit
    VERIFIED-vs-ASSUMED section for exactly which parts of this are confirmed
    against real LMCache source and which are best-effort.
-3. **LMCache's config YAML key names are not a stable contract across
-   versions.** `scripts/common/gen-lmcache-config.sh` targets `LMCACHE_VERSION=0.5.4`
-   specifically; `scripts/common/25-validate-lmcache-config.sh` exists
-   precisely because a config can load cleanly and still silently never
-   reach the NIXL storage backend on a different installed version.
+3. **LMCache's `--l2-adapter` JSON key names are not a stable contract
+   across versions.** This repo targets `LMCACHE_VERSION=0.5.4` specifically
+   (`scripts/common/20-build-vllm-lmcache.sh`); `scripts/common/
+   25-validate-lmcache-config.sh --l2-adapter-json` exists precisely because
+   an adapter spec can parse cleanly and still silently never reach the
+   NIXL storage backend on a different installed version.
 4. **No restart-survival or cross-process value sharing for a caller that
    never sets `metaInfo`** — see `plugins/nvme-kv/spdk_nvme_kv_backend.h`'s
    `make_key()` comment. `kv_io.py`/`nixlbench`-style tooling that calls the

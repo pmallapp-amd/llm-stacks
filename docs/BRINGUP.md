@@ -566,7 +566,7 @@ Expected final output:
 ```
 ok  vLLM + LMCache + NIXL bindings verified importable
 ok  wrote /opt/kvstack/etc/env.sh
-    next: scripts/common/gen-lmcache-config.sh <prefill|decode> <output-path>
+    next: scripts/common/start-lmcache-daemon.sh
 ```
 
 ### §6.2 Apply the LMCache backend-allowlist patch
@@ -600,59 +600,44 @@ found` — the installed LMCache version has moved this logic; see
 `patches/lmcache/README.md`'s "What is ASSUMED" section and
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#assertionerror-on-the-lmcache-nixl-backend-name).
 
-### §6.3 Generate + validate the config
+### §6.3 Validate the LMCache storage-tier config (optional, standalone)
 
-Config generation itself is normally handled automatically by
-`scripts/common/start-vllm.sh` (§7), but you can run it standalone to
-inspect the file before starting anything:
+Config validation is normally handled automatically by
+`scripts/common/start-lmcache-daemon.sh` (§7.1): it builds a `--l2-adapter`
+JSON spec from `config/cluster.env` (`KV_BACKEND`/`XNVME_DEV`/`KV_TRID`) and
+validates that spec **before** ever spawning the daemon. To inspect the
+same check standalone — e.g. to re-verify after an LMCache upgrade, without
+starting anything:
 
 ```bash
-scripts/common/gen-lmcache-config.sh prefill /opt/kvstack/etc/lmcache-prefill.yaml
-scripts/common/25-validate-lmcache-config.sh /opt/kvstack/etc/lmcache-prefill.yaml
+scripts/common/25-validate-lmcache-config.sh --l2-adapter-json \
+  '{"type":"nixl_store","backend":"XNVME_KV","backend_params":{"dev_uri":"/dev/ng1n1"},"pool_size":2000000}'
 ```
 
-`gen-lmcache-config.sh` writes `nixl_pool_size: 0` (selects LMCache's
-content-derived-key `NixlDynamicStorageBackend` — see
-`ARCHITECTURE.md` §3; **never** change this away from 0 on this cluster),
-`nixl_backend: "${KV_BACKEND}"` (`XNVME_KV` by default), and
-`nixl_backend_params` sourced straight from `config/cluster.env`.
+This parses the JSON with the SAME installed
+`lmcache.v1.distributed.l2_adapters.config` classes the daemon itself uses
+(`get_l2_adapter_config_class()`/`<ConfigClass>.from_dict()`), so a typo'd
+key or an unregistered adapter `type` fails here instead of 30s into a
+daemon start, and it also confirms `validate_nixl_backend()`/the OBJ
+mem_type check both accept `${KV_BACKEND}` (i.e. that §6.2's patch actually
+took) by cross-checking against a throwaway `nixl_agent`'s live
+`get_plugin_params("${KV_BACKEND}")`.
 
-> **This YAML's `extra_config` block (`enable_nixl_storage`, `nixl_backend`,
-> `nixl_backend_params`) is generated, validated — and then IGNORED at
-> runtime.** This cluster runs `LMCacheMPConnector` (MP mode: LMCache is a
-> separate host process, §7.1 below), and under MP mode nothing reads this
-> YAML's `extra_config` at all — that surface belongs to the in-process
-> `LMCacheConnectorV1` path, which this cluster does not use. **The KV
-> storage tier is actually attached daemon-side**, via
-> `scripts/common/start-lmcache-daemon.sh`'s `--l2-adapter <JSON>` flag (see
-> §7.1) — editing `nixl_backend`/`nixl_backend_params` here changes nothing
-> about which storage tier a running daemon uses. This file remains worth
-> generating and validating anyway: it's the same per-backend
-> (`trid`/`dev_uri`) shape the daemon's `--l2-adapter` JSON also uses, and
-> `25-validate-lmcache-config.sh`'s introspection checks below exercise the
-> same installed `NixlStorageConfig`/allowlist code path regardless of which
-> connector ends up reading it. See
-> [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#lmcache-mp-daemon-up-but-the-storage-tier-never-attaches)
-> if you find yourself editing this YAML expecting the storage tier to
-> change — it won't.
-
-`25-validate-lmcache-config.sh` introspects the **installed** LMCache's
-actual source (via `inspect.getsource`, not a hardcoded assumption) to prove
-every key in the generated YAML is both recognized and routed to the NIXL
-storage backend, and that `validate_nixl_backend()`/the OBJ mem_type check
-both now accept `${KV_BACKEND}` (i.e. that §6.2's patch actually took). It
-also constructs a throwaway `nixl_agent` and echoes back the **live**
-plugin's `get_plugin_params("${KV_BACKEND}")` so you can eyeball it against
-what's in the YAML. The same script also has a second, unrelated mode —
-`25-validate-lmcache-config.sh --l2-adapter-json <JSON>` — that validates a
-daemon `--l2-adapter` spec directly against the installed adapter classes in
-about a second, instead of finding out it's malformed 30s into a daemon
-start; `start-lmcache-daemon.sh` (§7.1) calls this automatically.
-
-Expected final line: `PASS: all generated keys are recognized by the
-installed LMCache.` Any `FAIL`/`IGNORED` line above that must be resolved
-before starting vLLM — see
+Expected final line: `PASS: --l2-adapter-json validated against installed
+LMCache.` Any `FAIL` above that must be resolved before starting the daemon
+— see
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#assertionerror-on-the-lmcache-nixl-backend-name).
+
+> **There is no separate LMCache config file for this cluster.** This
+> cluster runs `LMCacheMPConnector` (MP mode: LMCache is a separate host
+> process, §7.1 below); the KV storage tier is configured entirely by the
+> `--l2-adapter <JSON>` spec above, built fresh by `start-lmcache-daemon.sh`
+> every time it starts. An earlier, separate config surface — a generated
+> YAML with its own `extra_config.{enable_nixl_storage,nixl_backend,
+> nixl_backend_params}` block — belonged to the in-process
+> `LMCacheConnectorV1` path, which this cluster never runs; that generator
+> and its YAML have been removed along with the rest of that path's dead
+> config (`docs/TODO.md` §6.23).
 
 ## §7 Start prefill, decode, proxy
 
@@ -712,10 +697,8 @@ calls `scripts/common/start-lmcache-daemon.sh` (§7.1 — idempotent, so this
 is a convenience, not the only thing that starts it), then `exec`s
 `scripts/common/start-vllm.sh prefill`. That shared script, in order:
 sources `${STACK_ROOT}/etc/env.sh`, calls `setup_nixl_kv_env prefill` and
-`setup_ucx_env` (from `lib.sh`), generates + validates the LMCache config
-for this role (pass `--skip-validate` only for debugging the validator
-itself — **not recommended**, see the script's own warning), **refuses to
-start unless the LMCache MP daemon is reachable at
+`setup_ucx_env` (from `lib.sh`), **refuses to start unless the LMCache MP
+daemon is reachable at
 `LMCACHE_MP_HOST:LMCACHE_MP_PORT` within 30s** (a hard gate — see the
 script's comment on why a silently-absent LMCache leg, not a failure to
 start, is the worst outcome here), **and refuses to start unless SMC3's

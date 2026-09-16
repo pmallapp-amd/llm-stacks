@@ -4,7 +4,7 @@
 # Node:          SMC1 (prefill), SMC2 (decode).
 # Prerequisites: scripts/common/10-build-stack.sh has completed (NIXL_PREFIX
 #                populated, plugins installed).
-# Next step:     scripts/common/gen-lmcache-config.sh, then
+# Next step:     scripts/common/start-lmcache-daemon.sh, then
 #                scripts/prefill/03-start-prefill.sh /
 #                scripts/decode/03-start-decode.sh.
 #
@@ -156,4 +156,4 @@ export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False"
 EOF
 ok "wrote ${STACK_ROOT}/etc/env.sh"
 
-log "next: scripts/common/gen-lmcache-config.sh <prefill|decode> <output-path>"
+log "next: scripts/common/start-lmcache-daemon.sh"

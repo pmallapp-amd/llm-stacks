@@ -27,7 +27,8 @@ elements are themselves bare strings, it's a flat allowlist: append
 bracketed (tuples/lists), it's a collection-of-combinations (e.g.
 (backend, device) pairs, consistent with the "Invalid NIXL backend & device
 combination" assertion text this repo has already observed and recorded in
-scripts/common/gen-lmcache-config.sh) — clone every matching row, swapping
+patches/lmcache/README.md's "What is VERIFIED vs. what is ASSUMED" section)
+— clone every matching row, swapping
 only the first string in the row for "SPDK_NVMe_KV" or "XNVME_KV" and
 appending the clones as new top-level elements of the OUTER bracket. Skip
 (don't double-patch) any bracket that already contains the substring

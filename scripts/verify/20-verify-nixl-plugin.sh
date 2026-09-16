@@ -135,8 +135,8 @@ fi
 # scripts/common/25-validate-lmcache-config.sh's "live NIXL plugin
 # introspection" section — VERIFIED against a real install by a prior agent.
 # create_backend(name, params) is named consistently across this repo's
-# comments (scripts/common/gen-lmcache-config.sh, plugins/nvme-kv/*.cpp) as
-# what NIXL/LMCache calls to dlopen+construct a backend. Both are used here
+# comments (scripts/common/start-lmcache-daemon.sh, plugins/nvme-kv/*.cpp)
+# as what NIXL/LMCache calls to dlopen+construct a backend. Both are used here
 # exactly as elsewhere in this repo. If a given NIXL build's python binding
 # names differ, this heredoc fails with a specific AttributeError naming the
 # missing call — loudly and precisely, not silently mis-verifying success.

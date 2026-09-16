@@ -11,18 +11,35 @@ of NIXL backend names inside
    `nixl_backend` is one of a fixed set of upstream-known names (observed in
    this codebase's own introspection as roughly `GDS`/`GDS_MT`/`OBJ` (cpu or
    cuda) and `POSIX`/`HF3FS`/`AZURE_BLOB`/`DOCA_MEMOS` (cpu only) — see
-   `scripts/common/gen-lmcache-config.sh`'s "THE BACKEND-ALLOWLIST RISK"
-   section, which is where this project's own prior investigation of this
-   exact function is recorded). `SPDK_NVMe_KV` and `XNVME_KV` are not in
-   that list.
+   the "THE BACKEND-ALLOWLIST RISK" section of the in-process
+   LMCacheConnectorV1 YAML generator, where this project's own prior
+   investigation of this exact function was recorded, before that whole
+   surface was removed — TODO 6.23). `SPDK_NVMe_KV` and `XNVME_KV` are not
+   in that list.
+
+   > **Superseded on the path this repo actually runs (measured 2026-09-16).**
+   > `validate_nixl_backend()` belongs to the **in-process**
+   > `LMCacheConnectorV1`/`NixlStorageBackend` path, which this repo no
+   > longer configures at all. The MP daemon's `nixl_store` L2 adapter keeps
+   > its own separate allowlist, and in the installed lmcache 0.5.3 that one
+   > **already contains both KV backends**:
+   > `_VALID_NIXL_BACKENDS = (GDS, GDS_MT, POSIX, AIS_MT, HF3FS, OBJ,
+   > AZURE_BLOB, SPDK_NVMe_KV, XNVME_KV)`, with `_FILE_BACKENDS`
+   > deliberately excluding both so they route as `mem_type="OBJ"`
+   > (`nixl_store_l2_adapter.py:1056-1067`). The daemon has been brought up
+   > and has stored ~1.16 GB through `XNVME_KV` with **no LMCache patch
+   > applied**. Treat the patches below as required only if something
+   > reintroduces the in-process path.
 2. **`NixlDynamicStorageAgent.__init__`** — separately decides the NIXL
    `mem_type` to use for a backend by a second hardcoded name check
    (`backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS")` -> `OBJ` mem_type,
    else -> `FILE` mem_type). `SPDK_NVMe_KV`/`XNVME_KV` fall into the `FILE`
    branch there too.
 
-Unpatched, a deployment configured with `nixl_backend: "SPDK_NVMe_KV"` (see
-`scripts/common/gen-lmcache-config.sh`) hits one of two failure modes:
+Unpatched, a deployment configured with `nixl_backend: "SPDK_NVMe_KV"` (a key
+of the in-process LMCacheConnectorV1 YAML surface, removed — TODO 6.23; the
+MP daemon spells the same choice as `"backend"` inside its `--l2-adapter`
+JSON) hits one of two failure modes:
 
 - **Loud failure**: `validate_nixl_backend()` raises
   `AssertionError: Invalid NIXL backend & device combination` the first time
@@ -171,7 +188,8 @@ source in front of them):
   introspectable in whatever LMCache version was installed when that script
   was written.
 - The failure message text `AssertionError: Invalid NIXL backend & device
-  combination`, quoted verbatim in `scripts/common/gen-lmcache-config.sh`.
+  combination`, quoted verbatim in this file and in
+  `patches/lmcache/_patch_engine.py`.
   This specific wording implies the real assertion is checking a
   **(backend, device) pair**, not a bare backend name — i.e. the allowlist
   is plausibly a collection of 2-tuples (`("GDS", "cuda")`,
