@@ -20,7 +20,7 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 2 | 0 |
 | 4 | Open items and known limitations | 6 | 0 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 20 | 12 | 6 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 21 | 12 | 6 |
 
 **Read [HANDOFF §9](HANDOFF.md#9-how-to-resume) first** — it carries the
 cluster state as handed over and the ordered plan. This block is the index.
@@ -36,12 +36,20 @@ Both compute nodes were handed over freshly rebooted with **0 GPUs** — TODO
 **Two independent tracks, neither blocking the other.**
 
 *Track A — 6.10, the storage tier.* The last item in §6 and the project's
-original goal. **Blocked by 6.18**, not by anything in this repo. Everything
-else is worked out; recipe at HANDOFF §12.7. The correction that matters:
-the composition is `MultiConnector[NixlConnector, **LMCacheConnectorV1**]` —
-**not** `LMCacheMPConnector`, which this repo's architecture has named since
-day one and which cannot reach the NIXL storage backend at all, silently
-ignoring its config (HANDOFF §12.1).
+original goal. **MAJOR CORRECTION, 2026-09-16 (HANDOFF §16): the previous
+entry here was wrong.** The composition is
+`MultiConnector[NixlConnector, **LMCacheMPConnector**]` — matching this
+repo's architecture since day one and its own
+`gen-kv-transfer-config.sh` — **not** `LMCacheConnectorV1`.
+`LMCacheMPConnector` reaches XNVME_KV through the distributed L2-adapter
+path (`nixl_store_l2_adapter.py`); HANDOFF §12.1's conclusion that it
+"cannot reach the NIXL storage backend at all" is withdrawn. Recipe at
+HANDOFF §12.7 (also corrected). **Previously recorded as blocked by 6.18**
+(the shared `smc3` target). **That may no longer apply**: both `smc1` and
+`smc2` have their own local Pensando DSC (`/dev/ng1n1`), and a local-DSC
+XNVME_KV tier would not need `smc3` at all — unproven, nothing deployed
+yet, see HANDOFF §16.8. Re-evaluate before treating 6.18 as the only path
+forward.
 
 *Track B — §3, RDMA acceptance.* **Firmware updated 2026-09-16 — routing is
 now CLOSED and cross-node RDMA is measured for the first time.** Static
@@ -850,6 +858,22 @@ otherwise.*
          `lmcache server` daemon that runs nowhere on this cluster. **Use
          `LMCacheConnectorV1`** — in-process, no daemon, and the only
          connector that reaches the NIXL storage backend.
+
+         **CORRECTED 2026-09-16, HANDOFF §16 — this conclusion is WRONG.**
+         `LMCacheMPConnector` reaches the same backend through a route
+         this session never checked: the distributed L2-adapter path
+         (`nixl_store_l2_adapter.py`), which routes `XNVME_KV` to
+         `mem_type="OBJ"` exactly as §12.2 required, with `mem_split_n`
+         written specifically for MP-mode chunk sizes against a KV
+         backend. The `extra_config` keys above genuinely are ignored
+         under MP — that observation was right — but the config surface
+         MP actually uses is `kv_connector_extra_config:
+         {"lmcache.mp.host", "lmcache.mp.port"}`, with the backend
+         configured on a separate daemon process that the vendor ships as
+         a compose service, not something absent from this cluster by
+         design. **Use `LMCacheMPConnector`, not `LMCacheConnectorV1`** —
+         see HANDOFF §16 for the corrected recipe and the vendor
+         reference that runs it.
       2. **`MultiConnector` is safe to wrap leg A in.** It never inspects
          child `kv_role`s, passes the request object to children by
          reference, and merges response `kv_transfer_params` with a
@@ -1249,3 +1273,21 @@ otherwise.*
       — the BMC (`DECODE_BMC` in the creds file) and its event log are the
       next place to look. *Blocks any long-running work on decode,
       including 6.10 and all of §3.*
+- [ ] **6.21** 🔴 **HARD WARNING — never launch the vendor's
+      `deploy-xnvme.sh` on `smc1`/`smc2` without overriding
+      `AIC_XNVME_DEV`.** The script defaults `AIC_XNVME_DEV=/dev/ng0n1`.
+      **On both nodes `/dev/ng0n1` is the OS boot drive**
+      (Micron_7450_MTFDKBA800TFS, 800 GB, carrying partitions
+      `nvme0n1p1`/`nvme0n1p2`), not a KV device. The real local Pensando
+      DSC is `/dev/ng1n1` (`PDSNVME-00`, model `PDSNVME`). Running the
+      reference with its default would point XNVME_KV writes at the root
+      disk. **Always set `AIC_XNVME_DEV=/dev/ng1n1` explicitly on these
+      two nodes.** See HANDOFF §16.7.
+
+      Also note, not a blocker: `nvme id-ns /dev/ng1n1` reports `nsze =
+      0x200000` blocks at `lbads 9` (512 B) = **1 GiB** — small for a KV
+      tier, flag as a sizing question to confirm before relying on it.
+      `nvme list` shows "0.00 B / 0.00 B" for this device only because
+      `nuse=0` (unused) — do not read that as an absent namespace.
+      Ties to the newly-available local-DSC option for Track A (6.10,
+      HANDOFF §16.8).

@@ -628,12 +628,21 @@ non-zero. That is the §11 result. Anything less is not a baseline.
 Then pick one of two independent tracks. They do not block each other.
 
 **Track A — the storage tier (TODO 6.10).** The last item in §6, and the
-original goal of the project. *Blocked by 6.18* — it needs our KV
-subsystem back on `smc3`. Everything else is worked out: the exact
-launch recipe is at **§12.7**, and note the correction that matters —
-the composition is `MultiConnector[NixlConnector, **LMCacheConnectorV1**]`,
-**not** `LMCacheMPConnector`, which cannot reach the NIXL storage backend
-at all and silently ignores its config (§12.1).
+original goal of the project. Previously recorded as *blocked by 6.18* —
+needing our KV subsystem back on the shared `smc3` target. **That may no
+longer be the only path — both `smc1` and `smc2` have their own local
+DSC (`/dev/ng1n1`), and a local-DSC XNVME_KV tier does not need `smc3` at
+all. Unproven, nothing deployed or measured yet — evaluate before
+assuming 6.18 still gates this track. See §16.8.**
+
+The exact launch recipe is at **§12.7**, corrected: the composition is
+`MultiConnector[NixlConnector, **LMCacheMPConnector**]` — matching what
+this repo's scripts have emitted all along
+(`scripts/common/gen-kv-transfer-config.sh`) — **not**
+`LMCacheConnectorV1`. §12.1's conclusion that MP "cannot reach the NIXL
+storage backend at all" is **withdrawn** — see §16 for the corrected
+architecture (the distributed L2-adapter path) and the vendor reference
+that proves it.
 
 **Track B — RDMA acceptance (§3).** Newly viable and not previously
 available. Another party installed the matched 24.04 DSC bundle, so
@@ -1139,7 +1148,20 @@ detail because most of what was learned is durable and expensive to
 rediscover, and because one finding invalidates a design assumption this
 repo has carried since §1.
 
-### 12.1 `LMCacheMPConnector` cannot carry the KV tier at all — correct the architecture
+### 12.1 ~~`LMCacheMPConnector` cannot carry the KV tier at all — correct the architecture~~ — WITHDRAWN, see §16
+
+> **CORRECTION, 2026-09-16: this section's headline conclusion is WRONG
+> and is WITHDRAWN. Full account at §16.**
+> `LMCacheMPConnector` **can** carry the KV tier, reaching XNVME_KV through
+> the distributed L2-adapter path (`v1/distributed/l2_adapters/nixl_store_l2_adapter.py`)
+> — a config surface this section never examined. `LMCacheConnectorV1` is
+> **not** the required child. The evidence below is left in place, not
+> deleted — it correctly shows that `extra_config`'s NIXL keys are ignored
+> under MP; the error was concluding from that observation that MP is
+> incapable, rather than that those particular keys are the wrong surface
+> for MP. This section's ordering finding — NixlConnector must be first on
+> the decode side, `multi_connector.py:387-400` — is **unaffected and
+> reaffirmed**; nothing in §16 touches it.
 
 **This repo has described its composition as
 `MultiConnector[NixlConnector, LMCacheMPConnector]` since the beginning
@@ -1163,11 +1185,18 @@ the installed LMCache 0.5.3:
   server` daemon reached over ZMQ (`mq.py:263-275` connects; nothing
   spawns it). No such process runs on either node.
 
-**The correct child is `LMCacheConnectorV1`** — in-process, no daemon, and
-the only connector that reaches `nixl_storage_backend.py`. Verified
-end-to-end through `vllm_v1_adapter.py:498` → `lmcache_get_or_create_config()`
-→ `VllmServiceFactory` → `LMCacheEngineBuilder` → `StorageManager` →
-`CreateStorageBackends`.
+**WITHDRAWN, see §16 — do not read the rest of this section as concluding
+`LMCacheConnectorV1` is the required, or even the preferred, child.**
+`LMCacheConnectorV1` is *a* way to reach `nixl_storage_backend.py` —
+in-process, no daemon — verified end-to-end through
+`vllm_v1_adapter.py:498` → `lmcache_get_or_create_config()` →
+`VllmServiceFactory` → `LMCacheEngineBuilder` → `StorageManager` →
+`CreateStorageBackends`. **It is not the only way, and it is not the one
+the vendor ships.** `LMCacheMPConnector` reaches the same backend by a
+different route this section did not examine — the distributed
+L2-adapter path documented in full at §16. The composition this repo
+should use is `MultiConnector[NixlConnector, LMCacheMPConnector]`, per
+§16 and per this repo's own scripts, which never changed.
 
 Two consequences worth stating plainly:
 
@@ -1187,7 +1216,9 @@ recorded: `MultiConnector.get_num_new_matched_tokens` assigns the load to
 the **first** child reporting a non-zero match
 (`multi_connector.py:387-400`). On decode, if LMCache is listed first and
 hits, the NIXL remote-prefill pull is skipped entirely. **NixlConnector
-must be first on the decode side.**
+must be first on the decode side.** **This finding is unaffected by the
+§16 correction and is explicitly reaffirmed there** — it holds regardless
+of which LMCache connector is the sibling child.
 
 ### 12.2 The LMCache allowlist patch is not needed on the container path
 
@@ -1281,6 +1312,24 @@ actionable. Re-check before treating 6.16 as blocked.
 
 ### 12.7 Where 6.10 now stands
 
+> **CORRECTED 2026-09-16, see §16.** The recipe below was written against
+> §12.1's withdrawn conclusion and names the wrong connector.
+> `LMCacheConnectorV1` here should be `LMCacheMPConnector`, and the child's
+> `kv_connector_extra_config` should carry only the rendezvous keys
+> `lmcache.mp.host` / `lmcache.mp.port` (default port **6557**) — under
+> MP the backend (`nixl_backend`, `dev_uri`, etc.) is configured on the
+> **daemon** side, not in vLLM's connector config, and vLLM must share IPC
+> and PID namespace with the daemon container
+> (`VLLM_IPC_MODE=service:<lmcache>`, `VLLM_PID_MODE=service:<lmcache>` —
+> §16.5). The JSON block and the `LMCACHE_CONFIG_FILE`/`extra_config`
+> paragraph below describe the in-process `LMCacheConnectorV1` config
+> surface, which the vendor path — and this repo's own
+> `gen-kv-transfer-config.sh` — does not use. Left in place because the
+> LMCache tuning facts inside it (per-worker `max_local_cpu_size`, §12.3;
+> `chunk_size` as part of the cache key, §7 invariant 8) are still
+> correct and still apply; only the connector and its top-level config
+> surface are wrong. See §16.5 for the vendor's actual recipe.
+
 Everything except the target is worked out. The recipe to resume with,
 each element established above rather than guessed:
 
@@ -1309,6 +1358,13 @@ parts), so a 10 MiB page implies ~320 parts against the device's
 before suspecting anything else — and remember `chunk_size` is part of the
 cache key, so both roles must change together or the receiver silently
 re-prefills (§7 invariant 8).
+
+**Superseded 2026-09-16 (§16):** replace `LMCacheConnectorV1` above with
+`LMCacheMPConnector` and `{"lmcache.mp.host":"<daemon URI>","lmcache.mp.port":6557}`;
+drop the `LMCACHE_CONFIG_FILE`/`extra_config` block shown above from the
+vLLM side entirely — it belongs on the daemon side under MP, which this
+repo has not yet stood up. §16.5 is the authoritative recipe until this
+repo runs it and can record the daemon-side config directly.
 
 ### 12.8 `smc2` (decode) became reboot-unstable during this session — read before planning any long run
 
@@ -1913,3 +1969,195 @@ is `-a-120` on both nodes, i.e. it avoids `smc1`'s lone `-pi-121` card
 - **Phase 2 RDMA acceptance is unblocked at the fabric level** and gated
   only on the UCX transport question (3.9) and mapping `/dev/infiniband`
   into the containers.
+
+---
+
+## 16. MAJOR CORRECTION: §12.1's headline conclusion is WRONG — `LMCacheMPConnector` DOES carry the KV tier, and a local-DSC path may unblock Track A (2026-09-16)
+
+**§12.1 is wrong.** It concluded `LMCacheMPConnector` "cannot carry the KV
+tier at all" and that the correct child is `LMCacheConnectorV1`. That
+conclusion has been steering this project's docs away from the connector
+the vendor actually ships, and away from what this repo's own scripts have
+emitted since §1. It is withdrawn here, in full, in the open — see §13.4
+for why this repo does that rather than quietly edit the earlier text.
+
+All evidence below is read from the installed LMCache 0.5.3 in image
+`rocm-aic:mp-pd-ionic2609`, at
+`/usr/local/lib/python3.12/dist-packages/lmcache` — a container variant
+not previously catalogued in §10.1's image table.
+
+### 16.1 `LMCacheMPConnector` reaches XNVME_KV through a path §12.1 never examined
+
+§12.1 checked exactly one route into the storage backend — the in-process
+`StorageManager` / `CreateStorageBackends` path, configured by
+`LMCacheEngineConfig` — found MP mode never constructs one, and concluded
+MP "cannot carry the KV tier at all." **There is a second route, and MP
+uses it:** the distributed L2-adapter path under `lmcache/v1/distributed/`.
+
+- `v1/distributed/config.py:28-29` registers L2 adapter types
+  `nixl_store` and `nixl_store_dynamic`.
+- `v1/distributed/l2_adapters/nixl_store_l2_adapter.py`:
+  - `_VALID_NIXL_BACKENDS` (~line 1056) includes **`XNVME_KV`** and
+    `SPDK_NVMe_KV`.
+  - `_FILE_BACKENDS` (~line 1068) is `("GDS", "GDS_MT", "POSIX", "HF3FS",
+    "AIS_MT")` — **`XNVME_KV` is deliberately excluded**, so no
+    `file_path` is required for it.
+  - ~line 234: `elif self.backend in ["OBJ", "AZURE_BLOB",
+    "SPDK_NVMe_KV", "XNVME_KV"]:` routes to
+    `init_storage_handlers_object`.
+  - ~lines 437-440 register with `mem_type="OBJ"` — exactly the OBJ (not
+    FILE) routing §12.2 identified as required.
+  - ~lines 202-208: `mem_split_n` exists to split pages against a KV
+    backend's `max_value_size`, and the comment reads "SPDK_NVMe_KV:
+    524288 B vs. a multi-MiB **MP-mode** chunk." **This code was written
+    specifically for MP mode driving a KV backend.** MP is not
+    incidentally supported here; it is the path this code exists for.
+
+### 16.2 Use the static adapter — `nixl_store_dynamic` is a different, file-oriented thing
+
+Do not reach for `nixl_store_dynamic_l2_adapter.py` by name-similarity.
+It requires `backend_params["file_path"]` (~line 105), does
+`os.makedirs` (~line 106), and registers `mem_type="FILE"` (~lines
+168-171) — that is the GDS/HF3FS/POSIX-style file-backend adapter. For
+XNVME_KV the static `nixl_store` adapter (§16.1) is the one that routes
+to `mem_type="OBJ"` with no `file_path` at all.
+
+### 16.3 Where §12.1 went right, and the actual shape of its error
+
+§12.1's evidence was not fabricated and is not being retracted:
+
+- `extra_config{enable_nixl_storage, nixl_backend, nixl_backend_params}`
+  **is** silently ignored under `LMCacheMPConnector` — true.
+- `LMCacheEngineConfig` **is** never constructed on the MP path — true.
+
+**The error was the inference, not the observation.** §12.1 went from "the
+keys I checked are ignored" to "this connector cannot carry the tier at
+all." Those keys are simply the wrong config surface for MP. Under MP the
+backend is configured on the **daemon** side; vLLM's connector config
+carries only the rendezvous keys `lmcache.mp.host` / `lmcache.mp.port`
+(§16.4). §12.1 never looked for those because it never considered that MP
+might have a config surface at all beyond the one `LMCacheConnectorV1`
+uses.
+
+§12.1 also asserted MP "requires a separately launched `lmcache server`
+daemon reached over ZMQ (`mq.py:263-275` connects; nothing spawns it)."
+The daemon requirement is real and correctly identified. **"Nothing spawns
+it" was true only of this repo's scripts** — the vendor reference spawns
+it as a compose service (§16.4). That, too, was an inference about the
+component drawn from a gap in this repo's tooling.
+
+### 16.4 The generalised lesson — sibling to §13.4, the same shape inverted
+
+§13.4 catalogued checks that **passed** while the thing they checked was
+broken. This is the same failure family, inverted: **a check that
+correctly showed a key was ignored, read as if it showed a component was
+incapable.** A negative result about a configuration surface is not a
+negative result about a component. State it plainly because it will
+happen again with some other connector, some other `extra_config` block:
+before concluding "X cannot do Y," confirm you have found *every* config
+surface X exposes, not just the one you expected it to use.
+
+### 16.5 The vendor reference — authoritative, and it deploys exactly this
+
+`/root/rixl-bench/stack/tracks/rocm-aic/deploy-xnvme.sh`, on `smc1`. Its
+own summary line (~245):
+
+```
+stack : vLLM -> LMCacheMPConnector -> NixlStorageAgent l2-adapter -> XNVME_KV -> ${AIC_XNVME_DEV}
+```
+
+Its vLLM connector config (~line 173):
+
+```
+--kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"tcp://${CONTAINER_LMCACHE}","lmcache.mp.port":${LMCACHE_XNVME_PORT}}}'
+```
+
+Default port **6557**. The daemon is a separate compose service — `docker
+compose --profile storage-xnvme up -d` brings it up alongside vLLM.
+
+**Namespace sharing is a hard requirement, not optional decoration.**
+vLLM is launched with `VLLM_IPC_MODE=service:<lmcache>` and
+`VLLM_PID_MODE=service:<lmcache>` — i.e. the vLLM container **shares IPC
+and PID namespace** with the lmcache daemon container. Treat this the way
+§7 treats its invariants: skip it and the failure will present as
+something else entirely, not as a namespace error.
+
+Also recorded in the same script: `AIC_XNVME_KV_POOL` default `2000000`,
+and a deployment record with `backend=XNVME_KV`, `category="1 (real
+Pensando DSC)"`.
+
+### 16.6 The repo's own scripts were already correct — no code change needed
+
+Reassuring, and important to say plainly so nobody "fixes" working code
+toward the withdrawn conclusion: `scripts/common/gen-kv-transfer-config.sh`
+still emits `LMCacheMPConnector` with `lmcache.mp.host` /
+`lmcache.mp.port` (~lines 92-96), matching the vendor reference exactly.
+`config/cluster.env` likewise still describes
+`MultiConnector[NixlConnector, LMCacheMPConnector]`. §12.1's "correct the
+architecture" was **never applied to code** — only the docs were rewritten
+to contradict scripts that were right all along. **Do not touch
+`gen-kv-transfer-config.sh` or `cluster.env` to chase
+`LMCacheConnectorV1`.** They do not need it.
+
+### 16.7 A dangerous trap in the vendor reference — read before running it here
+
+`deploy-xnvme.sh` defaults `AIC_XNVME_DEV=/dev/ng0n1`. **On `smc1` and
+`smc2` that default is wrong, and running it is destructive.** Measured on
+both nodes:
+
+| Device | Identity | Size | What it is |
+|---|---|---|---|
+| `/dev/ng0n1` | Micron_7450_MTFDKBA800TFS | 800 GB | **The OS boot drive** — carries partitions `nvme0n1p1`, `nvme0n1p2` |
+| `/dev/ng1n1` | `PDSNVME-00`, model `PDSNVME` | — | The actual Pensando DSC device |
+
+**On our nodes, `AIC_XNVME_DEV` must be set to `/dev/ng1n1`.** Running the
+reference with its default would point XNVME_KV at the root disk. This is
+a §7-style invariant, stated here because §7 predates this device: **never
+run `deploy-xnvme.sh` on `smc1`/`smc2` without overriding
+`AIC_XNVME_DEV=/dev/ng1n1` explicitly.**
+
+The DSC namespace itself is real and provisioned, not absent:
+`nvme id-ns /dev/ng1n1` gives `nsze = 0x200000` blocks at `lbads 9` (512
+B) = **1 GiB**. `nvme list` displays "0.00 B / 0.00 B" only because
+`nuse=0` (unused, not unprovisioned) — do not read that as an absent
+namespace. 1 GiB is small for a KV tier; flag as a **sizing question to
+confirm before relying on it**, not as a blocker.
+
+### 16.8 Strategic consequence — Track A may not need `smc3` at all
+
+Both `smc1` and `smc2` have their **own local DSC** (§16.7). §9.3's Track A
+was recorded as "Blocked by 6.18" because it needed this repo's KV
+subsystem restored on the shared `smc3` target, currently owned by another
+party. **A local-DSC XNVME_KV tier does not need `smc3` at all.** Track A
+is therefore potentially unblocked without resolving the `smc3` ownership
+question.
+
+State this as what it is — **a newly available option to evaluate, not a
+proven result.** Nothing has been deployed or measured against the local
+DSC by this repo. It also changes the storage tier's topology from remote
+NVMe-oF (the design this repo has assumed since §1) to a local device —
+a real architectural difference, and one this repo should decide on
+deliberately rather than by default. It aligns with §10.1's standing
+observation that the lab does not run the model this repo originally
+assumed; this is one more instance of that same pattern.
+
+### 16.9 What this changes
+
+- **§12.1's headline conclusion is withdrawn.** `LMCacheConnectorV1` is
+  not the required child; `LMCacheMPConnector` reaches XNVME_KV via the
+  L2-adapter path (§16.1). §12.1's ordering finding (NixlConnector must be
+  first on the decode side, `multi_connector.py:387-400`) is unaffected
+  and stands.
+- **§12.7's launch recipe is corrected** to `LMCacheMPConnector` with
+  `lmcache.mp.host` / `lmcache.mp.port`, per §16.5.
+- **§9.3's Track A entry is corrected** — composition is
+  `MultiConnector[NixlConnector, LMCacheMPConnector]`, and Track A may no
+  longer be gated on 6.18 if the local-DSC path (§16.8) is adopted.
+- **No code change is required.** `gen-kv-transfer-config.sh` and
+  `cluster.env` were right the whole time (§16.6).
+- **New hard warning:** never point `AIC_XNVME_DEV` at `/dev/ng0n1` on
+  `smc1`/`smc2` — that is the OS boot drive. Use `/dev/ng1n1` (§16.7).
+- **Track A's blocked-by-6.18 status needs re-evaluation**, not
+  automatic closure — the local-DSC option is unproven and 6.18 (the
+  `smc3` ownership question) remains true on its own terms if the
+  remote-target design is kept instead.
