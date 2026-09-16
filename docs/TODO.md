@@ -403,8 +403,11 @@ counters rather than inferred from throughput.*
         narrower than this item claimed.** The errors are contemporaneous
         with the new driver (module loads 06:10:50, errors 06:10:50-51),
         so they are not stale. Measured precisely: **RC QPs work and move
-        data** (`ibv_rc_pingpong` 6.8 Gbit/s on `smc1`, 5.9 on `smc2`, GID
-        index 1); **UD QPs cannot be created** (`Couldn't create QP`); and
+        data** (`ibv_rc_pingpong`, GID index 1: 9.6 us RTT on `smc1`,
+        11.1 us on `smc2` — a **loopback latency** test that never crossed
+        the fabric; do not quote its Mbit/s figure as throughput, see
+        HANDOFF §14.2); **UD QPs cannot be created** (`Couldn't create
+        QP`); and
         **`rdma_cm` fails** (`rdma_connect: Invalid argument`). QP1 is a UD
         QP, so the MAD agent and CM fail downstream of the UD limitation.
 

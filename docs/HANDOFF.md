@@ -1510,10 +1510,36 @@ But §13 characterised the consequence too broadly. Measured directly:
 | Path | Result |
 |---|---|
 | Device enumeration (`ibv_devinfo`, `show_gid`) | **works** |
-| **RC QP** create + data (`ibv_rc_pingpong`, GID idx 1) | **WORKS** — 6.8 Gbit/s, 9.6 µs/iter (`smc1`); 5.9 Gbit/s, 11.1 µs (`smc2`) |
+| **RC QP** create + data (`ibv_rc_pingpong`, GID idx 1) | **WORKS** — 9.6 µs RTT (`smc1`), 11.1 µs (`smc2`). See the warning below before quoting any bandwidth figure from this. |
 | **UD QP** create (`ibv_ud_pingpong`) | **FAILS** — `Couldn't create QP` |
 | **`rdma_cm`** connect (`rping`) | **FAILS** — `rdma_connect: Invalid argument` |
 | GSI/MAD QP1 (a UD QP) | **FAILS** — `CREATE_QP BAD_ATTR` |
+
+> **Do not read a throughput number out of that RC row.**
+> `ibv_rc_pingpong` prints a `Mbit/sec` figure (6819.56 on `smc1`, 5900.95
+> on `smc2`) and it is close to meaningless here, for three independent
+> reasons:
+> - It is a **latency** test. It sends one 4 KB message and waits for the
+>   reply before sending the next — the byte total is exactly
+>   `4096 x 1000 iters x 2 directions = 8,192,000`. The rate is bounded by
+>   round-trip stalls, not by the link.
+> - It ran **loopback**, `-d ionic_0 ... localhost`. Both ends are the same
+>   device on the same host. **The traffic never crossed the fabric.**
+> - These are 200 Gb/s NICs, so ~5.9 Gb/s is about 3% of line rate. Quoted
+>   without context it reads as a catastrophic fabric result rather than
+>   what it is: an irrelevant one.
+>
+> The `smc1`-vs-`smc2` difference is not real either. On `smc2` the two
+> ends of the *same* run disagreed — client 5900.95 Mbit/s / 11.11 us,
+> server 4917.17 Mbit/s / 13.33 us — so the error bars swamp the
+> cross-node gap. Both figures above are client-side, so at least the
+> comparison is like-for-like, but it supports no claim that one node's
+> fabric is faster.
+>
+> For a real transport number: `ib_write_bw` / `ib_send_bw` from
+> `perftest`, **cross-node**, once 3.6's routing exists and 3.10's
+> firmware skew is levelled. Until then there is no RDMA throughput
+> measurement on this cluster, and this section does not provide one.
 
 **The pattern is: this driver/firmware cannot create UD queue pairs. RC
 queue pairs work and move data.** QP1 is a UD QP, which is why the MAD
