@@ -1,6 +1,6 @@
 # TODO
 
-Working task list. Last updated 2026-09-15.
+Working task list. Last updated 2026-09-16.
 
 ## How to use this list
 
@@ -22,41 +22,44 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 5 | Done | 14 | 14 | — |
 | 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 20 | 12 | 6 |
 
-**Next action: 6.20 — get `smc2` stable, because nothing else can be measured
-until it is.** It rebooted five times on 2026-09-15 and is cycling every
-~8-10 minutes, which is shorter than a 72B TP=8 model load. Then **6.18** —
-establish ownership of the shared KV target on `smc3` — and only then resume
-6.10.
+**Read [HANDOFF §9](HANDOFF.md#9-how-to-resume) first** — it carries the
+cluster state as handed over and the ordered plan. This block is the index.
 
-**§3 (RDMA) moved forward on 2026-09-16 without us:** another party installed
-the matched 24.04 DSC bundle, fixing half of 3.7. `ibv_devinfo` now works on
-both nodes and **RC QPs carry data** (6.8 / 5.9 Gbit/s loopback). What remains
-broken is narrower and now precisely characterised: **UD QPs cannot be created
-at all**, so `ib_mad` QP1 and `rdma_cm` both fail (3.7, 3.9). NIXL/UCX do not
-need `rdma_cm`, so this likely does not block leg A over RDMA — but `UCX_TLS=ib`
-pulls in UD transports that will fail, which is 3.9. **3.6's routing gap is the
-operative §3 blocker again**, alongside 3.9. Also: the `ionic_N` → netdev
-mapping changed, making 2.8 stale, and node firmware is mismatched (3.10). See
-HANDOFF §14. 6.10 was attempted in session 4 and did not land, but
-not for any reason inside this repo: the target was reconfigured by another
-party mid-session and `nqn.2024-01.io.nixl:kv0` no longer exists (6.18).
-Everything else 6.10 needed is now worked out — including the discovery that
-`LMCacheMPConnector`, the connector this repo's architecture has named since
-day one, **cannot carry the KV tier at all** and must be `LMCacheConnectorV1`
-(HANDOFF §12.1). The exact resume recipe is at HANDOFF §12.7. Also re-check
-6.19: the target's 200G links, recorded as permanently down, are now up. Everything else is decided,
-resolved, or proven: the deployment model is the container path (6.1); the
-kernel/CSI-1 gap is closed by the 24.04.5/6.8.0-139 OS upgrade (6.5–6.8); the
-KV backend decision is XNVME_KV over kernel nvme-of (6.3); leg B is proven
-end-to-end at the plugin level (6.12); housekeeping is done (6.17); and as of
-session 4, **leg A actually transfers KV** — decode at 0.0 tokens/s prompt
-throughput with a 100% external prefix cache hit rate, measured through this
-repo's own proxy (6.11, now closed). Two defects had to be fixed to get
-there, both of which presented as a pipeline serving correct text while
-moving zero KV — see HANDOFF §11, and note that 6.14's router decision is
-**reversed** by it. Everything else in §6 is done or explicitly parked behind
-6.10 (6.2, 6.13, 6.15, 6.16 — see each item's status). §§1–5 are largely
-untouched; their own next actions (2.3, 3.6) stand independently.
+**Before anything: 6.20, 6.18, and the amdgpu ritual.** `smc2` rebooted seven
+times on 2026-09-15, cycling every 3-13 minutes — shorter than a 72B TP=8
+model load — then held for hours, then rebooted again; nothing explains either
+the instability or the recovery. `smc3` is shared and currently serves
+*another party's* subsystem, so our `nqn.2024-01.io.nixl:kv0` is gone (6.18).
+Both compute nodes were handed over freshly rebooted with **0 GPUs** — TODO
+0.4's `modprobe amdgpu` is required right now.
+
+**Two independent tracks, neither blocking the other.**
+
+*Track A — 6.10, the storage tier.* The last item in §6 and the project's
+original goal. **Blocked by 6.18**, not by anything in this repo. Everything
+else is worked out; recipe at HANDOFF §12.7. The correction that matters:
+the composition is `MultiConnector[NixlConnector, **LMCacheConnectorV1**]` —
+**not** `LMCacheMPConnector`, which this repo's architecture has named since
+day one and which cannot reach the NIXL storage backend at all, silently
+ignoring its config (HANDOFF §12.1).
+
+*Track B — §3, RDMA acceptance.* Newly viable: another party installed the
+matched 24.04 DSC bundle on 2026-09-16, fixing half of 3.7. `ibv_devinfo`
+works on both nodes and **RC queue pairs carry data**. What remains is
+narrower and now exact — **UD QPs cannot be created at all**, so `ib_mad` QP1
+and `rdma_cm` both fail. NIXL/UCX need neither, so this likely does not block
+leg A over RDMA, but `UCX_TLS=ib` pulls in UD transports that will fail
+(3.9). **3.6's routing gap is the operative blocker again**, alongside 3.9 and
+3.10's firmware skew. See HANDOFF §14.
+
+**Cheap, do anytime: 3.8** — make preflight assert `ibv_devinfo` returns a
+device rather than merely existing. That check would have made 3.7
+self-diagnosing instead of costing two sessions.
+
+**Closed in session 4: 6.11** — leg A transfers KV, decode at 0.0 tokens/s
+prompt throughput and a 100% external prefix cache hit rate, measured through
+this repo's own proxy (HANDOFF §11). Also stale now: 2.8's `ionic_N` → netdev
+mapping, and 6.14's router decision, both reversed with evidence.
 
 ---
 

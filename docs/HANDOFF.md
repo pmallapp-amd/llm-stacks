@@ -1,10 +1,24 @@
 # Handoff
 
 State of the P/D-disaggregated KV cache project, for whoever picks this up
-next (including future me). Last updated 2026-09-15.
+next (including future me). Last updated 2026-09-16.
 
 Read this before [BRINGUP.md](BRINGUP.md). It tells you what is real, what is
 assumed, and what is still wrong.
+
+> **Resuming? Go straight to [§9](#9-how-to-resume).** It carries the
+> cluster state as handed over, the three things to check before touching
+> anything, and what to do in what order. §§1–8 are background; §§10–14
+> are the evidence record, including several corrections of earlier
+> corrections — read them when you need the *why*, not to get started.
+>
+> **Headline, session 4 (2026-09-16):** leg A works — a direct P→D NIXL
+> transfer, proven by decode doing **zero** prefill at a 100% external
+> cache hit rate (§11). Two silent defects had to be fixed to get there,
+> both of which served correct text while moving no KV at all. The
+> storage tier (TODO 6.10) is the last item in §6 and is blocked on a
+> shared resource, not on us. RDMA (§3) became newly viable when another
+> party fixed half the `ionic` stack (§14).
 
 ---
 
@@ -60,7 +74,11 @@ sides as a reuse tier, not the transport.
 
 ## 2. Current state
 
-18 commits on `main`, which is the default branch and in sync with
+> **Note, 2026-09-16:** this section is a running record and its numbered
+> blockers below are historical — each is annotated with how it resolved.
+> For what is true *now*, see [§9.1](#91-cluster-state-as-handed-over).
+
+`main` is the default branch and in sync with
 `github.com/pmallapp-amd/llm-stacks`. Working tree clean.
 
 **The repository is PUBLIC.** Everything lab-specific has been externalised and
@@ -552,87 +570,171 @@ other directly today.
 
 ## 9. How to resume
 
-> **Before anything below: check `uptime` on `smc2`.** It rebooted five
-> times on 2026-09-15 and spent the end of that session cycling every
-> eight to ten minutes — shorter than the five or six minutes a 72B TP=8
-> load needs. §12.8 and TODO 6.20. Also check who owns the KV target on
-> `smc3` before relying on it (§12.5, TODO 6.18). Both of these will
-> otherwise present as a failure in whatever you were actually testing.
+Rewritten 2026-09-16, end of session 4. Everything above §9 is background
+and evidence; this section is the operational one. If you read nothing
+else, read this.
 
-### The one live item — read this first, nothing else in §6 is more urgent
+### 9.1 Cluster state as handed over
 
-Everything that used to gate §6 (deployment model, kernel/CSI-1, KV backend
-choice, and as of the fourth session leg A itself) is now decided, resolved,
-or proven — see §6/§10/§11 above. **Exactly one actionable item remains:**
+Measured, not assumed, minutes before writing:
 
-- **[TODO 6.10](TODO.md#6-storage-tier-integration-plan-xnvme_kv--spdk_nvme_kv-as-an-lmcache-tier) —
-  compose the storage tier under P/D.** `MultiConnector[NixlConnector,
-  LMCacheMPConnector]` with LMCache's `nixl_backend = XNVME_KV` and
-  `dev_uri` from `resolve_xnvme_kv_dev()`. New integration — prove both legs
-  independently, with a cross-instance or post-eviction reuse number so
-  vLLM's own prefix cache can't fake the result (§8).
+| Node | State |
+|---|---|
+| `smc1` prefill | **up 4 min** (just rebooted). **0 GPUs, no `/dev/kfd`.** No containers. `ibv_devinfo` → 8 devices (RDMA userspace OK). |
+| `smc2` decode | **up 4 min** (just rebooted). **0 GPUs, no `/dev/kfd`.** No containers. `ibv_devinfo` → 8 devices. |
+| `smc3` target | up 4 days. Serving **`nqn.2016-06.io.spdk:cnode1`** — *another party's* configuration. Our `nqn.2024-01.io.nixl:kv0` does not exist. |
 
-  The leg-A half of that proof is now available as a known-good baseline
-  rather than a hope: bring the pair up with
-  `scripts/common/start-vllm-container.sh {prefill,decode}`, front it with
-  `scripts/proxy/disagg_proxy.py`, and confirm decode's `Avg prompt
-  throughput` sits at 0.0 with `External prefix cache hit rate` at 100%
-  BEFORE adding LMCache. If composing the tier breaks that, you know
-  which change did it.
+Nothing of ours is running anywhere. vLLM and the proxy were torn down
+deliberately at the end of the session; the containers carry no
+`--restart` policy, so they will not come back on their own.
 
-Everything else in TODO §6 is done or explicitly parked behind it —
-see each item's status there.
+Both compute nodes rebooted simultaneously just now, which nobody on our
+side initiated — see §9.5.
 
-**One standing warning, earned twice now (§11):** on this stack a correct
-completion is not evidence of anything. Both defects that hid leg A
-produced perfect output at plausible latency. Read the two engine
-throughput counters, or you have measured nothing.
+### 9.2 Check these three things before touching anything
 
-### The per-boot ritual — none of this survives a reboot
+Each has cost a run already, and each presents as a failure in whatever
+you were actually testing rather than as itself.
 
-Confirmed again this session (both after the amdgpu recurrence and after
-the OS upgrade): **none** of the following persist across a reboot of
-either compute node or the target, and all three are prerequisites before
-resuming either live item above:
+1. **`uptime` on `smc2`.** It rebooted seven times on 2026-09-15, cycling
+   every 3–13 minutes — shorter than the 5–6 minutes a 72B TP=8 load
+   takes. It later held for hours, then rebooted again. Nothing explains
+   either the instability or the recovery. TODO 6.20. **If it has been up
+   less than the time your step needs, you will lose the run.**
+2. **Who owns `smc3`.** It is shared and was reconfigured mid-session by
+   someone else (§12.5). Our subsystem is gone. Do not restart their
+   target to reclaim it — agree ownership first. TODO 6.18.
+3. **`modprobe amdgpu` on both compute nodes.** Currently **needed** —
+   both report 0 GPUs as handed over. §9.4.
 
-1. `modprobe amdgpu` on both compute nodes (`modprobe.blacklist=amdgpu` is
-   still on the 24.04 cmdline; `01-host-prep.sh` does this automatically,
-   opt-out `AMDGPU_AUTOLOAD=0` — TODO 0.4).
-2. Restart the KV target from `/root/kv_spdk` (it does not survive a
-   reboot either — this session had to redo it).
-3. Re-run `nvme connect` on both compute nodes (no `--persistent` flag, no
-   systemd unit — TODO 6.9).
+### 9.3 What to do, in order
 
-### Standing resume steps (unchanged in substance since first hardware contact)
+**Step 0 — restore the leg-A baseline.** Do this before any new work,
+even if leg A is not what you came for. It is the one known-good
+reference point on this cluster, it now takes minutes, and every failure
+mode below is easier to attribute against it.
 
-1. `scripts/common/deploy.sh` to push the repo (and creds) onto each node —
-   none of the three has a shared filesystem, NFS, or the repo already on it;
-   this has to run before anything else can. SSH key auth is **not**
-   configured on any node, so this and everything else currently depends on
-   the passwords in `creds/active.env`; `deploy.sh` pushes those passwords to
-   all three machines by default (TODO 2.12).
-2. `scripts/common/init-creds.sh 4`, populate it, confirm
-   `source config/cluster.env` resolves real addresses. *(Done as of
-   2026-09-14 — TODO 2.1.)*
-3. Work [TODO.md §2](TODO.md) — hardware bring-up. The architecture correction
-   (§1) is complete; the GPU blocker is resolved (TODO 0.4, both nodes up via
-   `modprobe amdgpu`, redone automatically by host-prep every run); the P→D
-   **RDMA** fabric still has no route (TODO 3.6) but this is a Phase 2/3
-   acceptance concern, not what's blocking the two live items above, which
-   run on TCP over the shared management `/24`.
-4. Follow [BRINGUP.md](BRINGUP.md).
-5. For the storage tier specifically, §6.1–6.3's decisions are now made
-   (container path, XNVME_KV, kernel `nvme-of`) — go straight to 6.11 then
-   6.10, per the section above.
+```
+scripts/common/start-vllm-container.sh prefill     # on smc1
+scripts/common/start-vllm-container.sh decode      # on smc2
+python3 scripts/proxy/disagg_proxy.py              # fronting both
+```
 
-The first things likely to bite, in order: the LMCache allowlist patch
-against whatever version actually installs (2.7, folded into 6.10); and
-reconciling XNVME_KV's real 32768-byte value ceiling against the config
-(6.4/6.13, also folded into 6.10). The amdgpu blacklist and the P→D RDMA
-route are both known, both still require the same manual steps as before —
-see the per-boot ritual and TODO 3.6 respectively. The container-image
-`rixl` gap and the KV-transfer gap that sat here in previous sessions are
-both closed — §11.
+Send one long (≥4000-token) prompt with a per-run nonce through the proxy
+and confirm **decode's `Avg prompt throughput` is 0.0 with
+`External prefix cache hit rate` at 100%**, while prefill's throughput is
+non-zero. That is the §11 result. Anything less is not a baseline.
+
+Then pick one of two independent tracks. They do not block each other.
+
+**Track A — the storage tier (TODO 6.10).** The last item in §6, and the
+original goal of the project. *Blocked by 6.18* — it needs our KV
+subsystem back on `smc3`. Everything else is worked out: the exact
+launch recipe is at **§12.7**, and note the correction that matters —
+the composition is `MultiConnector[NixlConnector, **LMCacheConnectorV1**]`,
+**not** `LMCacheMPConnector`, which cannot reach the NIXL storage backend
+at all and silently ignores its config (§12.1).
+
+**Track B — RDMA acceptance (§3).** Newly viable and not previously
+available. Another party installed the matched 24.04 DSC bundle, so
+`ibv_devinfo` works and **RC queue pairs carry data** (§14). Remaining,
+in order:
+- **3.9** — `UCX_TLS=ib` pulls in UD transports, and **UD QP creation
+  fails on this hardware**. Find the transport spec that works, without
+  weakening invariant 6's exclusion of `tcp`. Also: the container launch
+  does **not** map `/dev/infiniband` yet, which Phase 2 needs.
+- **3.6** — the IPv4 routing gap, `30.1.N.1/24` vs `30.2.N.1/24`, now the
+  operative blocker again. One lead to measure, not assume: the index-2
+  IPv6 GIDs share `2001:0db8::/32` across both nodes.
+- **3.10** — firmware differs between nodes (`-pi-121` vs `-a-120`).
+  Level it before trusting any cross-node RDMA number.
+
+**Cheap and worth doing whenever — 3.8.** Make `00-preflight.sh` assert
+`ibv_devinfo` actually returns a device instead of merely existing, and
+surface libibverbs' `couldn't load driver` warning. That warning names
+the exact missing provider and would have made §13 self-diagnosing
+instead of costing two sessions.
+
+### 9.4 The per-boot ritual — none of this survives a reboot
+
+1. **`modprobe amdgpu`** on both compute nodes. `modprobe.blacklist=amdgpu`
+   is still on the 24.04 cmdline, so GPUs never autoload.
+   `01-host-prep.sh` and `start-vllm-container.sh` do this automatically
+   (opt-out `AMDGPU_AUTOLOAD=0`). TODO 0.4. **Required right now.**
+2. **The KV target.** It does not survive a reboot of `smc3` — but as
+   handed over the problem is different and worse: `smc3` is up, and
+   someone else's subsystem is on it. Resolve 6.18 before assuming this
+   step is yours to perform.
+3. **`nvme connect`** on both compute nodes — no `--persistent`, no
+   systemd unit (TODO 6.9). Moot until (2) is resolved.
+
+What does **not** need redoing: the DSC/RDMA userspace fix is a package
+install and survived this reboot (`ibv_devinfo` → 8 devices on both nodes
+post-boot).
+
+### 9.5 The hardware is shared, and it changes under you
+
+This is the single most important thing a new session needs to internalise,
+because it has invalidated recorded facts five separate times (§14.4):
+
+- The KV target was reconfigured by another party mid-session (§12.5).
+- The DSC driver/firmware bundle was replaced between sessions, fixing
+  half of a blocker we had documented as needing vendor action (§14).
+- A 200G link came up during an investigation (§13.7), contradicting a
+  TODO marked "not actionable without physical access".
+- `amdgpu` was loaded on `smc2` by someone else, three hours into a boot.
+- Both compute nodes rebooted simultaneously as this handoff was written.
+
+**Re-measure; do not trust a recorded measurement of driver, device, or
+library state.** Prefer a check that fails loudly over a note in a
+document. Every "Verified" entry in §6 taken before 2026-09-15 should be
+treated as suspect if it concerns anything the OS or driver updates could
+have touched; entries about hardware identity, plugin source, and Gerrit
+status are fine.
+
+### 9.6 Traps that have actually bitten, distilled
+
+Not hypothetical — each cost real time on this project.
+
+| Trap | Where |
+|---|---|
+| A correct completion proves **nothing**. Two separate defects produced perfect output at plausible latency while transferring zero KV. Read the two engine throughput counters or you have measured nothing. | §11 |
+| `UCX_NET_DEVICES` unset makes UCX advertise the first TCP device it enumerates — an unroutable fabric NIC. `<auto>` was not a default, it was the bug. | §11.2 |
+| `max_local_cpu_size` is **per TP worker**. At TP=8, `80` means 640 GiB of pinned memory. It took a node down. | §12.3 |
+| `LMCacheMPConnector` silently ignores `enable_nixl_storage` / `nixl_backend` / `nixl_backend_params`. Not rejected — ignored. | §12.1 |
+| vLLM's own prefix cache sits upstream of every connector. A valid reuse number must be cross-instance or post-eviction. | §8 |
+| `nixl_rocm._api.create_backend()` has no `return` — it is always `None`. Checking it is a test incapable of failing. | §11.3 |
+| `ibv_rc_pingpong`'s Mbit/s figure is latency-bound loopback, not throughput. There is **no** RDMA throughput number on this cluster. | §14.2 |
+
+### 9.7 What this session added to the repo
+
+- `scripts/common/start-vllm-container.sh` — **new**. The container launch
+  path as a guarded script rather than shell history.
+- `scripts/proxy/disagg_proxy.py` — **fixed**. Implements the full
+  three-step XpYd handshake; it now *requests* the handoff, which is what
+  made leg A work. This is the router, **not** the vendored
+  `disagg_proxy_demo.py` (which cannot drive NixlConnector — TODO 6.14 is
+  reversed).
+- `config/cluster.env` — `PREFILL_PD_IF` / `DECODE_PD_IF`, the compute-leg
+  NIC, deliberately separate from the storage-leg `*_DATA_IF`.
+- `scripts/common/lib.sh` — `setup_ucx_env` now dies rather than
+  autodetecting.
+- `scripts/common/gen-lmcache-config.sh` — emits `nixl_buffer_size` only
+  when the buffer device is not `cpu`, and no longer claims the LMCache
+  allowlist patch is mandatory (it is not, on the container path).
+
+### 9.8 Standing setup, if starting from a fresh checkout
+
+1. `scripts/common/init-creds.sh 4`, populate it, confirm
+   `source config/cluster.env` resolves real addresses. *(Already done —
+   TODO 2.1.)*
+2. `scripts/common/deploy.sh` to push the repo and creds onto each node.
+   No node has a shared filesystem. SSH key auth is **not** configured
+   anywhere, so everything depends on the passwords in `creds/active.env`,
+   which `deploy.sh` pushes to all three machines by default — TODO 2.12.
+3. Then §9.3 above. [BRINGUP.md](BRINGUP.md) remains the long-form guide,
+   but note it predates the container-path decision (TODO 6.1) and
+   describes the from-source build, which is deprioritized (TODO 6.2).
 
 ---
 
