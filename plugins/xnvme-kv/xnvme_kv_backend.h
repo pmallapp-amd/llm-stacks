@@ -61,13 +61,42 @@ extern "C" {
 
 #define XNVME_KV_KEY_MAX_LEN 16u
 
-// Compiled-in fallback for the max single-value size, used when the device has
-// not been queried yet (no backend instance created) or the query failed.
-// 32768 was established EMPIRICALLY against the real Pensando DSC — 32768 B
-// stores/retrieves cleanly, 65536 B fails with a vendor-specific NVMe
-// completion status (sct=7 sc=234). Keep it as the fallback rather than
-// trusting an advertised value blindly: that empirical probe is the only
-// evidence we have that a size actually works end-to-end on this firmware.
+// Compiled-in fallback for the max single-value size, used only when
+// NIXL_KV_MAX_VALUE_SIZE is unset (see xnvme_kv_configured_max_value_size()
+// below, the real control now).
+//
+// BOTH measurements below are real, dated history — neither supersedes the
+// other, because they were taken against the SAME Pensando DSC at different
+// points in time:
+//   - 32768 was established EMPIRICALLY on this DSC: 32768 B stores/retrieves
+//     cleanly, 65536 B fails with a vendor-specific NVMe completion status
+//     (sct=7 sc=234).
+//   - As of 2026-09-15/2026-09-17, the SAME DSC's KV Identify Namespace now
+//     reports value_max=4096, key_max=16 — the device's own ADVERTISED
+//     ceiling moved under us (see docs/HANDOFF.md §18.3).
+//     scripts/verify/20-verify-nixl-plugin.sh caught this as
+//     RESULT:MAX_VALUE_SIZE_MISMATCH:reported='32768' expected=4096.
+//
+// DO NOT "FIX" THIS BY LOWERING IT TO 4096. That was tried on 2026-09-17 and
+// reverted the same day. The advertised 4096 is NOT known to be the device's
+// true capability: the hardware owner states this DSC supports up to 65536
+// with 32768 as the reliable operating point, which is consistent with the
+// first measurement above and inconsistent with the advertised field. Nobody
+// has yet stored 32768 B against the CURRENT firmware and observed the
+// result — the cross-node roundtrips run on 2026-09-17 all used 4096 B parts,
+// so they proved 4096 WORKS, not that 32768 FAILS. Advertised-vs-actual is an
+// open measurement, not a settled fact; see query_max_value_size()'s
+// non-fatal handling and docs/TODO.md for the probe that settles it.
+//
+// The default is therefore the RELIABLE MEASURED value, not the advertised
+// one. Note the two failure directions are not symmetric: under-claiming just
+// means splitting a logical object into more sub_size pieces (safe, only costs
+// throughput), while over-claiming means a STORE at the compiled-in size
+// gets rejected outright by the device. When in doubt, claim less.
+//
+// This is now only a FALLBACK, not the source of truth — see
+// xnvme_kv_configured_max_value_size() and query_max_value_size()'s hard
+// validation against the device below.
 #define XNVME_KV_DEFAULT_MAX_VALUE_SIZE 32768u
 
 // NVMe completion status for "this key is not on the device", i.e. an ordinary
@@ -80,6 +109,31 @@ extern "C" {
 // an error and a cold cache reports as a broken device, and every lookup path
 // above starts erroring instead of recomputing.
 #define XNVME_KV_SC_KEY_DOES_NOT_EXIST 0x87u
+
+// THE single source of truth for the advertised max single-value size.
+//
+// Reads NIXL_KV_MAX_VALUE_SIZE (see lib.sh's setup_nixl_kv_env(), which
+// exports it from config/cluster.env's KV_MAX_VALUE_SIZE_EFFECTIVE) and
+// falls back to XNVME_KV_DEFAULT_MAX_VALUE_SIZE if it is unset or invalid.
+//
+// This is a free function, not a member, so BOTH callers that must never
+// disagree can call the exact same code: the plugin's getParams() in
+// xnvme_kv_plugin.cpp (what NIXL advertises to a caller) and
+// query_max_value_size() in xnvme_kv_backend.cpp (what gets validated
+// against the device at create_backend()). Prior to 2026-09-17 these read
+// two DIFFERENT things — getParams() read a compiled-in constant or a
+// call-order-dependent discovered_max_value_size_, while nothing validated
+// that value against the device at all — which is exactly how
+// scripts/verify/20-verify-nixl-plugin.sh caught a stale 32768 being
+// advertised for a device that had moved to 4096. Routing both through one
+// function makes that class of disagreement structurally impossible rather
+// than a thing to remember to keep in sync.
+//
+// Defined in xnvme_kv_backend.cpp. Deliberately NOT cached in a static: this
+// is not a hot-path call (once at getParams(), once at create_backend()), and
+// caching would silently freeze whatever value was in the environment on the
+// FIRST call, defeating the entire point of making the value re-readable.
+uint32_t xnvme_kv_configured_max_value_size();
 
 // Per-registered memory descriptor.
 class nixlXnvmeKvMD : public nixlBackendMD {
@@ -193,6 +247,24 @@ struct QueueWorker {
     std::atomic<uint64_t> m_stalls{0};         // stall-check trips
     std::atomic<uint64_t> m_peak_in_flight{0};
     std::atomic<uint64_t> m_lat_sum_us{0};
+    // Retrieve-only, added for the cdw0 length-validation check in
+    // completion_trampoline() (.cpp). It is NOT yet confirmed whether this
+    // Pensando DSC populates completion DWORD 0 with the retrieved value's
+    // length on Retrieve at all (see XNVME_KV_SC_KEY_DOES_NOT_EXIST-style
+    // "measured, not assumed" precedent above) — these two counters are how
+    // that gets settled from a live run instead of guessed:
+    //   m_retr_len_checked:    successful retrieves where cdw0 was non-zero,
+    //                          i.e. the device reported a length and the
+    //                          check in completion_trampoline() actually ran.
+    //   m_retr_len_unreported: successful retrieves where cdw0 was 0, i.e.
+    //                          the safety guard skipped the check because
+    //                          the device gave no length to compare against.
+    // If m_retr_len_checked stays 0 across a whole run, the check is a no-op
+    // on this firmware and the silent-corruption path it guards against is
+    // still open; if m_retr_len_unreported stays 0, the device always
+    // reports and the check is doing real work on every retrieve.
+    std::atomic<uint64_t> m_retr_len_checked{0};
+    std::atomic<uint64_t> m_retr_len_unreported{0};
     // Device-latency histogram, submit-accepted -> completion. Bucket upper
     // bounds in XNVME_KV_LAT_BUCKET_US; last bucket is the overflow.
     std::atomic<uint64_t> m_lat_bucket[8]{};
@@ -210,24 +282,27 @@ public:
     explicit nixlXnvmeKvEngine(const nixlBackendInitParams *init_params);
     ~nixlXnvmeKvEngine() override;
 
-    // Max single-value size as reported by the device's KV Identify Namespace,
-    // discovered once at construction. 0 = not discovered (no backend created
-    // yet, or the query failed) — getParams() then reports the compiled-in
-    // XNVME_KV_DEFAULT_MAX_VALUE_SIZE instead.
+    // Max single-value size as reported by the device's KV Identify Namespace
+    // (the raw "vml" field), published once at construction by
+    // query_max_value_size(). 0 = not discovered (no backend created yet, the
+    // query failed, or the device reported "not indicated").
     //
-    // Read by the plugin's getParams() in xnvme_kv_plugin.cpp. That works
-    // because NIXL never caches plugin params: nixlAgent::getPluginParams()
-    // calls nixlBackendPluginHandle::getBackendOptions(), which calls the
-    // plugin's get_backend_options function pointer fresh every time (see
-    // nixl src/core/nixl_plugin_manager.cpp). So a value stored here during
-    // create_backend() is visible to a get_plugin_params() call made after it
-    // — which is the order LMCache uses.
+    // AS OF 2026-09-17 THIS IS DIAGNOSTIC ONLY — nothing downstream reads it
+    // to decide what to advertise. Before this date, the plugin's getParams()
+    // read this field directly, gated behind NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE,
+    // which had a call-order defect: getParams() can be (and is, by
+    // scripts/verify/20-verify-nixl-plugin.sh) called BEFORE create_backend(),
+    // i.e. before this field is ever populated, so the opt-in silently did
+    // nothing for that caller. getParams() now calls the call-order-independent
+    // xnvme_kv_configured_max_value_size() instead (see its declaration above),
+    // and this field's only remaining job is to give query_max_value_size()
+    // something to hold the device's number in while it validates the
+    // configured value against it.
     //
-    // Static rather than per-instance because getParams() is a plugin-level
-    // callback with no engine pointer. Multiple engines on different devices
-    // would race; in practice one process opens one KV device, and the
-    // conservative-fallback design below means a lost race costs finer
-    // splitting, never a too-large write.
+    // Static rather than per-instance for the same reason it always was:
+    // nothing that reads it has an engine pointer. In practice one process
+    // opens one KV device, so the multi-engine race this was written to
+    // tolerate remains theoretical.
     static std::atomic<uint32_t> discovered_max_value_size_;
 
     // Locate the KV namespace's generic char device, e.g. "/dev/ng3n1", or ""
@@ -410,10 +485,29 @@ private:
     nixl_status_t start_workers();
     void          stop_workers();
 
-    // Issue Identify Namespace (CSI=KV) and publish the device's reported
-    // KV Value Max Length into discovered_max_value_size_. Best-effort: any
-    // failure leaves the value at 0 so the compiled-in default is used.
-    void          query_max_value_size(struct xnvme_dev *dev);
+    // Issue Identify Namespace (CSI=KV), publish the device's reported KV
+    // Value Max Length into discovered_max_value_size_ (diagnostic only, see
+    // its declaration), and VALIDATE xnvme_kv_configured_max_value_size()
+    // against it.
+    //
+    // NO LONGER "best-effort, non-fatal" as of 2026-09-17. It used to be: any
+    // failure silently kept the compiled-in default, and a device advertising
+    // a SMALLER ceiling than what was being advertised to callers only got a
+    // WARNING (see git history / docs/HANDOFF.md §18.3 for how that let a
+    // stale 32768 keep being advertised against a device that had moved to
+    // 4096, caught only by scripts/verify/20-verify-nixl-plugin.sh). Geometry
+    // now comes from config (xnvme_kv_configured_max_value_size()) and this
+    // function's job is to make sure the device actually agrees to serve it —
+    // a disagreement here is a startup failure, not a log line, precisely
+    // because a value that CAN change on-wire object geometry silently is the
+    // one thing this backend must never let happen twice.
+    //
+    // Returns NIXL_SUCCESS if the configured value is safe to advertise
+    // (validated against the device, or unvalidatable but not known-unsafe),
+    // NIXL_ERR_BACKEND if the device's own ceiling is provably smaller than
+    // what would be advertised, or if the device's max key length cannot fit
+    // the 12-byte key make_key() emits.
+    nixl_status_t query_max_value_size(struct xnvme_dev *dev);
 
     static void  *reactor_entry(void *arg);
     void          reactor_loop(QueueWorker *qw);

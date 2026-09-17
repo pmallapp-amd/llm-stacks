@@ -35,10 +35,42 @@
 #include <unistd.h>
 #include <utility>      // std::pair, for the candidate list
 
-// Populated by query_max_value_size() at construction; read by the plugin's
-// getParams(). See the declaration in the header for why this is static and
-// why a stale/zero value is always the safe direction.
+// Populated by query_max_value_size() at construction; diagnostic only as of
+// 2026-09-17 — see the declaration in the header for why nothing downstream
+// reads it to decide what to advertise anymore, and why a stale/zero value is
+// still always the safe direction for the one thing that DOES still touch it
+// (query_max_value_size()'s own validation logic).
 std::atomic<uint32_t> nixlXnvmeKvEngine::discovered_max_value_size_{0};
+
+// See the declaration in xnvme_kv_backend.h for why this exists and why it is
+// deliberately not cached.
+uint32_t xnvme_kv_configured_max_value_size() {
+    const char *env = std::getenv("NIXL_KV_MAX_VALUE_SIZE");
+    if (!env || env[0] == '\0') return XNVME_KV_DEFAULT_MAX_VALUE_SIZE;
+
+    errno = 0;
+    char *endp = nullptr;
+    unsigned long v = std::strtoul(env, &endp, 10);
+    // Reject: no digits consumed at all, trailing garbage after the number,
+    // overflow (ERANGE), or a value that parses but is 0 — a 0-byte max value
+    // is not a usable configuration and almost certainly means someone passed
+    // an empty/garbled override. All of these fall back to the compiled-in
+    // default rather than propagating a bogus number into the on-wire
+    // geometry, but LOUDLY: a config that failed to take effect must never
+    // look identical to one that succeeded.
+    if (endp == env || *endp != '\0' || errno == ERANGE || v == 0 ||
+        v > 0xFFFFFFFFul) {
+        fprintf(stderr,
+                "[XNVME_KV] WARNING: NIXL_KV_MAX_VALUE_SIZE='%s' is not a "
+                "valid positive uint32 — ignoring it and using the "
+                "compiled-in default %u. Set it to a decimal byte count "
+                "<= the device's reported value_max (see "
+                "query_max_value_size()'s log line at startup).\n",
+                env, XNVME_KV_DEFAULT_MAX_VALUE_SIZE);
+        return XNVME_KV_DEFAULT_MAX_VALUE_SIZE;
+    }
+    return static_cast<uint32_t>(v);
+}
 
 // ---- nixlXnvmeKvReqH --------------------------------------------------------
 
@@ -138,6 +170,69 @@ void nixlXnvmeKvEngine::completion_trampoline(struct xnvme_cmd_ctx *ctx, void *c
         }
     }
 
+    // ---- Retrieve return-length validation (cdw0) --------------------------
+    // xnvme_cmd_ctx_cpl_status() above only inspects the completion's
+    // status field (sct/sc). Per the NVMe KV Command Set spec, a Retrieve's
+    // completion DWORD 0 additionally carries the ACTUAL length of the
+    // stored value. If a retrieve asks for N bytes but the stored value is
+    // only M < N bytes, the device returns M bytes WITH SUCCESS STATUS —
+    // `ok` above is already true — and the trailing N-M bytes of the
+    // caller's buffer are left holding whatever was there before (a
+    // previous retrieve's data, stale VRAM staging content, or
+    // uninitialised memory). No layer above this one ever sees an error;
+    // the page reassembles part-new/part-stale and the only symptom is
+    // degraded model output. This is exactly the "read geometry coarser
+    // than write geometry" case xnvme_kv_plugin.cpp's getParams() comment
+    // warns about ("the completion path checks status and not returned
+    // length") — this is that path, being fixed.
+    //
+    // ONLY for retrieve: on store, cdw0 is not defined by the spec as a
+    // length and comparing it to buf_len would just be comparing two
+    // unrelated numbers.
+    //
+    // ONLY when ok is already true: this must never mask or override a
+    // real status error — if the device already reported failure, that
+    // failure is unambiguous without this check.
+    if (ok && work->op != NIXL_WRITE) {
+        // CRITICAL SAFETY GUARD. It is NOT yet confirmed that this specific
+        // Pensando DSC populates cdw0 on Retrieve at all (see
+        // QueueWorker::m_retr_len_checked/m_retr_len_unreported in the
+        // header, added specifically to answer this from a live run). If it
+        // does not, cdw0 is always 0, and a naive `cdw0 != work->buf_len`
+        // check would then fail EVERY retrieve on this device — turning an
+        // intended data-integrity fix into a total outage, which is a far
+        // worse failure than the silent-corruption bug it targets. Treating
+        // cdw0==0 as "not reported" and skipping the check makes this a
+        // no-op on a device that doesn't report a length, and a real check
+        // on one that does.
+        if (ctx->cpl.cdw0 == 0) {
+            work->qw->m_retr_len_unreported.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            work->qw->m_retr_len_checked.fetch_add(1, std::memory_order_relaxed);
+            if (ctx->cpl.cdw0 != work->buf_len) {
+                char keyhex[XNVME_KV_KEY_MAX_LEN * 2 + 1];
+                xnvme_kv_key_hex(reinterpret_cast<const uint8_t *>(&work->key),
+                                 work->key_len, keyhex);
+                XNVME_PLUGIN_ERR
+                    << "retrieve length mismatch key=" << keyhex
+                    << " requested=" << work->buf_len
+                    << " device_reported(cdw0)=" << ctx->cpl.cdw0 << " — "
+                    << (ctx->cpl.cdw0 < work->buf_len ? "SHORT" : "LONG")
+                    << " read: the buffer is a part-new/part-stale "
+                       "reassembly, not a transient error. This indicates a "
+                       "geometry mismatch (value stored at a different size "
+                       "than requested) or on-device corruption, not "
+                       "something a retry fixes.";
+                ok = false;
+            }
+        }
+    }
+
+    // Deliberately checked BEFORE the VRAM staging copy below: a retrieve
+    // caught short/long by the check above must never be staged into VRAM
+    // as if it were good data — that would hand the corrupted buffer to the
+    // GPU instead of surfacing the error. Setting ok=false above makes the
+    // `if (ok && work->vram_dst)` guard immediately below skip the copy.
 #ifndef NIXL_XNVME_NO_VRAM
     if (ok && work->vram_dst) {
         hipError_t e = hipMemcpy(work->vram_dst, work->buf, work->buf_len,
@@ -280,6 +375,7 @@ void nixlXnvmeKvEngine::write_metrics(bool force) {
     uint64_t so = 0, ro = 0, sb = 0, rb = 0, cok = 0, cerr = 0;
     uint64_t sretry = 0, sfail = 0, stalls = 0, peak = 0, latsum = 0;
     uint64_t inflight = 0, buckets[8] = {0};
+    uint64_t rlchecked = 0, rlunreported = 0;
     for (auto &w : workers_) {
         if (!w) continue;
         so     += w->m_store_ops.load(std::memory_order_relaxed);
@@ -294,6 +390,8 @@ void nixlXnvmeKvEngine::write_metrics(bool force) {
         latsum += w->m_lat_sum_us.load(std::memory_order_relaxed);
         peak   += w->m_peak_in_flight.load(std::memory_order_relaxed);
         inflight += w->in_flight;
+        rlchecked    += w->m_retr_len_checked.load(std::memory_order_relaxed);
+        rlunreported += w->m_retr_len_unreported.load(std::memory_order_relaxed);
         for (int i = 0; i < 8; ++i)
             buckets[i] += w->m_lat_bucket[i].load(std::memory_order_relaxed);
     }
@@ -303,6 +401,12 @@ void nixlXnvmeKvEngine::write_metrics(bool force) {
     if (!f) return;   // best-effort: never fail a transfer over a metrics write
     std::fprintf(f,
         "{\n"
+        // Bumped 2026-09-17 for the retr_len_checked/retr_len_unreported
+        // fields added below (see QueueWorker's declaration in the header
+        // for what they mean). Consumers of this file must not assume field
+        // stability across a schema bump — check "schema" before relying on
+        // the presence/absence of any given field.
+        "  \"schema\": 2,\n"
         "  \"backend\": \"XNVME_KV\",\n"
         "  \"pid\": %d,\n"
         "  \"device\": \"%s\",\n"
@@ -319,6 +423,8 @@ void nixlXnvmeKvEngine::write_metrics(bool force) {
         "  \"in_flight\": %llu,\n"
         "  \"peak_in_flight\": %llu,\n"
         "  \"lat_us_sum\": %llu,\n"
+        "  \"retrieve_len_checked\": %llu,\n"
+        "  \"retrieve_len_unreported\": %llu,\n"
         "  \"lat_us_bucket_upper\": [16,64,256,1024,4096,16384,65536,-1],\n"
         "  \"lat_us_bucket\": [%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n"
         "}\n",
@@ -329,6 +435,7 @@ void nixlXnvmeKvEngine::write_metrics(bool force) {
         (unsigned long long)sretry, (unsigned long long)sfail,
         (unsigned long long)stalls, (unsigned long long)inflight,
         (unsigned long long)peak, (unsigned long long)latsum,
+        (unsigned long long)rlchecked, (unsigned long long)rlunreported,
         (unsigned long long)buckets[0], (unsigned long long)buckets[1],
         (unsigned long long)buckets[2], (unsigned long long)buckets[3],
         (unsigned long long)buckets[4], (unsigned long long)buckets[5],
@@ -652,9 +759,26 @@ nixl_status_t nixlXnvmeKvEngine::start_workers() {
         workers_.push_back(std::move(qw));
     }
 
-    // Ask the device what it actually supports, now that a handle exists.
-    // Best-effort and non-fatal: on any failure the compiled-in default stands.
-    query_max_value_size(workers_[0]->dev);
+    // Ask the device what it actually supports, now that a handle exists, and
+    // VALIDATE the configured max_value_size against it.
+    //
+    // NO LONGER best-effort/non-fatal (that changed 2026-09-17 — see the
+    // declaration in the header for why). A hard failure here is returned to
+    // the caller, not swallowed: at least one worker's reactor thread is
+    // already running by this point (the loop above already pushed every
+    // successfully-started worker into workers_), so returning non-SUCCESS
+    // does NOT leak them. The constructor (below) sets initErr = true on any
+    // non-SUCCESS return from start_workers() and returns without touching
+    // workers_ further; nixlXnvmeKvEngine's caller then deletes the (partially
+    // constructed but otherwise intact) engine object, which runs
+    // ~nixlXnvmeKvEngine() -> stop_workers(), which signals stop on every
+    // entry already in workers_, joins its thread, and closes its queue/dev —
+    // reclaiming exactly the resources this function's failure path would
+    // otherwise strand. This is the SAME pattern spdk_nvme_kv_backend.cpp
+    // already uses after its own start_spdk_reactor() failure (initErr = true;
+    // return;), not a new risk introduced here.
+    nixl_status_t qs = query_max_value_size(workers_[0]->dev);
+    if (qs != NIXL_SUCCESS) return qs;
 
     // Dedicated handle for queryMem()'s synchronous KV Exist probes. See the
     // declaration for why this is not one of the workers' handles.
@@ -755,7 +879,33 @@ nixl_status_t nixlXnvmeKvEngine::queryMem(const nixl_reg_dlist_t         &descs,
     return any_failed ? NIXL_ERR_BACKEND : NIXL_SUCCESS;
 }
 
-void nixlXnvmeKvEngine::query_max_value_size(struct xnvme_dev *dev) {
+nixl_status_t nixlXnvmeKvEngine::query_max_value_size(struct xnvme_dev *dev) {
+    // NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE was REMOVED 2026-09-17. It read
+    // discovered_max_value_size_, which only start_workers() (i.e.
+    // create_backend()) ever populated, so a caller that fetched plugin
+    // params BEFORE creating a backend — which
+    // scripts/verify/20-verify-nixl-plugin.sh does, calling
+    // get_plugin_params() at :171 and create_backend() only at :214 — still
+    // saw the stale compiled-in value regardless of this flag. An opt-in
+    // whose effect depends on when the caller happens to call it is not a
+    // real control; on-wire geometry must never depend on call order. Warn
+    // rather than silently ignore, since an operator who set this expects it
+    // to do something.
+    if (std::getenv("NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE")) {
+        fprintf(stderr,
+                "[XNVME_KV] WARNING: NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE is set "
+                "but has been REMOVED and is IGNORED (2026-09-17). It was "
+                "call-order dependent: it only worked if create_backend() had "
+                "already run before get_plugin_params() was called, which is "
+                "not true for every caller (scripts/verify/"
+                "20-verify-nixl-plugin.sh calls get_plugin_params() before "
+                "create_backend()). Set NIXL_KV_MAX_VALUE_SIZE=<bytes> "
+                "instead — that is now the single source of truth for both "
+                "getParams() and this validation, and is not fatal here.\n");
+    }
+
+    const uint32_t configured = xnvme_kv_configured_max_value_size();
+
     // Identify Namespace with CSI=KV (Key Value Command Set Spec 1.0c, Fig 39).
     // The 4096-byte result carries up to 16 KV format descriptors; the active
     // one is selected by the KV Format Capabilities byte at offset 29 (low
@@ -765,9 +915,10 @@ void nixlXnvmeKvEngine::query_max_value_size(struct xnvme_dev *dev) {
     auto *idfy = static_cast<struct xnvme_spec_kvs_idfy *>(
         xnvme_buf_alloc(dev, sizeof(struct xnvme_spec_kvs_idfy)));
     if (!idfy) {
-        XNVME_PLUGIN_ERR << "max_value_size query: xnvme_buf_alloc failed; keeping default "
-                         << XNVME_KV_DEFAULT_MAX_VALUE_SIZE;
-        return;
+        XNVME_PLUGIN_ERR << "max_value_size query: xnvme_buf_alloc failed; cannot validate "
+                            "configured max_value_size=" << configured
+                         << " against the device — proceeding UNVALIDATED";
+        return NIXL_SUCCESS;
     }
     std::memset(idfy, 0, sizeof(struct xnvme_spec_kvs_idfy));
 
@@ -776,11 +927,12 @@ void nixlXnvmeKvEngine::query_max_value_size(struct xnvme_dev *dev) {
     if (err || xnvme_cmd_ctx_cpl_status(&ctx)) {
         fprintf(stderr,
                 "[XNVME_KV] max_value_size query failed (err=%d sct=%u sc=%u) — "
-                "keeping compiled-in default %u\n",
+                "cannot validate configured max_value_size=%u against the "
+                "device — proceeding UNVALIDATED\n",
                 err, (unsigned)ctx.cpl.status.sct, (unsigned)ctx.cpl.status.sc,
-                XNVME_KV_DEFAULT_MAX_VALUE_SIZE);
+                configured);
         xnvme_buf_free(dev, idfy);
-        return;
+        return NIXL_SUCCESS;
     }
 
     uint8_t idx = static_cast<uint8_t>(idfy->ns.rsvd29[0] & 0x0F);
@@ -788,35 +940,95 @@ void nixlXnvmeKvEngine::query_max_value_size(struct xnvme_dev *dev) {
     const uint32_t vml = idfy->ns.kvf[idx].vml;
     const uint16_t kml = idfy->ns.kvf[idx].kml;
 
-    // Report unconditionally, even though adopting the value is opt-in (see
-    // getParams()). A device whose advertised size differs from the
-    // empirically-validated default is precisely what someone needs to see
-    // before deciding to change the on-disk geometry.
+    // Report unconditionally. The whole point of the 2026-09-17 change is
+    // that geometry comes from config, not this query — but the query still
+    // needs to be visible in the log so a mismatch is legible, not just a
+    // terse hard-fail below.
     fprintf(stderr,
             "[XNVME_KV] device KV format %u: value_max=%u key_max=%u novg=%u "
-            "(compiled-in default %u)\n",
-            idx, vml, kml, idfy->ns.novg, XNVME_KV_DEFAULT_MAX_VALUE_SIZE);
+            "— configured max_value_size=%u (compiled-in default %u)\n",
+            idx, vml, kml, idfy->ns.novg, configured,
+            XNVME_KV_DEFAULT_MAX_VALUE_SIZE);
 
+    // make_key() always emits exactly 12 bytes (xnvme_kv_backend.h). A device
+    // that cannot accept a 12-byte key cannot accept ANY store this backend
+    // issues — this used to be a warning (pre-2026-09-17); promoted to a hard
+    // failure because there is no value in starting a backend that is
+    // guaranteed to reject every write.
     if (kml != 0 && kml < 12) {
         XNVME_PLUGIN_ERR << "device max key length " << kml
-                         << " is below the 12 bytes make_key() emits — stores will be rejected";
+                         << " is below the 12 bytes make_key() emits — every "
+                            "store would be rejected; refusing to start";
+        xnvme_buf_free(dev, idfy);
+        return NIXL_ERR_BACKEND;
     }
+
     if (vml == 0) {
-        fprintf(stderr, "[XNVME_KV] device reported value_max=0 (not indicated); "
-                        "keeping compiled-in default %u\n", XNVME_KV_DEFAULT_MAX_VALUE_SIZE);
-    } else {
-        discovered_max_value_size_.store(vml, std::memory_order_relaxed);
-        if (vml < XNVME_KV_DEFAULT_MAX_VALUE_SIZE) {
-            // The compiled-in default is too big for this device: writes at
-            // the default size would be rejected. Loud, because the fallback
-            // is no longer the safe choice here.
-            XNVME_PLUGIN_ERR << "WARNING: device value_max=" << vml
-                             << " is SMALLER than the compiled-in default "
-                             << XNVME_KV_DEFAULT_MAX_VALUE_SIZE
-                             << " — set NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE=1 or stores will fail";
-        }
+        // "Not indicated" per the KV Command Set spec — not a device error,
+        // just a device that doesn't tell us. Keep the configured value: it
+        // is still the right thing to advertise, we simply have no way to
+        // cross-check it here.
+        fprintf(stderr,
+                "[XNVME_KV] WARNING: device reported value_max=0 (not "
+                "indicated) — configured max_value_size=%u could NOT be "
+                "validated against the device. Proceeding with the configured "
+                "value; if stores start failing, this is the first thing to "
+                "re-check.\n",
+                configured);
+        xnvme_buf_free(dev, idfy);
+        return NIXL_SUCCESS;
     }
+
+    discovered_max_value_size_.store(vml, std::memory_order_relaxed);
     xnvme_buf_free(dev, idfy);
+
+    if (configured > vml) {
+        // NOT FATAL BY DEFAULT — and the reason is the whole point of this
+        // block, so read it before "fixing" it.
+        //
+        // An earlier version of this check (2026-09-17, same day, reverted)
+        // returned NIXL_ERR_BACKEND here, on the reasoning that "the device is
+        // the AUTHORITY on what it will accept". That reasoning is WRONG on
+        // this hardware, in a way that made the repo's own default config
+        // un-startable: config/cluster.env defaults KV_MAX_VALUE_SIZE_XNVME to
+        // 32768, this DSC advertises vml=4096, so create_backend() failed for
+        // anyone without the creds-level 4096 override.
+        //
+        // The advertised value is NOT known to bound true capability here:
+        //   - 32768 B was measured working on this same DSC (65536 failed,
+        //     sct=7 sc=234) — see XNVME_KV_DEFAULT_MAX_VALUE_SIZE's comment.
+        //   - The hardware owner states the device supports up to 65536, with
+        //     32768 the reliable operating point.
+        //   - The advertised field later moved to 4096 with no evidence that
+        //     32768 stores stopped working. Nobody has tried one since.
+        // "Advertised understates capability" and "firmware genuinely got more
+        // conservative" are INDISTINGUISHABLE from the host by reasoning. Only
+        // a store/retrieve at the configured size settles it, and until that
+        // probe exists (docs/TODO.md) this code must not pick a side by
+        // refusing to start.
+        //
+        // So: warn loudly every time, and let the operator opt IN to strict
+        // enforcement once the real ceiling is known for their firmware.
+        const char *strict = std::getenv("NIXL_KV_STRICT_DEVICE_CEILING");
+        XNVME_PLUGIN_ERR << "device advertises value_max=" << vml
+                         << " but configured max_value_size=" << configured
+                         << " — stores at the configured size MAY be rejected "
+                            "(sct=7 sc=234 is the observed over-size failure "
+                            "on this DSC). This is a WARNING, not a failure: "
+                            "the advertised field has understated capability "
+                            "on this device before. Verify with a store at "
+                            "the configured size; set "
+                            "NIXL_KV_STRICT_DEVICE_CEILING=1 to make this "
+                            "fatal, or lower NIXL_KV_MAX_VALUE_SIZE / "
+                            "KV_MAX_VALUE_SIZE_XNVME to <= " << vml
+                         << ". NOTE: changing this value changes ON-WIRE "
+                            "OBJECT GEOMETRY for anything already stored — "
+                            "drain the namespace first, see "
+                            "scripts/target/50-reset-namespace.sh";
+        if (strict && strict[0] == '1') return NIXL_ERR_BACKEND;
+    }
+
+    return NIXL_SUCCESS;
 }
 
 void nixlXnvmeKvEngine::stop_workers() {
@@ -1038,6 +1250,64 @@ nixl_status_t nixlXnvmeKvEngine::checkXfer(nixlBackendReqH *handle) const {
 }
 
 nixl_status_t nixlXnvmeKvEngine::releaseReqH(nixlBackendReqH *handle) const {
+    auto *req = static_cast<nixlXnvmeKvReqH *>(handle);
+
+    // Do NOT delete a request that may still have ops in flight.
+    // ~nixlXnvmeKvReqH() (see this file, above) hipHostUnregisters and
+    // frees staging_, the VRAM staging buffer. If any command submitted
+    // against this handle is still outstanding when that runs, the
+    // device/driver is DMAing into memory that has just been returned to
+    // the allocator, and any completion still to arrive dereferences
+    // work->req (this handle) after it is gone — two distinct
+    // use-after-free failure modes from one unconditional `delete`.
+    //
+    // VERIFIED before relying on it, per the task that produced this fix:
+    // kv_complete_cb() (above in this file) already does
+    // `req->pending.fetch_sub(1, std::memory_order_acq_rel)` and, on the
+    // transition to 0, `req->cv.notify_all()` — no change was needed there
+    // to make waiting here correct. (That notify is not itself issued
+    // while holding req->mtx; the wait below uses cv.wait_for()'s
+    // predicate form, which re-checks the atomic `pending` once more right
+    // as the timeout expires, so even a theoretical notify-before-wait
+    // race self-heals within this same bounded wait instead of hanging.)
+    {
+        std::unique_lock<std::mutex> lk(req->mtx);
+        // 30s: the same magnitude as NIXL_XNVME_STALL_TIMEOUT_SEC's default
+        // (see stall_timeout_ns_'s declaration in the header) — the
+        // reactor's own stall detector already gives up on a device making
+        // zero forward progress at that timescale, so this wait is bounded
+        // by the same "the DSC has wedged" assumption, not an arbitrary
+        // number.
+        const bool done = req->cv.wait_for(lk, std::chrono::seconds(30), [&] {
+            return req->pending.load(std::memory_order_acquire) == 0;
+        });
+        if (!done) {
+            const int outstanding = req->pending.load(std::memory_order_acquire);
+            XNVME_PLUGIN_ERR
+                << "releaseReqH: request still has " << outstanding
+                << " op(s) outstanding after a 30s wait — this normally "
+                   "means the device has wedged (see reactor_loop()'s "
+                   "\"queue made no forward progress\" stall path: it can "
+                   "fail work still sitting in the local backlog, but NOT "
+                   "work already accepted by the device, which is exactly "
+                   "the outstanding count seen here). "
+                   "INTENTIONALLY LEAKING this handle rather than deleting "
+                   "it: ~nixlXnvmeKvReqH() frees staging_ (the VRAM staging "
+                   "buffer) via hipHostUnregister()+free(), and if the "
+                   "device is still able to DMA into it — which is exactly "
+                   "what \"still outstanding\" means here — freeing it races "
+                   "an in-flight DMA against the allocator handing that same "
+                   "memory to someone else. A leak wastes memory; a "
+                   "use-after-free here corrupts memory the device may "
+                   "still be writing to, or is a wild pointer dereference "
+                   "when the eventual completion runs. Leaking is strictly "
+                   "the safer failure. DO NOT \"fix\" this by deleting "
+                   "anyway — a future reader who removes this leak is "
+                   "reintroducing the exact bug this code exists to close.";
+            return NIXL_ERR_BACKEND;
+        }
+    }
+
     delete handle;
     return NIXL_SUCCESS;
 }

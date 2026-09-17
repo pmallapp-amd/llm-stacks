@@ -610,14 +610,36 @@ setup_nixl_kv_env() {
     export NIXL_PLUGIN_DIR
     export LD_LIBRARY_PATH="${NIXL_PREFIX}/lib/x86_64-linux-gnu:${UCX_PREFIX}/lib:${ROCM_PATH}/lib:${LD_LIBRARY_PATH:-}"
 
-    # Left UNSET on purpose, for BOTH backends. Setting it to 1 makes the
-    # plugin adopt the device's reported value ceiling instead of the
-    # validated constant, which silently changes on-wire object geometry and
-    # lets a reader reassemble a half-stale page from sub-keys written under
-    # the old split. This is docs/HANDOFF.md §7 invariant 4, and it applies
-    # identically to XNVME_KV — see the same hazard documented in
-    # plugins/xnvme-kv/xnvme_kv_plugin.cpp's getParams() comment, not just
-    # plugins/nvme-kv/spdk_nvme_kv_plugin.cpp's.
+    # The invariant is unchanged in SPIRIT from the old `unset
+    # NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE` this replaced (2026-09-17):
+    # advertised max_value_size must be a validated CONSTANT, never whatever
+    # the device happens to report today, because a silent change re-derives
+    # n = ceil(page_size / max_value_size) and lets a reader reassemble a
+    # half-stale page from sub-keys written under the OLD split. That is
+    # docs/HANDOFF.md §7 invariant 4, and it applies identically to XNVME_KV —
+    # see plugins/xnvme-kv/xnvme_kv_plugin.cpp's getParams() comment.
+    #
+    # The MECHANISM is now positive rather than negative: instead of
+    # suppressing an opt-in override (which turned out to be call-order
+    # dependent and never actually worked — see
+    # xnvme_kv_backend.cpp's query_max_value_size() comment), we STATE the
+    # value outright. KV_MAX_VALUE_SIZE_EFFECTIVE (config/cluster.env) is the
+    # one place that constant is decided for whichever KV_BACKEND is
+    # selected; exporting it as NIXL_KV_MAX_VALUE_SIZE makes the xnvme-kv
+    # plugin's getParams() AND its create_backend()-time device validation
+    # both read the exact same number, so they cannot disagree by
+    # construction. The plugin still hard-fails at create_backend() if this
+    # value exceeds what the device's KV Identify Namespace actually reports
+    # (query_max_value_size() in xnvme_kv_backend.cpp) — this export sets
+    # what gets advertised and validated, it does not bypass that check.
+    #
+    # The unset below is kept as a belt-and-braces guard against an
+    # INHERITED environment (e.g. a parent shell/CI job that still has the
+    # removed variable exported from before 2026-09-17) — the plugin now
+    # only warns and ignores it rather than trusting it, but there is no
+    # reason to let a dead variable linger in a freshly-set-up environment
+    # either.
+    export NIXL_KV_MAX_VALUE_SIZE="${KV_MAX_VALUE_SIZE_EFFECTIVE}"
     unset NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE
 
     case "${KV_BACKEND}" in

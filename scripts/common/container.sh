@@ -113,11 +113,35 @@ export NIXL_PLUGIN_DIR="${NIXL_PLUGIN_DIR:-/opt/nixl/lib/x86_64-linux-gnu/plugin
 # device pointer for VRAM_SEG registration.
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False"
 
-# The DSC KV namespace reports value_max=4096, SMALLER than the plugin's
-# compiled-in 32768 default. Without this the plugin keeps advertising
-# 32768 and every store larger than the device ceiling fails — the plugin
-# prints a warning saying exactly this at backend init.
-export NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE="${NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE:-1}"
+# NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE IS DELIBERATELY NOT EXPORTED HERE.
+#
+# It used to be, set to 1, on the reasoning that the DSC KV namespace reports
+# value_max=4096 (smaller than the plugin's compiled-in 32768) and that
+# "every store larger than the device ceiling fails". Removed 2026-09-16.
+# Three separate reasons, any one of which is sufficient:
+#
+#   1. IT NEVER TOOK EFFECT. start-vllm.sh sources this file and THEN calls
+#      lib.sh's setup_nixl_kv_env(), which `unset`s the variable outright
+#      (lib.sh:613-621, HANDOFF §7 invariant 4). lib.sh always won. An
+#      operator control that is silently annulled is worse than none.
+#
+#   2. ITS PREMISE IS FALSE ON THIS DEPLOYMENT. The MP daemon's nixl_store
+#      unit is --l1-align-bytes (4096), so mem_split_n == 1 and every stored
+#      object is 4096 B. Nothing has ever exceeded even the 4096 ceiling.
+#      The completions_err counts that motivated this are the DSC stall
+#      watchdog, not size rejections — they come in exact multiples of the
+#      64-deep queue (measured: 704 err == 11 stalls x 64).
+#
+#   3. IT IS CALL-ORDER DEPENDENT AND SO CANNOT BE TRUSTED ANYWAY.
+#      getParams() (xnvme_kv_plugin.cpp:52-58) reads discovered_max_value_size_,
+#      which start_workers() only populates during create_backend(). A caller
+#      doing get_plugin_params() BEFORE create_backend() — which
+#      20-verify-nixl-plugin.sh does, :171 then :214 — still sees 32768 even
+#      with the flag set. On-wire geometry must never depend on call order.
+#
+# The correct model: geometry comes from config (KV_MAX_VALUE_SIZE_EFFECTIVE),
+# the device is a VALIDATOR, and a disagreement should be a startup failure.
+# Aligning the plugin's compiled-in default to 4096 needs `plugin-build`.
 EOF
     ok "wrote ${STACK_ROOT}/etc/env.sh and ${STACK_ROOT}/venv/bin/python"
 }
