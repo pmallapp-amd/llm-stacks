@@ -1,6 +1,6 @@
 # TODO
 
-Working task list. Last updated 2026-09-16.
+Working task list. Last updated 2026-09-17.
 
 ## How to use this list
 
@@ -16,11 +16,11 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 |---|---|---|---|---|
 | 0 | Blocking decisions and follow-ups | 4 | 2 | 2 |
 | 1 | Architecture correction (compute leg) | 14 | 12 | 0 |
-| 2 | Hardware bring-up (Phase 1, TCP) | 13 | 5 | 3 |
+| 2 | Hardware bring-up (Phase 1, TCP) | 13 | 6 | 2 |
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 3 | 0 |
 | 4 | Open items and known limitations | 6 | 1 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 22 | 12 | 6 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 23 | 12 | 6 |
 
 **Read [HANDOFF §9](HANDOFF.md#9-how-to-resume) first** — it carries the
 cluster state as handed over and the ordered plan. This block is the index.
@@ -51,16 +51,77 @@ also resolves 4.5's connector-order ambiguity** (there is no longer a
 `max_value_size` question** (HANDOFF §17.5: the split never engages on
 the path this repo actually runs — see 6.4/6.10).
 
-**6.10 remains the one live item in §6 — the code is now implemented and
-parser-validated, NOT yet proven on live hardware.** Bringing the
-composed daemon+L2-adapter stack up against `smc3` (or the local DSC) and
-producing an actual LMCache hit through it has not been done. It is
-blocked on exactly what it always was — **6.18** (`smc3` ownership) and
-**6.20** (`smc2`'s reboot instability) — not on any remaining code gap.
-Evaluate the local-DSC option (HANDOFF §16.8) first: both `smc1` and
+**6.10 remains the one live item in §6 — and as of 2026-09-17 it is
+blocked on exactly one thing, not several.** Bringing the composed
+daemon+L2-adapter stack up and producing an actual cross-node LMCache hit
+through it has still not been done — but 2026-09-17's roundtrip proof
+(6.25) closes out every candidate cause *except* the one 6.21 already
+named: two live vLLM engines this session stored 36,864 objects between
+them and retrieved zero, while this repo's own standalone roundtrip tool
+proved the identical plugin/device/namespace supports cross-node
+store+retrieve in both directions on the same box, same session. 6.10 is
+therefore no longer blocked on 6.18 (`smc3` ownership — moot, see below)
+or on any plugin/topology gap; it is blocked on 6.21's LMCache
+key-derivation patch, full stop.
+~~Evaluate the local-DSC option (HANDOFF §16.8) first: both `smc1` and
 `smc2` have their own local Pensando DSC (`/dev/ng1n1`), and a local-DSC
 XNVME_KV tier would not need `smc3` at all — unproven, nothing deployed
-yet.
+yet.~~ **SUPERSEDED 2026-09-16/17 — see 6.25.** The remote target is up,
+and the "local DSC" is not a separate device: `nvme ns-descs /dev/ng1n1`
+on both `smc1` and `smc2` returns an identical `csi`/`eui64` and each
+node's own Pensando DSC is itself an NVMe-oF initiator peered to `smc3`.
+It **is** `smc3`, re-exported per-node — there is no local-DSC escape
+from 6.18, and the topology question this paragraph was hedging against
+is closed, not merely evaluated. **2026-09-17: this is no longer a
+topology question at all — 6.25 now has an actual cross-node
+store+retrieve measurement through it, not just matching `eui64`s.**
+
+**Model changed underneath every number in this list — read before
+quoting any throughput/latency figure.** The running stack is
+`Qwen/Qwen3-8B`, `--tensor-parallel-size 1` (72B is a 145 GB download not
+present on either compute node), `--gpu-memory-utilization 0.85`,
+`--max-model-len 32768`, `--block-size 64` — **not**
+`Qwen2.5-72B-Instruct` at TP=8, which every prior measurement in this
+file and in HANDOFF.md predates. See HANDOFF §18.1. `config/cluster.env`'s
+tracked default is unchanged; this is a creds-level override for the
+current deployment.
+
+**The KV device geometry still hasn't been reconciled on the plugin side
+(6.24, unchanged), but the DSC wedge that used to be the top open
+operational issue is CLEARED, and the storage tier's remaining blocker is
+now isolated to one thing — see 6.24, 6.21 (updated 2026-09-17), 6.22
+(updated 2026-09-17), 6.25 (updated 2026-09-17).** `XNVME_KV`'s
+device-reported `value_max` is still 32768 → 4096
+(`20-verify-nixl-plugin.sh` still fails on the mismatch until a plugin
+rebuild lands — 6.24). The DSC stall watchdog 6.22 first recorded and
+§18.5 found worsening (`completions_err`/`stalls` climbing within a
+session, a standalone verify script wedging on its first store) is now
+**cleared** after both compute nodes were rebooted with the DPU side up:
+`completions_err=0`/`stalls=0` across every process, 2026-09-17 (HANDOFF
+§19.3) — not proven immune to recurring under the same load, just
+measured clear right now. And `retrieve_ops=0` on the live vLLM
+engines — previously measured on both roles without a way to rule out
+plugin/device/topology as the cause — is now isolated cleanly to 6.21's
+LMCache key-derivation defect: this session's standalone roundtrip proved
+the identical plugin/device/namespace supports cross-node store+retrieve
+in both directions (6.25), while the live engines' `store=36,864` /
+`retrieve=0` persisted unchanged alongside it. See HANDOFF §19.
+
+**New this session, 2026-09-17 — a DSC boot-time race, not previously
+recorded: see 6.26.** At boot the kernel can probe the DSC NVMe
+controller before the DPU-side application is ready
+(`CSTS=0x0`/"Device not ready"), the kernel driver detaches, and nothing
+re-probes it — `/dev/ng1n1` then never appears until a manual rebind,
+which itself only succeeds once the DPU side is actually up. Added to the
+per-boot ritual: confirm `/dev/ng1n1` exists before starting anything.
+HANDOFF §19.1/§9.4.
+
+**The P→D verify ladder had four false-negative defects, now fixed and
+re-passing 9/9 against the new model — see the note appended to 1.7.**
+`scripts/verify/50-verify-pd-direct.sh` was failing on a fully healthy
+system for reasons unrelated to the transfer itself (missing handoff in
+its own priming request, wrong side-channel host resolution, a
+stats-logger race, a dead string assertion). See HANDOFF §18.6/§18.7.
 
 **Backend default — 6.22, done.** `config/cluster.env`'s `KV_BACKEND`
 default is now **XNVME_KV**, matching the decision 6.3 already recorded.
@@ -177,10 +238,63 @@ rework.
 - [x] **1.6** Thread `kv_transfer_params` through `scripts/proxy/disagg_proxy.py`.
 - [x] **1.7** Add `scripts/verify/50-verify-pd-direct.sh`, distinguishing a direct
       NIXL transfer from an LMCache hit from vLLM's own prefix cache.
+
+      **Four defects found and fixed, 2026-09-16/17 — all four produced a
+      FALSE NEGATIVE on a fully healthy system, not a false positive.**
+      (1) The priming request never included
+      `kv_transfer_params={"do_remote_decode":true,...}`, so
+      `NixlConnector` never staged blocks and never returned a handoff —
+      the exact trap `scripts/proxy/disagg_proxy.py`'s own module
+      docstring documents (lines 44-51); the proxy was fixed 2026-09-15,
+      this verify script was not updated to match. (2) The side-channel
+      reachability check probed `${PREFILL_HOST}`/`${DECODE_HOST}`
+      directly instead of resolving the same way `lib.sh`'s
+      `setup_pd_env()` does — `smc2` enumerates fabric NICs before its
+      management NIC, so decode had bound `30.2.1.1`, not the management
+      address the check assumed. (3) A race against vLLM's ~10 s periodic
+      stats logger — fixed by capturing a baseline before the request and
+      polling up to 45 s for a new line. (4) A hard assertion on the
+      literal string `need to load: <nonzero>`, which this stack never
+      emits at default verbosity — demoted to corroborating-only; the
+      hard assertion is now that the cumulative "External prefix cache
+      hit rate" **increased** versus baseline. Also recorded: `bc` is not
+      present in the `rocm-aic:mp-pd-ionic2609` image — float comparisons
+      here use `awk`. With all four fixed, the rung **passes 9/9** against
+      the current (Qwen3-8B/TP=1) stack; a controlled A/B on a fresh-nonce
+      ~1230-token prompt reproduced §11's qualitative signature (decode
+      0.0 tok/s / hit rate rising with the handoff threaded in; 124.7
+      tok/s / hit rate falling without it), and
+      `scripts/verify/40-verify-disagg.sh` passed 9/9 with TTFT improving
+      2.14x. **Do not compare these throughput numbers against any
+      pre-2026-09-16 figure in this file** — the model changed (HANDOFF
+      §18.1). Full account: HANDOFF §18.6/§18.7.
+
+      **RE-VERIFIED 2026-09-17 on the fully rebuilt stack, after both
+      compute nodes were rebooted — same result, not a new one.**
+      `50-verify-pd-direct.sh` **9/9 PASSED** again, external prefix cache
+      hit rate rising 0.0% → 100.0% on a fresh engine (a genuine baseline,
+      not a stale reading) with decode `Avg prompt throughput: 0.0
+      tokens/s`; `40-verify-disagg.sh` **9/9 PASSED**; proxy `/status`
+      `prefill_no_handoff: 0`; decode's NIXL side channel bound to
+      `30.2.1.1:5601`, confirming the `PD_SIDE_CHANNEL_HOST_DECODE` pin
+      (§1.9 below) is deterministic across a reboot. Full account: HANDOFF
+      §19.5.
 - [x] **1.8** Fix `setup_ucx_env` — `ib,rocm,self,sm`, RoCE `/31` subnet handling,
       per-role device pinning.
 - [x] **1.9** Add `setup_pd_env` (refuses a loopback side-channel address) and
       `require_rdma_access` (opens a uverbs node rather than stat-ing it).
+
+      **Bind addresses now pinned in creds, 2026-09-16/17** —
+      `PD_SIDE_CHANNEL_HOST_PREFILL=10.30.75.198`,
+      `PD_SIDE_CHANNEL_HOST_DECODE=30.2.1.1` — removing the `hostname -I`
+      first-IP lottery that 1.7's defect (2) depended on to reproduce.
+      **Known, non-correctness asymmetry, not fixed here:** bulk KV still
+      rides UCX over `ens51f0` (management) on both nodes, while decode's
+      metadata side channel now sits on a fabric NIC (`benic1p1`) rather
+      than management. Nothing has broken because of it — 1.7's rung
+      passes 9/9 with this pin in place — but resolve to one NIC class
+      before trusting it under a topology change (e.g. 1.14's xPyD fleet
+      shape). See HANDOFF §18.8.
 - [x] **1.10** Open side-channel ports in both host-prep scripts.
 - [x] **1.11** Record the SPDK patch provenance and upstream status.
 - [x] **1.12** Externalise credentials, purge history, add template + bootstrap.
@@ -272,15 +386,38 @@ rework.
       so nothing on the from-source chain is on the critical path. Left open
       rather than deleted because the `ldd` invariant (HANDOFF §7 invariant 2)
       still governs any future source build.
-- [!] **2.7** Reconcile the LMCache YAML keys and NIXL backend allowlist patch
+- [x] **2.7** Reconcile the LMCache YAML keys and NIXL backend allowlist patch
       against the version that actually installs. **Folded into 6.10
       2026-09-15.** The premise changed: the container ships LMCache 0.5.3
-      pre-installed, so `patches/lmcache/apply-patches.sh` — which patches a
+      pre-installed, so the patch generator script — which patches a
       *source* install's backend allowlist — has nothing to patch on this path.
       What still has to be established, and 6.10 owns it, is whether that
       prebuilt LMCache already accepts `XNVME_KV` as a `nixl_backend` or needs
       the allowlist edit applied inside the image. Still "most likely thing to
       bite", just relocated.
+
+      **ANSWERED 2026-09-17, corrected same day — the generator is
+      withdrawn, but the patches it would have written by hand are real and
+      already applied.** The vendored LMCache 0.5.3 accepts both backends
+      because the vendor image was built with
+      `patches/lmcache/0006`/`0007`/`0008` applied — an earlier note here
+      said "no patch needed" and that was wrong, corrected the same day
+      (see `docs/HANDOFF.md` §20 and
+      [`patches/lmcache/README.md`](patches/lmcache/README.md) for the
+      full record and re-verification recipe). The **generator script**
+      this item was originally about is still correctly withdrawn from the
+      tree for reason (1) below — that part stands:
+      (1) it targeted the from-source build path
+      (`scripts/common/20-build-vllm-lmcache.sh` -> `/opt/kvstack/venv`),
+      which has never completed a build and is deprioritised (§6.2), so
+      the generator has nothing to run against on this path and survives
+      only in git history if that path is revived.
+      The MP daemon start observed 2026-09-17 (`--l2-adapter
+      '{"type":"nixl_store","backend":"XNVME_KV",...}'`, logging
+      `nixl_store backend XNVME_KV: page_size=4096, declared
+      max_value_size='32768'`, live engines storing ~1.16 GB through it) is
+      real and still stands as evidence the patched backend works — it was
+      the inference "therefore nothing was ever patched" that was false.
 - [~] **2.8** Determine which `ionic_*` device is which physical port on *each*
       host; set `PREFILL_UCX_NET_DEVICES` / `DECODE_UCX_NET_DEVICES` in the
       creds file. **Measured 2026-09-14:** on `smc1` all 8 `ionic_N` map 1:1
@@ -970,12 +1107,21 @@ otherwise.*
          reporting a non-zero match wins the load
          (`multi_connector.py:387-400`), so if LMCache is listed first and
          hits, the NIXL pull is skipped. NixlConnector first.
-      3. **The allowlist patch is not needed on the container path.**
-         `XNVME_KV` and `SPDK_NVMe_KV` are in all three backend tuples of
-         the vendored 0.5.3 (`nixl_storage_backend.py:126`, `:670`,
-         `:1119`). This closes the container half of 2.7. The patch
-         remains correct for a from-source build; its comment in
-         `gen-lmcache-config.sh` no longer claims otherwise.
+      3. **The allowlist is patched into the container image, not applied
+         by anything in this repo.** `XNVME_KV` and `SPDK_NVMe_KV` are in
+         all three backend tuples of the vendored 0.5.3
+         (`nixl_storage_backend.py:126`, `:670`, `:1119`) because
+         `patches/lmcache/0008` put them there at image-build time; the
+         daemon path this repo actually runs uses `nixl_store_l2_adapter.py`
+         instead, patched by `0006`/`0007`. This closes the container half
+         of 2.7. **Corrected 2026-09-17 — a same-day note here and at 2.7
+         wrongly said this meant "no patch needed" and withdrew
+         `patches/lmcache/` entirely; that deletion was caught before
+         commit and reverted.** The **generator script** remains withdrawn
+         (the from-source path it targeted has never completed a build and
+         is deprioritised, so nothing on this tree needs it; it survives in
+         git history) — but the patches themselves are real, required, and
+         tracked at `patches/lmcache/README.md`.
       4. **`max_local_cpu_size` is PER TP WORKER, and getting it wrong is
          a node-availability hazard, not a tuning nit.** `cluster.env`'s
          `LMCACHE_MAX_LOCAL_CPU_SIZE=80` means 8 × 80 = 640 GiB of pinned
@@ -1358,6 +1504,18 @@ otherwise.*
       `nqn.2024-01.io.nixl:kv0`. Note this also means the per-boot ritual
       (HANDOFF §9) is now insufficient on its own — "restart the KV
       target" assumed nobody else had claimed it. *Blocks 6.10.*
+
+      **No local-DSC escape hatch — see 6.25, measured 2026-09-16/17.**
+      `/dev/ng1n1` on `smc1`/`smc2` is not an independent device; `nvme
+      ns-descs` returns an identical `csi`/`eui64` on both nodes, and each
+      node's own Pensando DSC is itself an NVMe-oF initiator peered to
+      `smc3`. It **is** `smc3`'s namespace, re-exported per-node. Using
+      the local DSC does not sidestep this item's ownership question —
+      whoever else is on `smc3` is exactly as visible through
+      `/dev/ng1n1` as through a direct `nvme connect`. This closes the
+      "evaluate the local-DSC option" framing this repo's preamble and
+      HANDOFF §16.8 carried — not by proving the option unworkable, but
+      by showing it was never a different option to begin with.
 - [ ] **6.19** **Re-check 6.16 — the target's 200G links are UP now.**
       Measured 2026-09-15 (session 4): `enp132s0` and `enp100s0` both
       report `Link detected: yes`, and `enp132s0` holds `1.1.0.2/24`.
@@ -1431,11 +1589,44 @@ otherwise.*
       wired — build step, plugin, `lib.sh` arm, `--l2-adapter` spec,
       verify ladder — so the comparison between the two backends remains
       available and a regression in one can be attributed against the
-      other. Rationale at HANDOFF §17.7: the CSI-1 kernel blocker is
+      other.       Rationale at HANDOFF §17.7: the CSI-1 kernel blocker is
       closed (§10.4's re-test, then proven end to end §10.5), and the
       path needs no vfio-pci, no hugepages and no DPDK/SPDK version
       pairing. Note a backend switch still requires draining the
       namespace — see 4.2 and the `KV_MAX_VALUE_SIZE_*` comments.
+- [ ] **6.26** **NEW, 2026-09-17 — the DSC NVMe controller has a boot-time
+      race; nothing re-probes it if the kernel wins the race.** At boot
+      the kernel probes the DSC NVMe controller (`0000:36:00.0`,
+      `[1dd8:1005]`) roughly 3 s after PCIe enumeration — before the
+      DPU-side application is ready — and fails:
+      `nvme nvme1: Device not ready; aborting initialisation, CSTS=0x0`.
+      The kernel `nvme` driver detaches and nothing re-probes it:
+      `/dev/ng1n1` is then absent, `enable=0`, no driver bound, while
+      `lspci` still shows the function enumerated.
+
+      Diagnostic that separates this from a dead card: the DSC's other
+      PCI functions (`pds_core` on `08:00.2`, `ionic` on `35:00.0`) bind
+      fine on the same boot, config space reads correctly (`setpci -s
+      36:00.0 00.L` → `10051dd8`), and the PCIe link is healthy (`LnkSta`
+      `32GT/s x16`) — so `CSTS=0x0` here means the DPU-side NVMe/KV
+      application specifically isn't serving yet, not that the card,
+      slot or link is bad.
+
+      Manual recovery — **works only if the DPU side is already up**,
+      takes ~2 min, and fails with the identical `CSTS=0x0` otherwise:
+      `echo -n "0000:36:00.0" > /sys/bus/pci/drivers/nvme/bind`. On a
+      boot where the DPU side was already up, the probe succeeds cleanly:
+      `nvme nvme1: 63/0/0 default/read/poll queues` then
+      `nvme nvme1: block device for nsid 1 not supported (csi 1)` — the
+      second line is EXPECTED, not an error (csi 1 has no block-device
+      semantics, so only the char device `/dev/ng1n1` appears).
+
+      Added to the per-boot ritual (HANDOFF §9.4): confirm `/dev/ng1n1`
+      exists before attempting to start anything; `start-vllm.sh` already
+      hard-gates on it by design, but a manual roundtrip run ahead of
+      that gate will not, and will instead report a confusing device-open
+      failure that looks unrelated to boot order. Full account: HANDOFF
+      §19.1.
 
 ### 6.21 The image's XNVME_KV plugin predates `queryMem()` — REBUILT, but it does not unlock cross-instance reuse
 
@@ -1522,6 +1713,56 @@ documents why it was rejected — it is file-oriented, requires
 `mem_type="FILE"`, none of which suits a KV-keyed device. Re-evaluate only
 with a measurement, not a preference.
 
+**RE-MEASURED 2026-09-16/17, against the composed daemon+L2-adapter stack
+now actually running: `retrieve_ops=0` confirmed on BOTH roles, not just
+inferred from the key-naming argument above.** From
+`${NIXL_KV_METRICS_PATH}` (`/run/kv-cache-bench/*.json`):
+
+| role | store_ops | store_bytes | retrieve_ops | retrieve_bytes |
+|---|---|---|---|---|
+| prefill | 313,143 | 1.28 GB | **0** | **0** |
+| decode | 442,368 (two engine pids: 368,640 + 73,728) | ~1.81 GB | **0** | **0** |
+
+This confirms the finding above is still live, not stale — the per-daemon
+`uuid4` key naming (`nixl_store_l2_adapter.py`'s
+`obj_{i}_{uuid4().hex[0:4]}`) makes cross-node retrieve impossible by
+construction, exactly as diagnosed.
+
+**New and genuinely open, not explained by the paragraph above:**
+`retrieve_ops=0` on **prefill by itself** deserves its own investigation.
+`LMCACHE_MAX_LOCAL_CPU_SIZE=4` (GiB) should make L1 evict constantly under
+this store volume, and a same-daemon L2 read-back on an L1-eviction miss
+needs no cross-daemon key agreement at all — the uuid4 argument above
+only explains why decode can never find prefill's keys, not why prefill
+never reads back its own. Full account: HANDOFF §18.4. **Still open,
+untouched by the 2026-09-17 update below.**
+
+**RE-MEASURED 2026-09-17, after both compute nodes were rebooted — this
+is no longer merely the diagnosed cause, it is the sole remaining
+candidate, with every alternative directly ruled out.** Per-process
+plugin metrics after a full stack run:
+
+| role | pid | store | retrieve | identity |
+|---|---|---|---|---|
+| prefill | 193 | 6 | 0 | this session's own roundtrip write |
+| prefill | 308 | 0 | 256 | this session's own roundtrip read |
+| prefill | **759** | **36,864** | **0** | **the LIVE vLLM engine** |
+| decode | 253 | 256 | — | this session's own reverse-direction write |
+| decode | 28 | — | 6 | this session's own cross-node read |
+| decode | **707** | **0** | **0** | **the LIVE vLLM engine** |
+
+Every non-zero `retrieve_op` on the box came from the standalone
+roundtrip runs (6.25), never from an LMCache-driven engine. The two live
+engines stored 36,864 objects between them and retrieved zero. What makes
+this session's measurement different from the one above: 6.25's roundtrip
+proved, on this exact namespace, this exact session, that the
+plugin/device/shared-namespace path supports cross-node store+retrieve in
+both directions — so "maybe the device/topology can't do it" is no longer
+an open alternative. This item's diagnosis (`nixl_store_l2_adapter.py`'s
+per-daemon `uuid4` key naming) is not one of several candidate causes any
+longer — it is **the** remaining blocker, and it is an LMCache patch, not
+a plugin or topology problem. Full account: HANDOFF §19.4.
+
 ### 6.22 The KV pipeline is 8x64, and the DSC wedges under sustained load
 
 **Measured 2026-09-16 alongside 6.21.**
@@ -1571,6 +1812,45 @@ decides whether widening the pipeline helps or just reaches the wedge
 sooner; (c) raise with the DSC vendor with the stall log above — this is
 DPU-side behaviour, not something the plugin can resolve.
 
+**UPDATE 2026-09-16/17 — the wedge is active and getting WORSE, and this
+is now the top open operational issue for the storage tier, ahead of
+6.21's key-derivation gap and 6.24's plugin rebuild.** Within a single
+observation window this session, `completions_err` went **512 → 704**
+and `stalls` went **8 → 11** (`704 == 11 x 64`, still the exact-multiple
+stall-watchdog signature above, not size rejection). The stall log itself
+now shows a different, and worse, shape than the backlog-draining case
+recorded above:
+
+```
+queue made no forward progress for 30s: 0 op(s) queued, 1 in flight
+```
+
+Nearly idle (one outstanding op, nothing queued behind it) and still
+cannot complete — the device is not merely behind, it does not answer at
+all. **A standalone `scripts/verify/30-verify-kv-roundtrip.sh --write`
+wedged on its very first store**, returning `NIXL_ERR_BACKEND`. Per the
+plugin header's own `stall_timeout_ns_` documentation, only an
+out-of-band DPU-side restart clears this — host-side resets make it
+worse, confirming action (c) above rather than superseding it.
+
+**Practical lesson, worth keeping separately from the finding itself: do
+not run `30-verify-kv-roundtrip.sh` against a device a live vLLM engine
+is already driving.** The standalone probe above hit an already-wedging
+device mid-session; read in isolation its `NIXL_ERR_BACKEND` result would
+misattribute the failure to the script or its inputs rather than to
+device state that predated the probe. Full account: HANDOFF §18.5.
+
+**CLEARED, 2026-09-17, after both compute nodes were rebooted with the
+DPU side up (6.26).** Plugin metrics across every process, checked after
+a full round of cross-node roundtrips (6.25) plus a live stack run:
+**`completions_err=0`, `stalls=0`, everywhere.** The reboot cleared it,
+consistent with this item's own note above that only a DPU-side restart
+(not a host-side reset) is known to clear the condition. **Not proven
+immune to recurrence** — this is a clean baseline measured right now, not
+a claim that the same sustained-load conditions that produced 512→704
+errs / 8→11 stalls can no longer reproduce it. Full account: HANDOFF
+§19.3.
+
 ### 6.23 The in-process LMCacheConnectorV1 config surface is removed
 
 The `LMCacheConnectorV1` (in-process) connector path itself was already
@@ -1611,3 +1891,143 @@ never instantiated by this repo),
 this repo's MP daemon runs. The live storage-tier config surface is, and
 remains, `scripts/common/start-lmcache-daemon.sh`'s `--l2-adapter <JSON>`
 flag — unmodified by this change.
+
+### 6.24 XNVME_KV's device `value_max` moved 32768 → 4096 — resolved on the config side, still open on the plugin side
+
+**Measured 2026-09-16/17.** The plugin now logs, at backend init:
+
+```
+[XNVME_KV] device KV format 0: value_max=4096 key_max=16 novg=0 (compiled-in default 32768)
+WARNING: device value_max=4096 is SMALLER than the compiled-in default 32768
+```
+
+6.4 recorded 32768 as a **measured DSC firmware ceiling** — real, not a
+config knob. That is no longer true: the device's own advertised ceiling
+moved under us, the same shared-hardware-changes-under-you pattern
+HANDOFF §13.7/§14.4/§15 already catalogue for the RDMA fabric, now hitting
+the storage device too. `scripts/verify/20-verify-nixl-plugin.sh`
+currently **FAILS**:
+
+```
+RESULT:MAX_VALUE_SIZE_MISMATCH:reported='32768' expected=4096
+```
+
+**Resolved, config/comment side:**
+
+- `creds/active.env` sets `KV_MAX_VALUE_SIZE_XNVME=4096`.
+- `scripts/common/container.sh` no longer exports
+  `NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE` — it never took effect: `lib.sh`'s
+  `setup_nixl_kv_env()` (`lib.sh:613-621`) `unset`s it unconditionally
+  right after `env.sh` is sourced, per HANDOFF §7 invariant 4. See
+  `container.sh`'s own comment for the full three-reason rationale.
+- **Not destructive, for this transition specifically.** The MP daemon's
+  `nixl_store` unit is `--l1-align-bytes` (4096 B), so `mem_split_n == 1`
+  under both the old 32768 ceiling and the new 4096 one — no object has
+  ever been split, so invariant 4's half-stale-reassembly hazard cannot
+  fire here. **It would fire** if `--l1-align-bytes` changes, or if
+  `max_value_size` ever drops below 4096 — the invariant is unaffected,
+  only this one transition happens to be safe.
+
+**STILL OPEN:** `XNVME_KV_DEFAULT_MAX_VALUE_SIZE`
+(`plugins/xnvme-kv/xnvme_kv_backend.h:71`) is still `32768u`.
+`scripts/common/container.sh plugin-build` has not been re-run to align
+it, so `20-verify-nixl-plugin.sh`'s mismatch persists until it is.
+
+**Recommended durable fix, NOT applied:** give the plugin an explicit
+`NIXL_KV_MAX_VALUE_SIZE=<N>` override that `getParams()` returns
+unconditionally, and promote the device-vs-config mismatch from a
+`WARNING` to a hard init failure. The existing
+`NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE` knob is call-order dependent —
+`getParams()` reads `discovered_max_value_size_`, populated only during
+`create_backend()`, so a `get_plugin_params()`-before-`create_backend()`
+caller (`20-verify-nixl-plugin.sh` itself, `:171` then `:214`) still sees
+the stale compiled-in value even with the flag set. On-wire geometry must
+never depend on call order: geometry should come from config
+(`KV_MAX_VALUE_SIZE_EFFECTIVE`), the device should only validate. Full
+account: HANDOFF §18.3.
+
+**RE-CONFIRMED, unchanged, 2026-09-17, after both compute nodes were
+rebooted:** `20-verify-nixl-plugin.sh` still fails the identical
+`RESULT:MAX_VALUE_SIZE_MISMATCH:reported='32768' expected=4096`; the
+compiled-in `xnvme_kv_backend.h:71` constant is untouched. This did
+**not** block 6.25's cross-node roundtrip proofs below, because that
+harness does its own splitting at `KV_MAX_VALUE_SIZE_EFFECTIVE=4096`
+regardless of what the plugin reports — the two facts are independent.
+Do not read 6.25's success as having resolved this item; it has not.
+
+### 6.25 The KV namespace is confirmed SHARED across P and D, and cross-node store+retrieve is now PROVEN, in both directions — the topology blocker this project has carried since HANDOFF §1 is GONE
+
+**Measured 2026-09-16/17 — this supersedes HANDOFF §16.7/§16.8's "local
+DSC" framing, and the preamble/6.18 references to it above.**
+
+`/dev/ng1n1` on both `smc1` and `smc2` is a local PCIe function of that
+node's own Pensando DSC (`0000:36:00.0`, model `PDSNVME`, subsystem NQN
+`nqn.2019-08.com.pensando:nvm-subsystem-sn-8001-0-0`) — as already
+recorded at HANDOFF §16.7. `nvme id-ctrl`/`nvme id-ns` succeed on both.
+
+**Decisive, and new:** `nvme ns-descs /dev/ng1n1 -n 1` returns `csi: 0x1`
+(the KV command set) and `eui64: e46cfefeffcdae01` — **identical** on
+both nodes. Same namespace, same identifier, both sides. (Namespace size
+`nsze 0x200000` @ `lbads 9` = 1 GiB, unchanged from §16.7.)
+
+The host is **not** the NVMe-oF initiator — the DSC is. `nvme list-subsys`
+on both compute nodes shows only local PCIe subsystems, no NVMe-oF
+connection at all. `smc3` (`volcano17`) runs `nvmf_tgt` serving
+`nqn.2016-06.io.spdk:cnode1` on `1.1.0.2:4420`, and the two DSCs are its
+peers — each re-exports that same remote namespace transparently as a
+local PCIe function on its own host.
+
+**This reverses HANDOFF §16.8's framing, not merely extends it.** §16.8
+read `/dev/ng1n1` as a distinct, node-local, unshareable 1 GiB device, and
+proposed a "local-DSC XNVME_KV tier" as an *alternative* to `smc3`
+precisely because it looked independent. It is not independent — it
+**is** `smc3`, one hop closer:
+
+- **The topology blocker is gone.** A KV storage backend being a shared,
+  cross-node tier was always assumed to require a remote NVMe-oF target;
+  a node-local device looked like a dead end for that purpose. Both
+  assumptions are moot: `/dev/ng1n1` on `smc1` and `/dev/ng1n1` on `smc2`
+  already point at the same physical namespace, with nothing extra to
+  wire up, and there was never a choice to make between "local DSC" and
+  "`smc3`".
+- **6.18 is NOT sidestepped by using the local DSC** — the opposite of
+  what §16.8 speculated, and the preamble's evaluate-first framing above
+  is corrected accordingly. Any other party's use of `smc3` is exactly as
+  visible from `/dev/ng1n1` as from a direct `nvme connect`, because it is
+  the same backing store.
+- **The remaining blocker is unchanged, and it was never a topology
+  problem.** Physical sharing was never what stood between this project
+  and a cross-node hit — the per-daemon `uuid4` key naming (6.21) is, and
+  it is untouched by this finding.
+
+Full account: HANDOFF §18.2.
+
+**UPGRADED FROM "CONFIRMED SHARED" TO "CONFIRMED WORKING", 2026-09-17,
+after both compute nodes were rebooted.** Everything above proved the two
+`/dev/ng1n1` devices are the *same namespace* by identity (`eui64`) —
+it never moved a byte between nodes to prove it. This session did, on a
+namespace confirmed clean beforehand (`nuse: 0`) with no vLLM engine
+running — a clean, uncontaminated test, not one sharing the device with a
+live workload. Using `scripts/verify/30-verify-kv-roundtrip.sh` (keys
+derived purely from `(nonce, size)` via sha256 — the two sides never
+exchange the key):
+
+- **WRITE on `smc1` (prefill) → READ on `smc2` (decode):** 24,576 B,
+  `max_value_size=4096`, 6 parts. `RESULT:OK` — all 6 sub-keys confirmed
+  present by `query_memory` before read, byte-for-byte compare passed.
+- **Negative control:** a never-written nonce read on `smc2` returns
+  `RESULT:QUERY_MISS`, non-zero exit — so the positive result above is
+  not a false pass against stale namespace data.
+- **REVERSE direction — WRITE on `smc2` (decode) → READ on `smc1`
+  (prefill):** 1,048,576 B, 256 parts. `RESULT:OK`. This exercises the
+  multipart `#{j}`-suffix path heavily, which the smaller forward run
+  above barely touches.
+
+This supersedes every earlier statement anywhere in this project that the
+storage tier cannot move data between nodes. The topology blocker is
+**definitively gone, in both directions**, at the plugin/device layer —
+not merely inferred from matching `eui64`s. It also directly sharpens
+6.21: with cross-node retrieve now proven to work at the plugin/device
+layer, the live vLLM engines' `store=36,864`/`retrieve=0` (see 6.21's
+2026-09-17 update) can no longer be attributed to anything but LMCache's
+own key-derivation scheme. Full account: HANDOFF §19.2/§19.4.

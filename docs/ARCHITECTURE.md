@@ -178,9 +178,28 @@ either ceiling, which is why some form of splitting is always in play.
 4. On an L1 eviction (or directly, depending on the daemon's policy), the L2
    tier's `nixl_store` adapter (`--l2-adapter`, backend = `KV_BACKEND`)
    takes over. It tiles the chunk's bytes into `--l1-align-bytes`-sized
-   (default 4096 B) pool slots — **not** into `KV_MAX_VALUE_SIZE`-sized
-   sub-transfers the way the old in-process/`patches/lmcache` multipart
-   split did; `pool_size` in the `--l2-adapter` spec counts these 4096 B
+   (default 4096 B) pool slots — **not** directly into
+   `KV_MAX_VALUE_SIZE`-sized sub-transfers, because 4096 B is already under
+   both plugins' ceilings (see step below on `mem_split_n`).
+
+   > **Correction, 2026-09-17.** An earlier version of this sentence
+   > attributed `mem_split_n`-style splitting to "the old in-process
+   > `LMCacheConnectorV1` path" and said its "allowlist-patch generator
+   > script was deleted... as dead code" — implying this file's splitting
+   > machinery was itself dead/withdrawn. **That is wrong on two counts.**
+   > First, `mem_split_n`/`_resolve_mem_split()` live in *this exact file*
+   > (`nixl_store_l2_adapter.py`, the daemon's L2 adapter — the live path,
+   > not the in-process one) and are supplied by
+   > `patches/lmcache/0007-lmcache-l2-adapter-value-size-split.patch`,
+   > baked into the vendor image and load-bearing right now. Second, the
+   > withdrawn generator targeted a *different* file entirely
+   > (`nixl_storage_backend.py`, the in-process path's allowlist — see
+   > `patches/lmcache/0008` for that file's equivalent patch) and its
+   > withdrawal has no bearing on whether this file's splitting exists —
+   > it does, and it is not upstream LMCache. See
+   > `patches/lmcache/README.md` for the full account.
+
+   `pool_size` in the `--l2-adapter` spec counts these 4096 B
    slots, one per raw page tile, which is why its default (2,000,000) looks
    large relative to a single chunk. Because 4096 B is well under both
    plugins' advertised ceilings (524288 / 32768), this adapter-level tiling

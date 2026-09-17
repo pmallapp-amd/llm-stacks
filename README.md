@@ -337,10 +337,15 @@ patches/spdk/
                              skipped automatically on trees where they're already merged.
 
 patches/lmcache/
-  README.md                  Why/what/how of the LMCache NIXL-backend-allowlist patch, with an
-                             explicit VERIFIED-vs-ASSUMED accounting.
-  apply-patches.sh            Applies the patch to the INSTALLED LMCache (not a static .patch file).
-  _patch_engine.py            tokenize/ast-based source transformation the above invokes.
+  README.md                  Per-patch table + a copy-pasteable docker-run re-verification
+                             recipe for the 5 LMCache patches (see below) — corrects a
+                             2026-09-17 error that claimed these were unnecessary.
+  0006/0007/0008-*.patch /
+  0009-lmcache-fused-kv-plane-count.patch /
+  0011-lmcache-guard-mp-connector-num-external-tokens.patch
+                             Already baked into rocm-aic:mp-pd-ionic2609 at image-build time,
+                             in a sibling build repo — NOT applied by anything in this repo.
+                             Tracked here for provenance and re-verification only.
 
 plugins/
   nvme-kv/                    SPDK_NVMe_KV NIXL plugin — NVMe-oF/TCP to the SMC3 target via
@@ -402,7 +407,15 @@ scripts/prefill/01-host-prep.sh          # or scripts/decode/01-host-prep.sh
 sudo scripts/common/05-build-spdk-initiator.sh   # UPSTREAM SPDK v26.05 — no fork needed here
 sudo scripts/common/10-build-stack.sh
 scripts/common/20-build-vllm-lmcache.sh
-patches/lmcache/apply-patches.sh
+# No LMCache backend-allowlist patch step to run here — the vendor
+# container image this lab actually runs was BUILT with the allowlist
+# already patched in (patches/lmcache/0006-0009/0011; see
+# patches/lmcache/README.md — corrects a 2026-09-17 error that claimed
+# no patch was needed at all). The old from-source generator this repo
+# used to run here is withdrawn (dead code on the from-source path,
+# docs/HANDOFF.md §20) and survives only in git history; if
+# 25-validate-lmcache-config.sh below ever reports a backend REJECTED,
+# re-verify patches/lmcache/README.md's recipe against the image first.
 scripts/common/25-validate-lmcache-config.sh <path-you-will-pass-to-start-vllm>
 
 # on SMC1
@@ -555,12 +568,17 @@ negative result.
    v26.09, they can be dropped and `SPDK_TARGET_REF` pinned to that release
    instead of `master`. Tracked at
    [TODO.md §4.4](docs/TODO.md#4-open-items-and-known-limitations).
-2. **The LMCache backend-allowlist patch is generated at apply time, not a
-   pinned diff.** `patches/lmcache/apply-patches.sh` scans and patches
-   whatever LMCache version is actually installed, rather than applying a
-   static `.patch` file — see `patches/lmcache/README.md`'s explicit
-   VERIFIED-vs-ASSUMED section for exactly which parts of this are confirmed
-   against real LMCache source and which are best-effort.
+2. **The LMCache allowlist patches this repo depends on are applied in a
+   sibling build repo, not here — this repo has no CI signal if a future
+   image build drops one.** `patches/lmcache/0006`-`0009`/`0011` are baked
+   into `rocm-aic:mp-pd-ionic2609` at image-build time; this repo only
+   tracks the `.patch` files for provenance and re-verification (a manual
+   `docker run` recipe, not an automated check) — see
+   `patches/lmcache/README.md`. (An earlier version of this item described
+   a since-withdrawn from-source generator that applied a patch at deploy
+   time rather than build time; that mechanism is gone along with the
+   from-source path it targeted, and this item now names the actual gap on
+   the path this repo runs.)
 3. **LMCache's `--l2-adapter` JSON key names are not a stable contract
    across versions.** This repo targets `LMCACHE_VERSION=0.5.4` specifically
    (`scripts/common/20-build-vllm-lmcache.sh`); `scripts/common/

@@ -48,7 +48,6 @@ logs/
 
 # ---- Generated configs -------------------------------------------------------
 *.orig-kvstack
-patches/lmcache/applied-*.diff
 **/lmcache-prefill.yaml
 **/lmcache-decode.yaml
 etc/lmcache-*.yaml

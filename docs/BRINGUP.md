@@ -569,36 +569,41 @@ ok  wrote /opt/kvstack/etc/env.sh
     next: scripts/common/start-lmcache-daemon.sh
 ```
 
-### §6.2 Apply the LMCache backend-allowlist patch
-
-```bash
-patches/lmcache/apply-patches.sh
-```
+### §6.2 LMCache backend-allowlist patch — nothing to run here, but it IS patched
 
 Stock LMCache's `NixlStorageConfig.validate_nixl_backend()` and
 `NixlDynamicStorageAgent.__init__` both hardcode a fixed allowlist of NIXL
-backend names that does not include `SPDK_NVMe_KV`/`XNVME_KV` — see
-`patches/lmcache/README.md` for the full rationale. This script patches the
-**installed** LMCache package in `${VENV}` (not a static `.patch` file — see
-that README's "Why this ships as a generator script" section) and writes a
-timestamped diff to `patches/lmcache/applied-<version>.diff`.
+backend names — historically a concern for `SPDK_NVMe_KV`/`XNVME_KV`. An
+older version of this step ran a generator script, formerly vendored in
+this repo's patch directory, against an **installed-from-source** LMCache
+to widen those allowlists. That generator is withdrawn (from-source path
+`scripts/common/20-build-vllm-lmcache.sh` -> `/opt/kvstack/venv` has never
+completed a build and is deprioritised, `docs/TODO.md` §6.2) and survives
+only in git history.
 
-Flags: `--dry-run` (show what would change, write nothing), `--force`
-(required to re-run after a prior successful apply — reverts then
-reapplies, never stacks edits), `--revert` (restore from `.orig-kvstack`
-backups).
+**There is still nothing to run for this step on the container path — but
+correct the reason.** A 2026-09-17 pass through this doc wrote that the
+LMCache installed in `rocm-aic:mp-pd-ionic2609` (0.5.3) "already accepts
+both backends with no patch". **That was false and is corrected the same
+day.** The real reason there is no runtime step: the vendor image is
+**prebuilt with the LMCache allowlist patches already applied**
+(`patches/lmcache/0006`-`0009`/`0011`, baked in at image-build time in a
+sibling build repo — not by anything in this repo). The MP daemon start
+observed 2026-09-17 (`--l2-adapter
+'{"type":"nixl_store","backend":"XNVME_KV",...}'`, logging `nixl_store
+backend XNVME_KV: page_size=4096, declared max_value_size='32768'`, and
+live engines storing ~1.16 GB through it) is still accurate evidence the
+backend works — it is evidence the *patches took*, not evidence none were
+needed. See `docs/HANDOFF.md` §20 and
+[`patches/lmcache/README.md`](../patches/lmcache/README.md) for the full
+record and a re-verification recipe.
 
-Expected output ends with:
-
-```
-ok  patch applied; diff recorded at patches/lmcache/applied-0.5.4.diff
-    next: scripts/common/25-validate-lmcache-config.sh <cfg-file>
-```
-
-If it reports `FAIL: zero "GDS"/"POSIX"/"OBJ" allowlist-shaped brackets
-found` — the installed LMCache version has moved this logic; see
-`patches/lmcache/README.md`'s "What is ASSUMED" section and
-[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#assertionerror-on-the-lmcache-nixl-backend-name).
+**Nothing to run for this step.** Proceed straight to §6.3's validation. If
+`scripts/common/25-validate-lmcache-config.sh` ever reports a backend
+**REJECTED** on some future image, that is the signal that the image build
+dropped one of the `patches/lmcache/` patches — re-run that README's
+verification recipe against the new image before assuming anything else is
+wrong.
 
 ### §6.3 Validate the LMCache storage-tier config (optional, standalone)
 
@@ -619,9 +624,10 @@ This parses the JSON with the SAME installed
 (`get_l2_adapter_config_class()`/`<ConfigClass>.from_dict()`), so a typo'd
 key or an unregistered adapter `type` fails here instead of 30s into a
 daemon start, and it also confirms `validate_nixl_backend()`/the OBJ
-mem_type check both accept `${KV_BACKEND}` (i.e. that §6.2's patch actually
-took) by cross-checking against a throwaway `nixl_agent`'s live
-`get_plugin_params("${KV_BACKEND}")`.
+mem_type check both accept `${KV_BACKEND}` — patched into this image at
+build time (`patches/lmcache/0006`, corrected §6.2 above, do not read that
+as "unpatched") — by cross-checking against a throwaway `nixl_agent`'s
+live `get_plugin_params("${KV_BACKEND}")`.
 
 Expected final line: `PASS: --l2-adapter-json validated against installed
 LMCache.` Any `FAIL` above that must be resolved before starting the daemon

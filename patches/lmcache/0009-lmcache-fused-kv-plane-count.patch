@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kv-cache <noreply@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] lmcache: derive the K/V plane count instead of assuming 2
+
+vLLM 0.26 presents a *fused* KV cache -- rank-4
+[num_blocks, block_size, num_kv_heads, 2 * head_size] -- but LMCache built a
+2-plane *split* staging destination for it. The byte totals coincide
+(2 * NH * HS == 1 * NH * 2 * HS), so nothing downstream ever complained; instead
+the copy kernel derived its source stride from the wrong destination shape and
+silently stored half the tokens, from the wrong offsets, with the V plane never
+written at all. Every chunk written by every backend on this path was corrupt.
+
+The plane count cannot be detected where it was being assumed: kv_shape is built
+at engine init, before any KV tensor exists, and it feeds both the staging
+allocator and the NIXL backend's read layout. vLLM's attention backend can
+answer at that point, and authoritatively -- get_kv_cache_shape() returns
+exactly the tensor it will allocate -- so ask it, and carry the answer through
+metadata.kv_shape to the connector.
+
+Also cross-checks the choice against the real tensors the first time they are
+available, and raises rather than proceeding, because a mismatch here is
+otherwise undetectable downstream.
+
+Verified on TinyLlama/vLLM 0.26/ROCm: a needle-in-haystack prompt stored, the
+container restarted, and the needle recovered correctly from the NVMe KV target
+with need-to-load non-zero -- the first correct cross-process read on this
+stack.
+
+Carried out-of-tree. See README.md.
+---
+--- a/lmcache/integration/vllm/vllm_service_factory.py	2026-09-08 22:23:48.957637437 -0700
++++ b/lmcache/integration/vllm/vllm_service_factory.py	2026-09-08 22:24:35.397397664 -0700
+@@ -36,6 +36,99 @@
+ logger = init_logger(__name__)
+ 
+ 
++def _aic_kv_plane_count(
++    vllm_config,
++    model_config,
++    cache_config,
++    num_kv_head: int,
++    head_size: int,
++    use_mla: bool,
++) -> tuple[int, int]:
++    """Return ``(kv_plane_count, per_head_width)`` for the layout vLLM will allocate.
++
++    ``LMCacheMetadata.kv_shape`` feeds both the staging allocator and the NIXL
++    backend's read layout, and both are bound at engine init -- strictly before
++    any KV tensor exists, so the runtime format detector cannot be consulted.
++    vLLM's attention backend *can* answer at init, and its answer is
++    authoritative: ``get_kv_cache_shape`` returns exactly the tensor the backend
++    will go on to allocate.
++
++        rank 4 -> fused, K and V packed into the trailing axis (2 * head_size)
++        rank 5 -> split, leading axis of 2
++        rank 3 -> MLA, a single plane
++
++    The backend is queried inside ``set_current_vllm_config`` because
++    ``get_attn_backend`` reads the ambient config; without it the scheduler role
++    raises and would silently fall back to a different answer than the worker,
++    leaving the two halves of one deployment disagreeing about the layout.
++
++    Falls back to the historical assumption if the backend cannot be reached, so
++    a future vLLM that reorganises this API degrades to the old behaviour rather
++    than failing to start. The result is cross-checked against the real tensors
++    in ``VLLMPagedMemGPUConnectorV2._initialize_pointers``, which raises if this
++    guess and the detected format disagree.
++    """
++    legacy = (1 if use_mla else 2, head_size)
++    try:
++        # Third Party
++        from vllm.config import set_current_vllm_config
++        from vllm.v1.attention.selector import get_attn_backend
++
++        with set_current_vllm_config(vllm_config):
++            backend = get_attn_backend(
++                head_size,
++                model_config.dtype,
++                cache_config.cache_dtype,
++                use_mla=use_mla,
++            )
++            # num_blocks is irrelevant to the rank and the trailing axis.
++            shape = backend.get_kv_cache_shape(
++                8, cache_config.block_size, num_kv_head, head_size
++            )
++    except Exception as exc:  # noqa: BLE001 - degrade, never block startup
++        logger.warning(
++            "rocm-aic: could not query the attention backend for the KV layout "
++            "(%r); falling back to kv_plane_count=%d, per_head_width=%d. If this "
++            "model actually uses a fused cache, the gather will be mis-strided.",
++            exc,
++            legacy[0],
++            legacy[1],
++        )
++        return legacy
++
++    rank = len(shape)
++    if rank == 4:
++        # [num_blocks, *, *, content_size]: the two middle axes are BS/NH or
++        # NH/BS depending on kv_layout, and neither affects the plane count or
++        # the per-token width, so the trailing axis alone is what we need.
++        result = (1, int(shape[-1]))
++    elif rank == 5 and int(shape[0]) == 2:
++        result = (2, head_size)
++    elif rank == 3:
++        result = (1, head_size)
++    else:
++        logger.warning(
++            "rocm-aic: attention backend %s reported an unrecognised "
++            "kv_cache_shape %s; falling back to kv_plane_count=%d.",
++            backend.get_name(),
++            tuple(shape),
++            legacy[0],
++        )
++        return legacy
++
++    logger.info(
++        "rocm-aic: attention backend %s reports kv_cache_shape=%s -> "
++        "kv_plane_count=%d, per_head_width=%d (the unpatched assumption "
++        "would have been %s)",
++        backend.get_name(),
++        tuple(shape),
++        result[0],
++        result[1],
++        legacy,
++    )
++    return result
++
++
+ class VllmServiceFactory(BaseServiceFactory):
+     """Creates LMCache service components for vLLM integration.
+ 
+@@ -100,12 +193,27 @@
+         chunk_size = self.lmcache_config.chunk_size
+         num_kv_head = model_config.get_num_kv_heads(parallel_config)
+         head_size = model_config.get_head_size()
++        # rocm-aic: vLLM 0.26 presents a *fused* KV cache on this stack -- rank-4
++        # [num_blocks, block_size, num_kv_heads, 2 * head_size] -- but this used
++        # to hardcode a 2-plane split destination. The byte totals coincide
++        # (2 * NH * HS == 1 * NH * 2 * HS), so nothing downstream ever complains;
++        # instead the copy kernel derives half the correct per-token stride and
++        # silently stores half the tokens, from the wrong offsets, with the V
++        # plane never written at all. Ask the backend what it will allocate.
++        kv_plane_count, per_head_width = _aic_kv_plane_count(
++            self.vllm_config,
++            model_config,
++            cache_config,
++            num_kv_head,
++            head_size,
++            use_mla,
++        )
+         kv_shape = (
+             num_layer,
+-            1 if use_mla else 2,
++            kv_plane_count,
+             chunk_size,
+             num_kv_head,
+-            head_size,
++            per_head_width,
+         )
+ 
+         logger.info(
+@@ -116,7 +224,7 @@
+             chunk_size,
+             num_kv_head,
+             head_size,
+-            num_kv_head * head_size,
++            num_kv_head * per_head_width,
+             use_mla,
+             kv_shape,
+             num_draft_layers,
+--- a/lmcache/v1/gpu_connector/gpu_connectors.py	2026-09-08 22:23:51.651681539 -0700
++++ b/lmcache/v1/gpu_connector/gpu_connectors.py	2026-09-08 22:25:32.994340536 -0700
+@@ -23,6 +23,7 @@
+     get_elements_per_layer,
+     get_group_data_ptrs,
+     get_head_size,
++    get_kv_size,
+     get_num_blocks,
+     get_num_layers,
+     get_page_buffer_size,
+@@ -180,6 +181,12 @@
+ 
+         self.gpu_buffer: Optional[torch.Tensor] = None
+         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
++        # rocm-aic: the K/V plane count is a property of the engine's cache
++        # layout, not of MLA. It is derived once, at metadata construction, from
++        # the attention backend, and carried here so the staging buffer, the
++        # memory objects and the NIXL read layout cannot disagree. Absent (older
++        # callers, tests) it reverts to the historical assumption.
++        self.kv_size = int(kwargs.get("kv_size") or (1 if self.use_mla else 2))
+         self.layout_hints: LayoutHints = (
+             kwargs.get(  # type: ignore[assignment]
+                 "layout_hints"
+@@ -223,8 +230,13 @@
+             A new instance of VLLMPagedMemGPUConnectorV2.
+         """
+         # Extract parameters from metadata
+-        # kv_shape: (num_layer, 2 or 1, chunk_size, num_kv_head, head_size)
++        # kv_shape: (num_layer, kv_planes, chunk_size, num_kv_head, per_head_width)
++        # rocm-aic: axis 1 is the real plane count and axis 4 the real per-head
++        # width, both settled against the attention backend when the metadata was
++        # built. For a fused cache that is (1, 2 * head_size); for a split one,
++        # (2, head_size). Deriving hidden_dim_size from axis 4 keeps both correct.
+         num_layers = metadata.kv_shape[0]
++        kv_size = metadata.kv_shape[1]
+         chunk_size = metadata.kv_shape[2]
+         num_kv_head = metadata.kv_shape[3]
+         head_size = metadata.kv_shape[4]
+@@ -238,6 +250,7 @@
+             dtype=metadata.kv_dtype,
+             device=device,
+             use_mla=metadata.use_mla,
++            kv_size=kv_size,
+             layout_hints=layout_hints,
+         )
+ 
+@@ -252,6 +265,25 @@
+             kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
+         )
+ 
++        # rocm-aic: this is the first moment the real tensors are available, and
++        # therefore the first chance to check the plane count the destination was
++        # built with against the one the cache actually has. They must agree: the
++        # copy kernel derives its source stride from the destination shape, so a
++        # disagreement does not fail, it silently stores half the tokens with no
++        # V plane. The byte totals match either way, so nothing else will catch
++        # it. Fail loudly instead.
++        detected_kv_size = get_kv_size(kv_caches, self.engine_kv_format)
++        if detected_kv_size != self.kv_size:
++            raise RuntimeError(
++                f"KV plane count mismatch: the staging destination was built "
++                f"for kv_size={self.kv_size}, but the engine's cache is "
++                f"{self.engine_kv_format!r} with kv_size={detected_kv_size}. "
++                f"Proceeding would mis-stride the gather and store corrupt KV. "
++                f"The plane count is chosen in vllm_service_factory."
++                f"_aic_kv_plane_count(); it disagrees with the runtime format "
++                f"detector and one of the two needs fixing."
++            )
++
+         self.kv_cache_pointers.numpy()[:] = [t.data_ptr() for t in kv_caches]
+         self.kv_cache_pointers_on_gpu[idx] = torch.empty(
+             self.num_layers, dtype=torch.int64, device=self.device
+@@ -414,8 +446,9 @@
+             self.from_gpu(memory_obj, start, end, **kwargs)
+ 
+     def get_shape(self, num_tokens: int) -> torch.Size:
+-        kv_size = 1 if self.use_mla else 2
+-        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
++        return torch.Size(
++            [self.kv_size, self.num_layers, num_tokens, self.hidden_dim_size]
++        )
+ 
+ 
+ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):

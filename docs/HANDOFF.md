@@ -1,7 +1,7 @@
 # Handoff
 
 State of the P/D-disaggregated KV cache project, for whoever picks this up
-next (including future me). Last updated 2026-09-16.
+next (including future me). Last updated 2026-09-17.
 
 Read this before [BRINGUP.md](BRINGUP.md). It tells you what is real, what is
 assumed, and what is still wrong.
@@ -12,13 +12,27 @@ assumed, and what is still wrong.
 > are the evidence record, including several corrections of earlier
 > corrections — read them when you need the *why*, not to get started.
 >
-> **Headline, session 4 (2026-09-16):** leg A works — a direct P→D NIXL
-> transfer, proven by decode doing **zero** prefill at a 100% external
-> cache hit rate (§11). Two silent defects had to be fixed to get there,
-> both of which served correct text while moving no KV at all. The
-> storage tier (TODO 6.10) is the last item in §6 and is blocked on a
-> shared resource, not on us. RDMA (§3) became newly viable when another
-> party fixed half the `ionic` stack (§14).
+> **Headline, 2026-09-17 (§19), supersedes the §18 headline below:** after
+> both compute nodes were rebooted, cross-node storage-tier store+retrieve
+> is **PROVEN, in both directions**, on a clean/empty namespace, with a
+> negative control — the topology blocker this project has carried since
+> §1 is not merely "confirmed shared" (§18.2) any more, it is confirmed
+> **working**. The DSC completions-error wedge (§18.5) is cleared. What
+> remains broken is now isolated to exactly one thing: LMCache's
+> `nixl_store_l2_adapter.py` L2 tier still never retrieves anything a live
+> vLLM engine stored (`retrieve_ops=0`, `store=36864`) — TODO 6.21's
+> per-daemon-`uuid4` key naming is no longer one of several candidate
+> causes, it is the sole remaining blocker, isolated beyond argument by
+> this session's evidence. A DSC boot-time race, new this session, is also
+> recorded (§19.1) — see it before assuming a reboot has left the stack in
+> a known state.
+>
+> **Headline, session 4 (2026-09-16), superseded above but not wrong:** leg
+> A works — a direct P→D NIXL transfer, proven by decode doing **zero**
+> prefill at a 100% external cache hit rate (§11). Two silent defects had
+> to be fixed to get there, both of which served correct text while moving
+> no KV at all. RDMA (§3) became newly viable when another party fixed
+> half the `ionic` stack (§14).
 
 ---
 
@@ -46,6 +60,17 @@ machines and share KV cache.
 Addresses and credentials are **not in this repo** — see §3. Stack is
 vLLM + LMCache + NIXL + the two NIXL plugins in `plugins/`, on ROCm.
 Model is Qwen2.5-72B-Instruct at TP=8.
+
+> **STALE, 2026-09-16/17 — see §18.1.** The creds file now pins
+> `MODEL=Qwen/Qwen3-8B`, `TP_SIZE=1` (72B is not present on disk on either
+> compute node — a 145 GB download — and Qwen3-8B is what's actually
+> being served). `config/cluster.env`'s own *default* is still
+> `Qwen2.5-72B-Instruct`/TP=8 and that line is not wrong as a description
+> of the tracked default; it is wrong as a description of the running
+> cluster. **Every latency/throughput number anywhere in §§2-17 above was
+> measured against the 72B/TP=8 stack and is not comparable to anything
+> measured from 2026-09-16 onward** — see §18.1 before quoting any figure
+> from this document as if the two were interchangeable.
 
 ### One stack, two always-on KV paths — not two independent legs
 
@@ -257,9 +282,11 @@ scripts/decode/             host prep, vLLM as kv_consumer
 scripts/proxy/              async disaggregation router
 scripts/verify/             10 network → 20 plugin → 30 KV roundtrip →
                             40 end-to-end → 50 direct P/D transfer
-scripts/bench/              llama-benchy harness + compare_runs.py
+scripts/bench/             llama-benchy harness + compare_runs.py
 patches/spdk/               4 NVMe-KV patches (2 still required, see §5)
-patches/lmcache/            NIXL backend allowlist patch, generated at apply time
+patches/lmcache/             5 LMCache patches baked into the vendor image
+                            at build time — not applied by anything in this
+                            repo; see patches/lmcache/README.md (§20 correction)
 plugins/                    vendored SPDK_NVMe_KV and XNVME_KV NIXL backends
 docs/                       ARCHITECTURE, BRINGUP, TROUBLESHOOTING, BENCHMARKING,
                             TODO, HANDOFF
@@ -478,8 +505,20 @@ when editing.
   > useful record. Now tracked as Verified above and at TODO 6.3/6.8, not
   > as an open assumption.
 - **LMCache YAML key names and the allowlist patch sites.** Derived against
-  v0.5.4, validated only against a mock. `apply-patches.sh` fails loudly if it
-  finds zero allowlist sites, because that means the assumption is stale.
+  v0.5.4, validated only against a mock.
+
+  > **Partially resolved 2026-09-17, corrected same day.** The
+  > from-source-generator half of this assumption is moot: that generator
+  > applied only to a from-source LMCache install, which has never
+  > completed a build and is deprioritised (`docs/TODO.md` §6.2), and
+  > remains withdrawn (git history holds it). **A same-day pass then wrongly
+  > concluded the vendor container "already accepts both backends with no
+  > patch" and deleted `patches/lmcache/` on that premise — that conclusion
+  > was FALSE and is corrected below at §20.** The vendored LMCache 0.5.3
+  > carries both backends in its allowlist sites because the image was
+  > **built with** `patches/lmcache/0006`/`0007`/`0008` applied, not
+  > because stock LMCache does. See `patches/lmcache/README.md` for the
+  > per-patch table and the re-verification recipe.
 - **All benchmark numbers** in `BENCHMARKING.md` are order-of-magnitude
   estimates, labelled as such.
 
@@ -729,18 +768,32 @@ change. Nothing further to do here.
    is still on the 24.04 cmdline, so GPUs never autoload.
    `01-host-prep.sh` does this automatically (opt-out
    `AMDGPU_AUTOLOAD=0`). TODO 0.4. **Required right now.**
-2. **The KV target.** It does not survive a reboot of `smc3` — but as
+2. **Confirm `/dev/ng1n1` exists before attempting to start anything on
+   that node — new, 2026-09-17, §19.1.** The DSC NVMe controller has a
+   boot-time race: the kernel can probe it (`CSTS=0x0`, "Device not
+   ready; aborting initialisation") before the DPU-side application is
+   ready, the driver detaches, and **nothing re-probes it**. If
+   `/dev/ng1n1` is missing after a reboot, first check `lspci` still
+   shows `[1dd8:1005]` and that the other DSC functions (`pds_core`,
+   `ionic`) bound fine — if so, the card is not dead, the DPU side just
+   was not ready in time. Retry with
+   `echo -n "0000:36:00.0" > /sys/bus/pci/drivers/nvme/bind` — this only
+   succeeds once the DPU side is actually up, takes ~2 minutes, and fails
+   with the identical `CSTS=0x0` otherwise. `start-vllm.sh` hard-gates on
+   `/dev/ng1n1` by design, but a manual roundtrip run ahead of that gate
+   will not, and will instead report a confusing device-open failure.
+3. **The KV target.** It does not survive a reboot of `smc3` — but as
    handed over the problem is different and worse: `smc3` is up, and
    someone else's subsystem is on it. Resolve 6.18 before assuming this
    step is yours to perform. (Or evaluate the local-DSC option, §16.8 —
    it sidesteps this step entirely if adopted.)
-3. **`nvme connect`** on both compute nodes — no `--persistent`, no
-   systemd unit (TODO 6.9). Moot until (2) is resolved.
-4. **Start the LMCache MP daemon on both nodes** —
+4. **`nvme connect`** on both compute nodes — no `--persistent`, no
+   systemd unit (TODO 6.9). Moot until (3) is resolved.
+5. **Start the LMCache MP daemon on both nodes** —
    `scripts/common/start-lmcache-daemon.sh` (§17.3). Idempotent, and the
    role start scripts (`scripts/{prefill,decode}/03-start-*.sh`) call it
    automatically before launching vLLM — but it does not survive a reboot
-   any more than (1)–(3) do, and `start-vllm.sh`'s gate will `die`, not
+   any more than (1)–(4) do, and `start-vllm.sh`'s gate will `die`, not
    silently proceed, if it isn't up.
 
 What does **not** need redoing: the DSC/RDMA userspace fix is a package
@@ -1287,19 +1340,32 @@ must be first on the decode side.** **This finding is unaffected by the
 §16 correction and is explicitly reaffirmed there** — it holds regardless
 of which LMCache connector is the sibling child.
 
-### 12.2 The LMCache allowlist patch is not needed on the container path
+### 12.2 The LMCache allowlist is patched into the image, not needed as a runtime step
 
-TODO 2.7 and `patches/lmcache/` exist to widen an LMCache backend
-allowlist. **The vendored LMCache 0.5.3 in the `rocm-aic` image does not
-need it.** `XNVME_KV` and `SPDK_NVMe_KV` appear in all three hardcoded
-backend tuples — `nixl_storage_backend.py:126` (`validate_nixl_backend`),
-`:670` (mem_type selection, which correctly routes them to `OBJ` not
-`FILE`), and `:1119` (`createPool`). The repo's patch marker string
-appears nowhere in the installed tree. This is an AMD/ROCm vendor build
-that ships the support natively. The patch remains correct for the
-from-source path and has not been removed; its comment in
-`gen-lmcache-config.sh` has been corrected to stop claiming it is
-mandatory.
+TODO 2.7 and a (now-withdrawn) from-source patch generator existed to
+widen an LMCache backend allowlist. **There is no runtime patch step for
+the container path** — but that is because the vendored LMCache 0.5.3 in
+the `rocm-aic` image was **built with the allowlist already patched in**,
+not because stock LMCache carries it natively. `XNVME_KV` and
+`SPDK_NVMe_KV` appear in all three hardcoded backend tuples —
+`nixl_storage_backend.py:126` (`validate_nixl_backend`), `:670` (mem_type
+selection, which correctly routes them to `OBJ` not `FILE`), and `:1119`
+(`createPool`) — because `patches/lmcache/0008` put them there at image
+build time. (A conventional build-time `.patch` diff does not leave a
+marker string in the resulting source the way the old generator's own
+edits did — "no marker string" was misread as "no patch" in an earlier,
+now-corrected pass; see §20.)
+
+**Correction, 2026-09-17: §20 originally recorded a second, FALSE reason
+for the old generator's removal — "the image already accepts these
+backends unpatched" — and that framing bled into this section too.** The
+generator itself remains correctly withdrawn (it targeted the from-source
+build path, `docs/TODO.md` §6.2, which has never completed a build) — that
+part stands. But the allowlist widening it would have performed is real,
+required, and already done: `patches/lmcache/0006`/`0007`/`0008` are
+tracked at `patches/lmcache/` and applied at the image's build time in a
+sibling build repo. See `patches/lmcache/README.md` for the per-patch
+table and a re-verification recipe against any future image.
 
 ### 12.3 `max_local_cpu_size` is PER TP WORKER, and getting it wrong took a node down
 
@@ -2212,6 +2278,16 @@ confirm before relying on it**, not as a blocker.
 
 ### 16.8 Strategic consequence — Track A may not need `smc3` at all
 
+> **CORRECTED 2026-09-16/17 — see §18.2. This section's premise, that the
+> local DSC is a separate device that "does not need `smc3` at all," is
+> WRONG.** `nvme ns-descs` against `/dev/ng1n1` on both nodes returns an
+> **identical** `eui64` and `csi`, and the DSCs are themselves NVMe-oF
+> initiators peered to `smc3`'s `nvmf_tgt` — the "local DSC" *is* `smc3`'s
+> namespace, transparently re-exported over each node's own PCIe function,
+> not an independent 1 GiB device. Left in place because the correction is
+> the useful record (§13.4's rule); read §18.2 before acting on anything
+> below.
+
 Both `smc1` and `smc2` have their **own local DSC** (§16.7). §9.3's Track A
 was recorded as "Blocked by 6.18" because it needed this repo's KV
 subsystem restored on the shared `smc3` target, currently owned by another
@@ -2601,3 +2677,649 @@ fleet shape as implemented and unit-tested, not as proven at scale.
   6.18 (`smc3` ownership) and 6.20 (`smc2` reboot instability) gate that
   exactly as they did before this session — nothing here required
   touching either.
+
+---
+
+## 18. The remote target came up, the KV namespace is confirmed SHARED, the device geometry shrank, and the P→D leg is re-verified against a different model (2026-09-16/17)
+
+Everything below was measured directly on `smc1`/`smc2`/`smc3` this
+session. It supersedes several standing assumptions rather than merely
+adding to them — each subsection says exactly what it supersedes and why,
+per this doc's own rule (§13.4) of leaving the wrong turn visible rather
+than quietly editing it away.
+
+### 18.1 The model changed — every historical throughput/latency figure in this document is against a different model
+
+The running stack is `Qwen/Qwen3-8B`, `--tensor-parallel-size 1`
+(`creds/active.env`), **not** `Qwen2.5-72B-Instruct` at TP=8 — 72B is a
+145 GB download that is not present on either compute node's disk today.
+Also pinned: `--gpu-memory-utilization 0.85`, `--max-model-len 32768`,
+`--block-size 64`.
+
+**Read this as a hard boundary, not a footnote.** Every prompt-throughput,
+TTFT, and decode-latency number recorded anywhere in §§2–17 above — the
+§11 4033-token-prompt result (prefill 403.3 tok/s, decode 0.0 tok/s /
+100% hit), the §17 launch parameters, all of it — was measured against
+72B/TP=8. None of it is a valid comparison baseline for anything measured
+from this session onward, and none of the new numbers in this section
+(§18.7) should be read back against those older ones as if the model had
+not changed. `config/cluster.env`'s own tracked *default* is unchanged
+(still `Qwen2.5-72B-Instruct`/TP=8, per `docs/ARCHITECTURE.md` §2) — this
+is a creds-level override for this specific deployment, not a decision to
+change the default.
+
+### 18.2 The KV namespace is confirmed SHARED across P and D — the topology blocker that has shaped this project's storage-tier design since §1 is GONE
+
+`/dev/ng1n1` on **both** `smc1` and `smc2` is a local PCIe function of
+that node's own Pensando DSC (`0000:36:00.0`, model `PDSNVME`, subsystem
+NQN `nqn.2019-08.com.pensando:nvm-subsystem-sn-8001-0-0`). `nvme id-ctrl`
+and `nvme id-ns` succeed on both, as §16.7 already recorded.
+
+**What §16.7/§16.8 did not know, and what changes everything:**
+`nvme ns-descs /dev/ng1n1 -n 1` returns `csi: 0x1` (the KV command set)
+and `eui64: e46cfefeffcdae01` — **identical** on both nodes. Same
+namespace, same identifier, on both sides. Namespace size is `nsze
+0x200000` @ `lbads 9` = 1 GiB, also matching §16.7's earlier reading.
+
+The host is **not** the NVMe-oF initiator here — the DSC is. `nvme
+list-subsys` on both compute nodes shows only local PCIe subsystems, no
+NVMe-oF connection at all. `smc3` (`volcano17`) runs `nvmf_tgt` serving
+`nqn.2016-06.io.spdk:cnode1` on `1.1.0.2:4420`, and the two DSCs are its
+peers — each one re-exports that same remote namespace transparently as
+a local PCIe function, `/dev/ng1n1`, on its own host.
+
+**This supersedes §16.7/§16.8 outright.** Those sections read `/dev/ng1n1`
+as a distinct, node-local, unshareable 1 GiB device, and framed a
+"local-DSC XNVME_KV tier" as an *alternative* to `smc3` precisely because
+it looked independent of it. It is not independent of it — it **is**
+`smc3`, one hop closer. The correction block added at §16.8 points here.
+Practical consequences:
+
+- **The topology blocker this project has carried since §1** — that a
+  KV storage backend can only be a shared, cross-node tier if it's a
+  remote NVMe-oF target, and that a node-local device is a dead end for
+  that purpose — **is gone.** `/dev/ng1n1` on `smc1` and `/dev/ng1n1` on
+  `smc2` already point at the same physical namespace, with no extra
+  wiring required, and no decision to make between "local DSC" and
+  "`smc3`" — they were never two options.
+- **6.18 (`smc3` shared-resource ownership) is NOT sidestepped by using
+  the local DSC** — the opposite of what §16.8 speculated. Any other
+  party's use of `smc3`'s subsystem is exactly as visible from `/dev/ng1n1`
+  as it would be from a direct `nvme connect`, because it is the same
+  backing store. Evaluate 6.18 on its own terms; there is no local-DSC
+  escape hatch from it.
+- **The remaining blocker is unchanged and is NOT a topology problem —
+  see §18.4/TODO 6.21.** Physical sharing was never what stood between
+  this project and a cross-node hit; the per-daemon random key naming is.
+
+### 18.3 The device KV geometry changed: `value_max` 32768 → 4096
+
+The plugin now logs, at backend init:
+
+```
+[XNVME_KV] device KV format 0: value_max=4096 key_max=16 novg=0 (compiled-in default 32768)
+WARNING: device value_max=4096 is SMALLER than the compiled-in default 32768
+```
+
+`novg=0` here is itself notable — earlier sessions (§10.4/§10.5, TODO 6.4)
+measured `novg=4096` against the 131072/32768-ceiling device; this is a
+different geometry entirely, not a re-measurement of the same one.
+
+Previously (§10.4, TODO 6.4) this document recorded 32768 as a **measured
+DSC firmware ceiling** — a real, empirically-established limit, not a
+config knob. **That is no longer true; the device's own ceiling moved
+under us, again**, in the same shared-hardware-changes-under-you pattern
+§13.7/§14.4/§15 already catalogue. `scripts/verify/20-verify-nixl-plugin.sh`
+currently **FAILS**:
+
+```
+RESULT:MAX_VALUE_SIZE_MISMATCH:reported='32768' expected=4096
+```
+
+**Resolution applied, this session, config/comment side only — read the
+still-open half below before assuming this is settled:**
+
+- `creds/active.env` now sets `KV_MAX_VALUE_SIZE_XNVME=4096`
+  (`config/cluster.env`'s `KV_MAX_VALUE_SIZE_EFFECTIVE` resolves from
+  this for `KV_BACKEND=XNVME_KV`).
+- `scripts/common/container.sh` no longer exports
+  `NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE` — it never took effect anyway,
+  because `lib.sh`'s `setup_nixl_kv_env()` (`lib.sh:613-621`) `unset`s it
+  unconditionally right after `env.sh` is sourced, per invariant 4. An
+  operator control silently annulled downstream is worse than no control;
+  see `container.sh`'s own comment (added this session) for the full
+  three-reason rationale.
+- **This particular transition is NOT destructive**, unlike invariant 4's
+  general warning. The MP daemon's `nixl_store` L2 adapter unit is
+  `--l1-align-bytes` (4096 B, §17.4/§17.5) — every stored object has
+  always been exactly 4096 B, under both the old 32768 ceiling and the
+  new 4096 one, so `mem_split_n == 1` either way. No object has ever been
+  split, so the half-stale-reassembly hazard invariant 4 exists to
+  prevent (§7 invariant 4) cannot fire for *this specific* change. **It
+  would fire** if `--l1-align-bytes` itself changes, or if
+  `max_value_size` ever drops below 4096 — the invariant's reasoning is
+  unaffected, only this one transition happens to be safe.
+- **STILL OPEN — the plugin's own compiled-in default is unchanged.**
+  `XNVME_KV_DEFAULT_MAX_VALUE_SIZE` (`plugins/xnvme-kv/xnvme_kv_backend.h:71`)
+  is still `32768u`. `scripts/common/container.sh plugin-build` has not
+  been re-run to align it, so `20-verify-nixl-plugin.sh`'s mismatch above
+  persists until that rebuild happens.
+- **Recommended durable fix, NOT yet applied — a config knob, not a code
+  fix to the ceiling itself.** Give the plugin an explicit
+  `NIXL_KV_MAX_VALUE_SIZE=<N>` override that `getParams()` returns
+  unconditionally, and promote the device-vs-config mismatch from a
+  `WARNING` to a hard init failure. Rationale, read directly off
+  `container.sh`'s own reason 3 (added this session): the existing
+  `NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE` knob is call-order dependent —
+  `getParams()` reads `discovered_max_value_size_`, which `start_workers()`
+  only populates during `create_backend()`, so any caller that calls
+  `get_plugin_params()` **before** `create_backend()` (which
+  `20-verify-nixl-plugin.sh` itself does, `:171` then `:214`) still sees
+  the stale compiled-in value even with the device-adoption flag set.
+  On-wire geometry must never depend on call order. The correct model:
+  geometry comes from **config** (`KV_MAX_VALUE_SIZE_EFFECTIVE`), the
+  device is a **validator**, and a disagreement is a startup failure, not
+  a warning to scroll past.
+
+### 18.4 `retrieve_ops=0` on BOTH nodes — measured, and this confirms TODO 6.21 is still live
+
+XNVME_KV plugin runtime metrics, read from `${NIXL_KV_METRICS_PATH}`
+(`/run/kv-cache-bench/*.json`):
+
+| role | store_ops | store_bytes | completions_ok | completions_err | stalls | retrieve_ops | retrieve_bytes |
+|---|---|---|---|---|---|---|---|
+| prefill | 313,143 | 1,282,633,728 (1.28 GB) | 312,439 | 704 | 11 | **0** | **0** |
+| decode | 442,368 (368,640 + 73,728 across two engine pids) | ~1.81 GB | — | — | — | **0** | **0** |
+
+This is exactly the failure signature TODO 6.21 already identified —
+`nixl_store_l2_adapter.py`'s per-daemon `uuid4` object naming
+(`key = f"obj_{i}_{uuid.uuid4().hex[0:4]}"`) means prefill and decode
+never name the same object, so cross-node retrieve is impossible by
+construction, independent of anything in §18.3. **Confirmed still true,
+not newly discovered.**
+
+**New, and genuinely open: `retrieve_ops=0` on PREFILL by itself is a
+question that deserves its own investigation, separate from the
+cross-node key mismatch.** `LMCACHE_MAX_LOCAL_CPU_SIZE=4` (GiB) means L1
+should be evicting constantly under this store volume, and a
+same-daemon L2 read-back on an L1 eviction miss is exactly the kind of
+lookup the key-mismatch argument does **not** explain — a daemon reading
+back its own previously-evicted object needs no cross-daemon key
+agreement at all. That retrieve count is zero anyway is not yet
+explained by anything recorded in this document. Do not assume it is the
+same cause as the cross-node case without checking.
+
+**State plainly, so it is not re-litigated:** cross-node L2 retrieve
+remains **impossible**, and nothing in §18.3's `max_value_size` work
+touches this — they are unrelated layers. Cross-node KV movement on this
+stack happens over the P→D `NixlConnector` handoff (§11, §18.7), which is
+the only mechanism this architecture has for it (§4/§18.9's summary).
+
+### 18.5 The DSC wedge is active and getting worse — top open operational issue for the storage tier
+
+Building on TODO 6.22's first characterisation of the DSC stall
+watchdog: **within a single observation window this session,
+`completions_err` went 512 → 704 and `stalls` went 8 → 11.** The errors
+arrive in exact multiples of the plugin's fixed 64-deep queue
+(`704 == 11 × 64`) — this is the **stall-watchdog signature** (per-queue
+`fail_queued_work()` firing after the timeout), **not** a size-rejection
+signature. Verbatim:
+
+```
+queue made no forward progress for 30s: 0 op(s) queued, 1 in flight
+```
+
+Contrast this with TODO 6.22's earlier stall log (`37705 op(s) queued, 64
+in flight`) — a saturated queue with a large backlog draining slowly. This
+one is nearly idle (`0 queued, 1 in flight`) and still cannot make
+progress, which is a different, and worse, presentation: the device is
+not merely behind, it is not responding to the one outstanding op at all.
+
+**A standalone `scripts/verify/30-verify-kv-roundtrip.sh --write` wedged
+on its very first store** and returned `NIXL_ERR_BACKEND`. Per the
+plugin header's own `stall_timeout_ns_` documentation
+(`plugins/xnvme-kv/xnvme_kv_backend.h`), only an out-of-band DPU-side
+restart clears this condition — host-side resets make it **worse**, not
+better. Mark this the **top open operational issue for the storage
+tier**, ahead of TODO 6.21's key-derivation gap and §18.3's rebuild, both
+of which are moot against a device that will not complete a single
+operation.
+
+**Practical lesson worth recording plainly:** do **not** run
+`30-verify-kv-roundtrip.sh` against a device a live vLLM engine is
+already driving. The standalone probe above was not the first cause of
+the wedge — it hit an already-wedging device mid-session and its
+`NIXL_ERR_BACKEND` result would otherwise misattribute the failure to the
+verify script or its inputs, rather than to device state that predates
+the probe. Confirm nothing else is live on the device before trusting a
+negative result from this script.
+
+### 18.6 `scripts/verify/50-verify-pd-direct.sh` had four defects that together produced a false-negative acceptance rung on a fully healthy system — all four now fixed, 9/9 passing
+
+All four defects made the P→D acceptance rung **fail** even when the
+underlying transfer was genuinely working — the exact "check passed/failed
+while proving the opposite" failure family §13.4/§16.4 already catalogue,
+this time on the verification side rather than the thing being verified:
+
+1. **The priming request never included
+   `kv_transfer_params={"do_remote_decode": true, ...}`**, so
+   `NixlConnector` never staged blocks and never returned a handoff — this
+   is the exact trap `scripts/proxy/disagg_proxy.py`'s own module
+   docstring documents at lines 44-51 (§11.1's three-step handshake). The
+   proxy itself was fixed 2026-09-15 (§11.1); this verify script was not
+   updated to match and kept priming without the handoff field.
+2. **The side-channel reachability check probed
+   `${PREFILL_HOST}`/`${DECODE_HOST}`**, but `lib.sh`'s `setup_pd_env()`
+   binds `${PD_SIDE_CHANNEL_HOST_<ROLE>}` if set, else the first IP from
+   `hostname -I | awk '{print $1}'`. `smc2` enumerates fabric NICs before
+   its management NIC, so decode had actually bound `30.2.1.1` (a fabric
+   address), not the management `10.30.75.204` the check assumed. The
+   script now resolves the side-channel host the same way `lib.sh` does,
+   rather than re-deriving it independently.
+3. **A race against vLLM's periodic stats logger.** The script grepped
+   the decode log immediately after issuing the request, but vLLM's
+   "External prefix cache hit rate" line comes from a ~10 s periodic
+   logger, not a per-request one. Fixed by capturing a baseline reading
+   before the request, then polling for a **new** stats line for up to
+   45 s — matching §15.7's lesson that an instrument's absence of signal
+   is not evidence of absence until the instrument has been shown to
+   respond at all.
+4. **A dead hard assertion.** The script hard-asserted on the literal
+   string `need to load: <nonzero>`, which vLLM 0.26.0+rocm / LMCache
+   0.5.3 never emit at default verbosity — verified **absent** even on
+   runs independently proven to transfer KV. This assertion could never
+   pass and was demoted to corroborating-only. The hard assertion is now
+   that the cumulative "External prefix cache hit rate" **increased**
+   versus the pre-request baseline — presence of the string alone is
+   meaningless for a cumulative rate; only the delta means anything (same
+   reasoning as defect 3).
+
+**Also recorded: `bc` is not present in the `rocm-aic:mp-pd-ionic2609`
+image.** Float comparisons in verify scripts must use `awk`, which is
+present everywhere this stack runs; a `require_cmd ... bc` would `die`
+before a single check ran, turning a working acceptance rung into an
+unconditional failure on this image.
+
+With all four fixed, `50-verify-pd-direct.sh` **passes 9/9** — see §18.7
+for the measured result.
+
+### 18.7 P→D direct transfer re-verified working, against the new (Qwen3-8B/TP=1) stack — measured
+
+A controlled A/B on a fresh-nonce ~1230-token prompt, read from the
+decode engine log:
+
+| condition | Avg prompt throughput | External prefix cache hit rate |
+|---|---|---|
+| WITH handoff threaded in | **0.0 tokens/s** | rose 48.3% → 58.2% |
+| WITHOUT handoff (negative control) | 124.7 tokens/s | fell 50.5% → 33.4% |
+
+Same qualitative signature §11 established against 72B/TP=8 — decode does
+no prefill work when the handoff fires, and does full prefill when it is
+deliberately withheld — reproduced against a different model. **Do not
+compare the throughput numbers themselves across the two sessions** (§18.1).
+
+Full rung run: `50-verify-pd-direct.sh` **PASSED 9/9**, hit rate rose
+58.2% → 65.0% over the run, decode `Avg prompt throughput` held at 0.0.
+`40-verify-disagg.sh` **PASSED 9/9** with TTFT improving **2.14x**.
+Proxy `/status` reported `prefill_no_handoff: 0` throughout both runs —
+the counter that would have caught §11's original defect, still clean.
+
+**Caveat this repo already makes, and it still applies unchanged:** the
+P→D leg runs over the 1 GbE **management** NIC (`UCX_NET_DEVICES=ens51f0`
+on both nodes, §11.2) — none of the numbers above are transport
+benchmarks. Nothing about the RDMA fabric (§3, §14, §15) was exercised by
+this measurement.
+
+### 18.8 Side-channel bind addresses are now pinned in creds
+
+`PD_SIDE_CHANNEL_HOST_PREFILL=10.30.75.198` and
+`PD_SIDE_CHANNEL_HOST_DECODE=30.2.1.1` are now set explicitly in
+`creds/active.env`, removing the `hostname -I`-first-IP lottery §18.6's
+defect 2 depended on to reproduce — with these pinned, `setup_pd_env()`
+no longer has to guess, on either node.
+
+**Known, non-correctness asymmetry, left as a follow-up, not fixed here:**
+bulk KV still rides UCX over `ens51f0` (management) on both nodes (§11.2),
+while decode's metadata **side channel** now sits on a fabric NIC
+(`benic1p1`, i.e. `30.2.1.1`) rather than the management NIC prefill uses.
+This is asymmetric by IP class, not merely by address, and nothing has
+broken because of it yet — `50-verify-pd-direct.sh` passes 9/9 with this
+pin in place — but it is worth resolving to one class or the other before
+trusting it under a topology change (e.g. the xPyD fleet shape, §17.9).
+
+### 18.9 What this session changes
+
+- **§18.1**: the model is `Qwen/Qwen3-8B` TP=1, not `Qwen2.5-72B-Instruct`
+  TP=8 — every prior throughput/latency figure in this document is
+  against the other model and is not a valid comparison baseline.
+- **§18.2 SUPERSEDES §16.7/§16.8**: the "local DSC" is not a separate,
+  node-local, unshareable device — it is `smc3`'s own namespace,
+  re-exported per-node over PCIe. The topology blocker this project has
+  carried since §1 is gone; 6.18 is not sidestepped by using it.
+- **§18.3**: `XNVME_KV`'s device-reported `value_max` moved 32768 → 4096.
+  Config-side resolved (`KV_MAX_VALUE_SIZE_XNVME=4096`, the dead
+  `NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE` export removed); the plugin's
+  compiled-in default (`xnvme_kv_backend.h:71`) still needs a
+  `plugin-build` to align, and `20-verify-nixl-plugin.sh` fails until it
+  does. A durable fix (explicit `NIXL_KV_MAX_VALUE_SIZE` override +
+  promoting the mismatch to a hard failure) is recommended, not applied.
+- **§18.4 confirms TODO 6.21 is still live**: `retrieve_ops=0` on both
+  roles, measured. New open question, not previously asked: why
+  `retrieve_ops=0` on **prefill alone**, given L1 should be evicting
+  under a 4 GiB cap — not yet explained by the cross-node key-mismatch
+  argument, which only accounts for the cross-node case.
+- **§18.5**: the DSC wedge is worse than TODO 6.22 characterised it —
+  `completions_err`/`stalls` climbing within one session, a new
+  near-idle stall signature (`0 queued, 1 in flight`), and a standalone
+  verify script wedging on its first store. Top open operational issue
+  for the storage tier. Practical lesson: never point
+  `30-verify-kv-roundtrip.sh` at a device a live engine is already
+  driving.
+- **§18.6/§18.7**: `50-verify-pd-direct.sh`'s four defects (missing
+  handoff request, wrong side-channel host resolution, a stats-logger
+  race, a dead string assertion) are fixed; the rung passes 9/9 and the
+  P→D direct-transfer result is reproduced against the new model.
+- **§18.8**: side-channel bind addresses are pinned in creds, removing
+  the first-IP lottery; a management-vs-fabric NIC asymmetry on the
+  side channel is recorded as a non-blocking follow-up.
+
+---
+
+## 19. Both compute nodes rebooted: a DSC boot-time race, cross-node storage-tier store+retrieve PROVEN in both directions, the DSC wedge cleared, and LMCache's L2 tier isolated as the sole remaining blocker (2026-09-17)
+
+Everything below was measured directly on `smc1`/`smc2` after both compute
+nodes were rebooted this session. As with §18, each subsection says what it
+supersedes rather than quietly editing an earlier claim away.
+
+### 19.1 The DSC NVMe controller has a boot-time race — new this session, not previously recorded
+
+At boot, the kernel probes the DSC NVMe controller (PCIe `0000:36:00.0`,
+`[1dd8:1005]`) roughly 3 seconds after PCIe enumeration — before the
+DPU-side application is ready to answer it — and the probe fails:
+
+```
+nvme nvme1: Device not ready; aborting initialisation, CSTS=0x0
+```
+
+The kernel `nvme` driver then detaches, and **nothing re-probes it**.
+Symptoms: `/dev/ng1n1` absent, the device shows `enable=0` in sysfs, no
+driver bound to the PCI slot — while `lspci` still shows the function
+present and enumerated: `36:00.0 ... DSC NVMe Controller [1dd8:1005]`.
+
+**Diagnostic that distinguishes "the card is dead" from "the NVMe
+personality specifically isn't ready yet" — check this before assuming a
+hardware fault:** the DSC's *other* PCI functions bind and work fine on
+the same boot — `pds_core` on `08:00.2` (firmware `1.130.0-a-120`) and
+`ionic` on `35:00.0` — config space reads correctly
+(`setpci -s 36:00.0 00.L` → `10051dd8`, i.e. the device answers config
+cycles), and the PCIe link itself is healthy (`LnkSta` `32GT/s x16`, full
+width and speed). A `CSTS=0x0` on a function with a healthy link and
+sibling functions bound cleanly means the DPU-side NVMe/KV application is
+not yet serving — not that the card, slot, or link is bad.
+
+**Manual recovery — works ONLY if the DPU side has already come up in the
+background; fails identically otherwise:**
+
+```
+echo -n "0000:36:00.0" > /sys/bus/pci/drivers/nvme/bind
+```
+
+This takes roughly 2 minutes to resolve either way. If the DPU-side
+application is not yet ready, it fails with the exact same
+`CSTS=0x0`/`Device not ready` signature as the original boot-time probe —
+the rebind is not a fix by itself, it is a way to re-trigger the probe
+once the actual precondition (DPU-side readiness) has been met.
+
+On a reboot where the DPU side was already up by the time the kernel got
+to it, the probe succeeds cleanly on the first try:
+
+```
+nvme nvme1: 63/0/0 default/read/poll queues
+nvme nvme1: block device for nsid 1 not supported (csi 1)
+```
+
+**Record explicitly: the second line is EXPECTED, not an error.** `csi 1`
+is the KV command set, which has no block-device semantics — that is
+exactly why only the char device `/dev/ng1n1` appears and `/dev/nvme1n1`
+correctly does **not**. This is the same signature §18.2/TODO 6.25 already
+established as healthy; it is restated here only because this section's
+subject is the boot race that precedes it, not the csi-1 behaviour itself.
+
+**Added to the per-boot ritual (§9.4) because of this:** after any reboot,
+confirm `/dev/ng1n1` exists before attempting to start anything on that
+node. `start-vllm.sh` already hard-gates on it by design (§7), so a
+missing device fails loudly there too — but a manual roundtrip run or a
+verify-script invocation ahead of that gate will not, and will instead
+report a confusing device-open failure that looks unrelated to boot order.
+
+### 19.2 Cross-node storage-tier STORE + RETRIEVE is PROVEN, in both directions — this is a first
+
+**This supersedes §18.2's framing.** §18.2 established that `/dev/ng1n1`
+on both nodes is the *same namespace* (`csi 0x1`, identical `eui64`) — a
+topology fact, established without moving a single byte between nodes.
+This session moved actual data across it, both directions, on a
+namespace confirmed clean beforehand (`nuse: 0`) with **no vLLM engine
+running** — a clean, uncontaminated test on a pristine device, not one
+sharing the namespace with a live workload. `nvme ns-descs` reconfirmed
+`csi 0x1` / `eui64 e46cfefeffcdae01`, identical on both nodes, matching
+§18.2 exactly.
+
+Using `scripts/verify/30-verify-kv-roundtrip.sh` — keys are derived purely
+from `(nonce, size)` via sha256; **the two sides never exchange the key
+directly**, so a successful cross-node read is proof the namespace is
+shared, not proof the test script leaked information between processes:
+
+| direction | size | max_value_size | parts | result |
+|---|---|---|---|---|
+| WRITE on `smc1` (prefill) → READ on `smc2` (decode) | 24,576 B | 4096 | 6 | **RESULT:OK** — all 6 sub-keys confirmed present by `query_memory` before read, byte-for-byte compare passed |
+| negative control: never-written nonce, read on `smc2` | — | — | — | **RESULT:QUERY_MISS**, non-zero exit |
+| WRITE on `smc2` (decode) → READ on `smc1` (prefill), reverse direction | 1,048,576 B | 4096 | 256 | **RESULT:OK** |
+
+The negative control is the reason the positive results above are not a
+false pass — a nonce that was genuinely never written correctly reports
+`QUERY_MISS` rather than a stale hit against leftover namespace data. The
+reverse-direction run (`smc2` → `smc1`, 256 parts) exercises the
+multipart `#{j}`-suffix path heavily, which the smaller forward-direction
+run barely touches.
+
+**This supersedes every earlier statement in this document that the
+storage tier cannot move data between nodes.** The topology blocker is
+definitively gone, in both directions, at the plugin/device layer. What
+remains broken sits one layer up, in LMCache — see §19.4.
+
+### 19.3 The DSC completions-error wedge (§18.5) is CLEARED
+
+§18.5 recorded `completions_err` climbing 512 → 704 and `stalls` 8 → 11
+within a single session, with a standalone verify script wedging on its
+very first store — and stated that only a DPU-side restart was known to
+clear it.
+
+Plugin metrics across every process, checked after all of §19.2's runs:
+**`completions_err=0`, `stalls=0`, everywhere.** The reboot — with the DPU
+side up, per §19.1 — cleared it, consistent with §18.5's own prediction
+that only an out-of-band DPU-side restart (not a host-side reset) would
+do so. Not yet known: whether the reboot cleared it incidentally or
+whether it recurs under the same sustained-load conditions §18.5/TODO
+6.22 first measured it under — this is a clean baseline, not a proof the
+wedge cannot recur.
+
+### 19.4 LMCache's L2 tier still does not retrieve — and is now cleanly isolated as the sole remaining blocker
+
+**This is the headline finding of this session, and it sharpens TODO
+6.21 from "the diagnosed cause" to "the only remaining candidate cause,
+with the alternatives ruled out by direct measurement."** Per-process
+plugin metrics after a full stack run, both roles:
+
+| role | pid | store | retrieve | identity |
+|---|---|---|---|---|
+| prefill | 193 | 6 | 0 | this session's own roundtrip write |
+| prefill | 308 | 0 | 256 | this session's own roundtrip read |
+| prefill | **759** | **36,864** | **0** | **the LIVE vLLM engine** |
+| decode | 253 | 256 | — | this session's own reverse-direction write |
+| decode | 28 | — | 6 | this session's own cross-node read |
+| decode | **707** | **0** | **0** | **the LIVE vLLM engine** |
+
+Every single non-zero `retrieve_op` measured anywhere on either box came
+from the standalone roundtrip runs in §19.2 — never from an
+LMCache-driven engine. The two live vLLM engines together stored **36,864**
+objects into the shared, now-proven-working namespace, and retrieved
+**zero** of them.
+
+**Why this matters more than a repeat of TODO 6.21's original diagnosis:**
+before this session, "the plugin/device/topology don't support cross-node
+retrieve" was one of the candidate explanations for `retrieve_ops=0` on
+both roles (§18.4 explicitly left this open, and flagged prefill's
+own-process `retrieve_ops=0` as a separate, unexplained question). §19.2
+closes that candidate directly — the plugin, the device, the shared
+namespace, and cross-node retrieve all demonstrably work, on this exact
+namespace, this session. What does **not** work is LMCache's
+`nixl_store_l2_adapter.py`, which names every stored object
+`obj_{i}_{uuid.uuid4().hex[0:4]}` with a fresh `uuid4` drawn independently
+by each daemon at startup (TODO 6.21's original finding, unchanged) — so
+prefill and decode never agree on a key for identical content, regardless
+of what the underlying device is capable of.
+
+TODO 6.21 is therefore no longer one of several candidate explanations
+for `retrieve_ops=0` — after this session's evidence, it is **the**
+remaining blocker, and it is an LMCache patch (the key-derivation scheme
+in `nixl_store_l2_adapter.py`), not a plugin defect and not a topology
+problem. §18.4's separate open question — why prefill's own-process
+`retrieve_ops=0` even on a same-daemon L1-eviction miss — remains
+unexplained and is not resolved by this session; it is a different
+mechanism than the cross-node key-mismatch and should still be
+investigated on its own.
+
+### 19.5 P→D leg re-verified on the fully rebuilt stack
+
+Re-running the acceptance ladder §18.6/§18.7 already established, this
+time against the freshly rebooted, freshly reconnected stack (not a
+repeat of the same live processes — a genuinely new engine instance):
+
+- `scripts/verify/50-verify-pd-direct.sh`: **9/9 PASSED.** External prefix
+  cache hit rate rose **0.0% → 100.0%** — a fresh engine, so the 0.0%
+  starting point is a genuine baseline, not a stale reading — while decode
+  logged `Avg prompt throughput: 0.0 tokens/s`, the same signature §18.7
+  established.
+- `scripts/verify/40-verify-disagg.sh`: **9/9 PASSED.**
+- Proxy `/status`: `prefill_no_handoff: 0` — the counter that would catch
+  §11's original silent-defect class, still clean.
+- Decode's NIXL side channel is bound to `30.2.1.1:5601`, matching the
+  pinned `PD_SIDE_CHANNEL_HOST_DECODE` (§18.8) — confirming that pin is
+  now deterministic across a reboot, rather than the `hostname -I`
+  first-IP accident §18.6's defect 2 depended on to reproduce.
+
+This does not supersede §18.6/§18.7 — it reproduces the same result on a
+rebuilt stack, which is worth recording because nothing about the P→D
+leg is assumed to survive a reboot untouched (§9.5's standing warning).
+
+### 19.6 Still open — do not read anything above as closing these
+
+- `20-verify-nixl-plugin.sh` still **FAILS**:
+  `RESULT:MAX_VALUE_SIZE_MISMATCH:reported='32768' expected=4096`. The
+  plugin's compiled-in `XNVME_KV_DEFAULT_MAX_VALUE_SIZE`
+  (`plugins/xnvme-kv/xnvme_kv_backend.h:71`) is still `32768u`, unchanged
+  since §18.3/TODO 6.24 — `container.sh plugin-build` has not been re-run.
+  This did **not** prevent any of §19.2's roundtrips, because the harness
+  does its own splitting at `KV_MAX_VALUE_SIZE_EFFECTIVE=4096`; the two
+  facts are independent, not a contradiction.
+- The explicit `NIXL_KV_MAX_VALUE_SIZE=<N>` override plus promoting the
+  device/config mismatch from a warning to a hard init failure (§18.3's
+  recommended durable fix) is still unimplemented.
+- §18.4's separate open question — `retrieve_ops=0` on prefill by itself,
+  independent of the cross-node key mismatch — is untouched by this
+  session and still unexplained.
+
+### 19.7 What this session changes
+
+- **§19.1**: new finding, not previously recorded — a DSC NVMe
+  boot-time race (`CSTS=0x0` if the kernel probes before the DPU side is
+  ready), with a diagnostic that separates it from a dead card and a
+  manual-recovery command that only works once the DPU side is actually
+  up. Added to the per-boot ritual, §9.4.
+- **§19.2 strengthens §18.2 from "confirmed shared" to "confirmed
+  working"**: cross-node store+retrieve through the shared namespace is
+  proven in both directions, on a clean namespace, with a negative
+  control. This supersedes every earlier statement that the storage tier
+  cannot move data between nodes.
+- **§19.3**: the DSC completions-error wedge §18.5 flagged as the top
+  open operational issue is cleared — `completions_err=0`/`stalls=0`
+  across every process, after the reboot.
+- **§19.4 isolates TODO 6.21 as the sole remaining blocker**: with the
+  plugin, device, topology and cross-node retrieve all directly proven
+  working (§19.2), the live vLLM engines' `store=36,864`/`retrieve=0`
+  can no longer be attributed to anything but LMCache's
+  `nixl_store_l2_adapter.py` per-daemon `uuid4` key naming. This is now a
+  targeted LMCache patch, not an open-ended investigation.
+- **§19.5**: the P→D leg (§18.6/§18.7) is reproduced, 9/9 on both rungs,
+  against the rebuilt stack — not a new result, a re-confirmation that
+  survives a reboot when the per-boot ritual (§9.4, now including §19.1)
+  is followed.
+- **§19.6**: TODO 6.24's plugin-rebuild gap and its recommended durable
+  fix remain open and unchanged; do not read §19.2-§19.5 as having
+  touched either.
+
+---
+
+## 20. The LMCache from-source patch generator withdrawn — and a same-day factual error in this section, corrected (2026-09-17)
+
+This repo's patch directory used to carry an LMCache subtree (a shell
+entry point plus a Python scan-and-patch engine module) that generated an
+in-place edit to an **installed-from-source** LMCache, adding
+`SPDK_NVMe_KV`/`XNVME_KV` to two hardcoded NIXL-backend allowlists in
+`lmcache/v1/storage_backend/nixl_storage_backend.py`. That generator was
+removed from the tree — `git rm -r`'d, not left behind untracked — and
+**remains withdrawn**; the reasoning below explains why, and also
+corrects a second claim this section originally made that was false.
+
+1. **It targeted a build path that has never completed. This reasoning
+   stands.** The generator only applied to LMCache installed via
+   `scripts/common/20-build-vllm-lmcache.sh` into `/opt/kvstack/venv` — the
+   from-source chain `docs/TODO.md` §6.2 tracks as parked/deprioritised.
+   This lab runs the vendor container image `rocm-aic:mp-pd-ionic2609`
+   instead, which never touches that venv at all. Git history holds the
+   generator if the from-source path is ever revived.
+
+2. **"The LMCache actually installed in that image (0.5.3) already accepts
+   both backends, unpatched" — this reasoning was FALSE and is retracted,
+   corrected 2026-09-17, same day it was written.** On the strength of
+   this claim, `patches/lmcache/` (the whole directory, including five
+   `.patch` files unrelated to the withdrawn generator) was `git rm`'d —
+   staged, caught and reverted before commit. **The image accepts
+   `SPDK_NVMe_KV`/`XNVME_KV` because it was BUILT with LMCache patches
+   applied, not because stock LMCache 0.5.3 does.** The patch set —
+   `0006`-`0009`, `0011` — lives in a sibling build repo and is now also
+   tracked here at `patches/lmcache/`, as conventional `.patch` diffs
+   consumed at image-build time (a different mechanism from the withdrawn
+   generator's deploy-time source-scanning, but the same underlying
+   intent). `nixl_store_l2_adapter.py` (the file the MP daemon's
+   `--l2-adapter` actually uses) carries `0006`'s allowlist widening and
+   `0007`'s `mem_split_n`/`#{j}` multipart-split machinery — the latter is
+   not upstream LMCache at all, it originates in `0007`. The MP daemon
+   store of ~1.16 GB (§19.4's `store` column) this section originally cited
+   as evidence of "no patch" is real and still stands as evidence the
+   backend works — it was the *inference* from that evidence ("therefore
+   unpatched") that was wrong. See `patches/lmcache/README.md` for the
+   full per-patch table and a copy-pasteable re-verification recipe
+   against any future image.
+
+So: the generator's withdrawal (point 1) is correct and unaffected by this
+correction. What was wrong was concluding, additionally, that the
+*patches* were unnecessary — they are necessary, they are just not applied
+by anything in this repo at runtime, because the image ships prebuilt with
+them already in place. Every doc that cited this section's original point
+2 (`README.md`, `BRINGUP.md` §6.2, `TROUBLESHOOTING.md`, `ARCHITECTURE.md`
+§2, `TODO.md` 2.7 / 6.10 §12.2) carries its own dated correction pointing
+back here and to `patches/lmcache/README.md`.
+
+**Git history holds the withdrawn generator** — a straightforward `git
+log`/`git show` lookup on the commit that removed it — if the from-source
+build path in `docs/TODO.md` §6.2 is ever revived and actually reaches an
+installed LMCache tree, that is the one condition under which reviving the
+generator (or just applying `0006`-`0009`/`0011` to that from-source tree
+directly) would matter again. Short of that, if
+`scripts/common/25-validate-lmcache-config.sh` ever reports a backend
+**REJECTED** against some future vendor image, that is the signal to
+re-run `patches/lmcache/README.md`'s verification recipe against that
+image — the patches may be missing from that build, not that this repo
+needs a runtime patch step. `patches/spdk/` is unaffected — it is
+unrelated, still live, target-side SPDK support.

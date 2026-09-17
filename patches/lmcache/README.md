@@ -1,257 +1,158 @@
-# LMCache patches — SPDK_NVMe_KV / XNVME_KV backend allowlist
+# patches/lmcache/ — LMCache patches baked into the vendor image
 
-## Why this exists
+**These five `.patch` files are not applied by anything in this repo.**
+They document, and let a future reader re-verify, patches that were already
+applied when `rocm-aic:mp-pd-ionic2609` (the vendor image this lab actually
+runs) was **built**, in a sibling build repo this repo does not have access
+to. This directory is provenance and a re-verification recipe, not a build
+step — there is no `apply-patches.sh` here and nothing in `scripts/`
+invokes `git am`/`patch` against these files.
 
-Stock LMCache (this repo pins `LMCACHE_VERSION=0.5.4`, see
-`scripts/common/20-build-vllm-lmcache.sh`) hardcodes two separate allowlists
-of NIXL backend names inside
-`lmcache/v1/storage_backend/nixl_storage_backend.py`:
+> **Correction, 2026-09-17 — read this before trusting anything else in
+> this repo about "no patch needed".** An earlier pass through this repo
+> today concluded that the LMCache installed in the vendor image "already
+> accepts `SPDK_NVMe_KV`/`XNVME_KV` with no patch applied" and, on that
+> premise, deleted this whole directory (the `git rm` was staged, then
+> reverted before commit) and rewrote several docs to say no patch step is
+> needed. **That was backwards.** The image accepts those backends
+> *because it was built with these five patches applied* — not because
+> stock LMCache 0.5.3 does. The docs this touched (`HANDOFF.md`,
+> `TODO.md`, `BRINGUP.md`, `TROUBLESHOOTING.md`, `README.md`,
+> `ARCHITECTURE.md`, the `scripts/verify/*` headers) each carry their own
+> dated correction pointing back here — this file is now the single
+> source of truth for what is and isn't patched.
 
-1. **`NixlStorageConfig.validate_nixl_backend()`** — asserts the configured
-   `nixl_backend` is one of a fixed set of upstream-known names (observed in
-   this codebase's own introspection as roughly `GDS`/`GDS_MT`/`OBJ` (cpu or
-   cuda) and `POSIX`/`HF3FS`/`AZURE_BLOB`/`DOCA_MEMOS` (cpu only) — see
-   the "THE BACKEND-ALLOWLIST RISK" section of the in-process
-   LMCacheConnectorV1 YAML generator, where this project's own prior
-   investigation of this exact function was recorded, before that whole
-   surface was removed — TODO 6.23). `SPDK_NVMe_KV` and `XNVME_KV` are not
-   in that list.
+## Why conventional `.patch` files, not the old generator
 
-   > **Superseded on the path this repo actually runs (measured 2026-09-16).**
-   > `validate_nixl_backend()` belongs to the **in-process**
-   > `LMCacheConnectorV1`/`NixlStorageBackend` path, which this repo no
-   > longer configures at all. The MP daemon's `nixl_store` L2 adapter keeps
-   > its own separate allowlist, and in the installed lmcache 0.5.3 that one
-   > **already contains both KV backends**:
-   > `_VALID_NIXL_BACKENDS = (GDS, GDS_MT, POSIX, AIS_MT, HF3FS, OBJ,
-   > AZURE_BLOB, SPDK_NVMe_KV, XNVME_KV)`, with `_FILE_BACKENDS`
-   > deliberately excluding both so they route as `mem_type="OBJ"`
-   > (`nixl_store_l2_adapter.py:1056-1067`). The daemon has been brought up
-   > and has stored ~1.16 GB through `XNVME_KV` with **no LMCache patch
-   > applied**. Treat the patches below as required only if something
-   > reintroduces the in-process path.
-2. **`NixlDynamicStorageAgent.__init__`** — separately decides the NIXL
-   `mem_type` to use for a backend by a second hardcoded name check
-   (`backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS")` -> `OBJ` mem_type,
-   else -> `FILE` mem_type). `SPDK_NVMe_KV`/`XNVME_KV` fall into the `FILE`
-   branch there too.
+An earlier version of this directory carried a different mechanism
+entirely: a shell entry point (`apply-patches.sh`) plus a Python
+`tokenize`/`ast`-based scan-and-patch engine (`_patch_engine.py`) that
+edited an **installed-from-source** LMCache in place. That generator
+targeted `scripts/common/20-build-vllm-lmcache.sh`'s from-source install
+path (`/opt/kvstack/venv`), which has never completed a build and is
+deprioritised (`docs/TODO.md` §6.2) — this lab runs the prebuilt vendor
+image instead, which never touches that venv. **The generator remains
+withdrawn** (git history holds it) for exactly that reason: it targets a
+code path this deployment does not exercise.
 
-Unpatched, a deployment configured with `nixl_backend: "SPDK_NVMe_KV"` (a key
-of the in-process LMCacheConnectorV1 YAML surface, removed — TODO 6.23; the
-MP daemon spells the same choice as `"backend"` inside its `--l2-adapter`
-JSON) hits one of two failure modes:
+**The patches themselves are a different matter and are load-bearing.**
+They were extracted from the sibling build repo that actually produces
+`rocm-aic:mp-pd-ionic2609` and are conventional unified-diff `.patch`
+files consumed at **image build time**, not by any generator or runtime
+step in this repo. Different mechanism (a build-time patch vs. a
+deploy-time source-scanning generator), same underlying intent (widen
+LMCache's hardcoded NIXL-backend allowlists and fix the bugs that surface
+once `SPDK_NVMe_KV`/`XNVME_KV` are live traffic instead of dead code).
 
-- **Loud failure**: `validate_nixl_backend()` raises
-  `AssertionError: Invalid NIXL backend & device combination` the first time
-  the NIXL storage backend is constructed, before a single byte reaches the
-  plugin. Annoying, but at least honest.
-- **Silent, dangerous failure**: if a version/code-path skips or has already
-  passed the first check, `NixlDynamicStorageAgent.__init__` puts
-  `SPDK_NVMe_KV`/`XNVME_KV` on the `FILE` mem_type path. LMCache then does
-  real `os.open()`/`os.path.join(extra_config.nixl_path, key)` calls against
-  the **local filesystem** of whichever node ran the store — never touching
-  SMC3 at all. The server starts, answers `/health`, serves every request,
-  and nothing anywhere logs an error. The only way this class of bug is
-  ever caught is a live P/D cache-hit test that comes back suspiciously
-  empty (see `plugins/nvme-kv/spdk_nvme_kv_backend.h`'s `queryMem()` comment
-  for the twin transport-layer version of this exact failure mode, and
-  `scripts/verify/30-verify-kv-roundtrip.sh` / `40-verify-disagg.sh` in this
-  repo for the tests that catch it).
+## Per-patch table
 
-Both name lists live in the SAME source function pair that
-`scripts/common/25-validate-lmcache-config.sh` already introspects (via
-`inspect.getsource`) to *detect* this problem. This patch is what actually
-*fixes* it, so that validator passes for real instead of reporting the
-condition it was written to catch.
+| Patch | Subject | Target file(s) | What it does | Why it's needed |
+|---|---|---|---|---|
+| `0006` | accept `SPDK_NVMe_KV` and `XNVME_KV` in the L2 adapter | `lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py` | Adds both names to **two** allowlists in this file: the `elif self.backend in [...]` branch that routes a backend to `init_storage_handlers_object`/`mem_type="OBJ"`, and `_VALID_NIXL_BACKENDS` (the config-time validator). | This is the file the **MP daemon's `nixl_store` L2 adapter** actually uses — the live path this cluster runs (`start-lmcache-daemon.sh`'s `--l2-adapter` JSON). Without it, `backend: XNVME_KV`/`SPDK_NVMe_KV` in the `--l2-adapter` spec is rejected outright at daemon startup. |
+| `0007` | split L2-adapter stores that exceed `max_value_size` | same file (`nixl_store_l2_adapter.py`) | Adds `mem_split_n` / `_resolve_mem_split()` (queries the backend's declared `max_value_size` via `get_plugin_params()` and computes how many sub-descriptors one page/slot needs), splits `init_mem_handlers()`/`init_storage_handlers_object()`'s descriptor lists accordingly, and tags each sub-part's storage key with a `#{j}` suffix (`_expand_split_indices()` keeps the mem-side and storage-side sub-descriptor lists in matching order). | **This is the origin of the `mem_split_n`/`_resolve_mem_split`/`#{j}` multipart scheme — it is not upstream LMCache.** `SPDK_NVMe_KV` advertises a 512 KiB `max_value_size`; a full LMCache page is normally several MB. Without this patch there is no split at all: a page larger than the backend's ceiling either fails outright or (worse) silently collapses distinct sub-parts onto one key and overwrites — see the warning below. |
+| `0008` | accept `SPDK_NVMe_KV` and `XNVME_KV` in `nixl_storage_backend` | `lmcache/v1/storage_backend/nixl_storage_backend.py` | Adds both names to `validate_nixl_backend()`'s allowlist, to the `mem_type="OBJ"` selection in `NixlDynamicStorageAgent.__init__`, and to the `create_backend`-adjacent pool-selection branch (`NixlObjectPool` vs `NixlFilePool`). | This is the **in-process** path (`LMCacheConnectorV1`/`StorageManager`/`CreateStorageBackends`), which this repo does not currently run — the MP daemon uses `0006`'s file instead. Patched anyway because it is the same LMCache install serving both code paths, and it is exactly the function pair this repo's own `scripts/common/25-validate-lmcache-config.sh` introspects. If the in-process path is ever revived, this patch is what makes it work; until then it is dormant but present. |
+| `0009` | derive the K/V plane count instead of assuming 2 | `lmcache/integration/vllm/vllm_service_factory.py`, `lmcache/v1/gpu_connector/gpu_connectors.py` | Adds `_aic_kv_plane_count()`, which asks vLLM's attention backend (`get_kv_cache_shape()`) whether the KV cache is *fused* (rank-4, `2 * head_size` trailing axis) or *split* (rank-5, leading axis of 2) instead of hardcoding "2 planes". Carries the answer through `metadata.kv_shape` to the connector and cross-checks it against the real tensors at first use, raising on mismatch. | vLLM 0.26 on this stack presents a fused cache; the unpatched assumption of 2 split planes has the same total byte count (so nothing fails loudly) but a wrong per-token stride — the copy kernel silently stores half the tokens, from the wrong offsets, with the V plane never written. Every chunk on the unpatched path is corrupt without ever raising an error. |
+| `0011` | gate `LMCacheMPConnector`'s load path on `num_external_tokens` | `lmcache/integration/vllm/lmcache_mp_connector.py` | One-line guard: `condition = num_external_tokens > 0 and tracker.needs_retrieve()` (previously just `tracker.needs_retrieve()`). | Since vLLM #46865, a non-chosen `MultiConnector` sub-connector receives the request's real blocks with `num_external_tokens=0`; without this guard it wrongly decides to retrieve anyway, creates a load that must not happen, and leaks lookup locks (only the vLLM-side hit tokens get freed, not the LMCache-side ones). There are two near-identical `LMCacheMPConnector` implementations in this image and the vendor's default import resolves to the one this patch touches — see the patch's own header comment for the two-copy trap. |
 
-### The second, independent reason: the multipart-split / `max_value_size` mismatch
+## Re-verification recipe
 
-The SPDK_NVMe_KV plugin advertises `max_value_size = 524288` (512 KiB) via
-its NIXL `getParams()` callback (`plugins/nvme-kv/spdk_nvme_kv_plugin.cpp`).
-That number is **not** a device limit — it is derived from the NVMe-oF/TCP
-transport's SGL ceiling (`nvmf_tcp_create()` rejects `max_io_size` above
-roughly `max_io_size / io_unit_size(131072) > SPDK_NVMF_MAX_SGL_ENTRIES(16)`,
-i.e. ~2 MiB, and this repo's target is configured for `max_io_size=1048576`
-— see `config/cluster.env`'s `NVMF_MAX_IO_SIZE`/`NVMF_IO_UNIT_SIZE` comments)
-with headroom left for NVMe/TCP PDU framing overhead.
+Copy-pasteable. This is how a future reader confirms a **new** image still
+carries these patches before assuming anything about it.
 
-A single LMCache KV page, however, is typically several MB —
-`chunk_size=256` tokens (`LMCACHE_CHUNK_SIZE` in `config/cluster.env`)
-works out to roughly **5.7 MB** for common 8B-class models. Handed to the
-plugin as one descriptor, the target rejects it outright with
-`"SGL length ... exceeds max io size"`
-(`plugins/nvme-kv/spdk_nvme_kv_plugin.cpp`'s comment on this exact failure,
-found 2026-08-18 wiring up the storage target). LMCache's own upstream NIXL
-storage backend has no built-in awareness that a single backend might want
-a value ceiling smaller than the page it's handed — it has to be told to
-split. That is the second half of what this patch family provides: ensuring
-the OBJ-mode code path in the installed LMCache actually reads
-`max_value_size` (rather than assuming its own OBJ-pool backends, whose
-`max_value_size` are effectively unbounded, e.g. object storage or a local
-POSIX filesystem) and chops a value larger than it into
-`ceil(page_size / max_value_size)` sub-transfers before handing them to
-`create_backend()`-constructed backend's `postXfer()`.
+```bash
+IMG=rocm-aic:mp-pd-ionic2609
+LMCACHE=/usr/local/lib/python3.12/dist-packages/lmcache
 
-Older comments in `plugins/nvme-kv/spdk_nvme_kv_plugin.cpp` and
-`plugins/xnvme-kv/xnvme_kv_plugin.cpp` refer to this same patch family by
-number under a different, now-stale path prefix:
-`stack/tracks/lmcache/patches/0002-*.patch` /
-`0003-*.patch`. That prefix reflects an earlier monorepo layout this repo
-was extracted from. **This directory (`patches/lmcache/`) is the current,
-canonical location** — the numbered-patch comments elsewhere in this repo
-have not been rewritten (out of scope for this change) but describe the
-same underlying fix.
+# 0006 — L2 adapter accepts SPDK_NVMe_KV / XNVME_KV
+docker run --rm --entrypoint bash "$IMG" -lc \
+  "sed -n '234p' $LMCACHE/v1/distributed/l2_adapters/nixl_store_l2_adapter.py; \
+   sed -n '1064,1065p' $LMCACHE/v1/distributed/l2_adapters/nixl_store_l2_adapter.py"
+# expected:
+#   234:  elif self.backend in ["OBJ", "AZURE_BLOB", "SPDK_NVMe_KV", "XNVME_KV"]:
+#   1064: "SPDK_NVMe_KV",
+#   1065: "XNVME_KV",
 
-## Exactly what version this targets
+# 0007 — mem_split_n / _resolve_mem_split exist in the same file
+docker run --rm --entrypoint bash "$IMG" -lc \
+  "sed -n '209p;249p' $LMCACHE/v1/distributed/l2_adapters/nixl_store_l2_adapter.py"
+# expected:
+#   209: self.mem_split_n = self._resolve_mem_split(l1_memory_desc.align_bytes)
+#   249: def _resolve_mem_split(self, page_size: int) -> int:
 
-```
-LMCACHE_VERSION=0.5.4   (default; see scripts/common/20-build-vllm-lmcache.sh)
+# 0008 — in-process nixl_storage_backend.py also carries both names
+docker run --rm --entrypoint bash "$IMG" -lc \
+  "grep -n 'SPDK_NVMe_KV\|XNVME_KV' $LMCACHE/v1/storage_backend/nixl_storage_backend.py"
+# expected: hits at (at least) lines 126, 670, 1119
+
+# 0009 — provenance comments in gpu_connectors.py
+docker run --rm --entrypoint bash "$IMG" -lc \
+  "grep -n '# rocm-aic:' $LMCACHE/v1/gpu_connector/gpu_connectors.py"
+# expected: hits at (at least) lines 184, 233-234, 269-273
+
+# 0011 — num_external_tokens guard live in lmcache_mp_connector.py
+docker run --rm --entrypoint bash "$IMG" -lc \
+  "grep -n 'num_external_tokens' $LMCACHE/integration/vllm/lmcache_mp_connector.py"
+# expected: hits at (at least) lines 1103, 1117
 ```
 
-`apply-patches.sh` reads the version straight out of the **installed**
-package (`python -c "import lmcache; print(lmcache.__version__)"`) rather
-than assuming 0.5.4 — if you've bumped `LMCACHE_VERSION` and rebuilt the
-venv, this patch targets whatever actually got installed, and says so in
-its output and in the `applied-<version>.diff` filename.
+All five were re-checked this way against `rocm-aic:mp-pd-ionic2609` on
+2026-09-17 and matched the expected output above exactly.
 
-## Why this ships as a generator script, not a `.patch` file
+> **If a future image lacks `0006`:** the daemon rejects
+> `backend: XNVME_KV` (or `SPDK_NVMe_KV`) outright — `--l2-adapter` config
+> validation (`scripts/common/25-validate-lmcache-config.sh`) fails before
+> the daemon ever spawns, or, if that check is bypassed, the daemon dies
+> the first time it tries to construct the NIXL backend. Loud, not silent.
+>
+> **If a future image lacks `0007`:** `mem_split_n` does not exist at all.
+> Any page larger than the backend's declared `max_value_size` either
+> fails the transfer outright, or — if some other code path tolerates the
+> oversized descriptor — silently truncates or corrupts the stored value,
+> because nothing is splitting it into backend-sized sub-descriptors. This
+> is a **silent** failure mode: the store can return success while only
+> the last sub-part's bytes are actually retrievable. See
+> `scripts/verify/30-verify-kv-roundtrip.sh`'s header comment for the full
+> mechanism.
 
-A traditional unified-diff `.patch` file is fragile against ANY drift in
-the installed LMCache source — a single reflowed line, renamed variable, or
-patch-version bump (0.5.4 -> 0.5.5) and `patch`/`git apply` either fails
-outright (safe, but blocks bring-up) or, worse, applies to the wrong
-context silently. Given how undocumented and internal these two functions
-are (see `scripts/common/25-validate-lmcache-config.sh`'s own header
-comment on this), a context diff shipped once and never re-verified is
-exactly the kind of thing that looks correct and is quietly wrong.
+## Keep `_kv_roundtrip.py` and `0007` in agreement
 
-`apply-patches.sh` instead:
-- locates the **installed** LMCache tree in `${VENV}` at apply time,
-- scans it (via Python's `tokenize`/`ast`, not `sed`/regex-on-whole-file)
-  for the actual allowlist site(s) as they exist in what's installed RIGHT
-  NOW,
-- fails loudly if it finds none (the assumption above has gone stale — see
-  "What is ASSUMED" below),
-- and prints + saves a unified diff of exactly what it did, so a human
-  reviews the real, current transformation instead of trusting a diff
-  written against a source tree nobody here re-diffed.
+`0007`'s `#{j}` sub-key scheme (one storage key per split sub-part,
+suffixed `#0`, `#1`, ... — see `_expand_split_indices()` in the patch
+itself) is **hand-mirrored**, not imported, by
+`scripts/verify/_kv_roundtrip.py`'s multipart handling. If `0007` is ever
+rebased and the suffix scheme, split-count arithmetic (`ceil(page_size /
+max_value_size)`), or sub-part ordering changes, `_kv_roundtrip.py` must
+change with it or the roundtrip verify script will silently stop testing
+the property it exists to test — see
+`scripts/verify/30-verify-kv-roundtrip.sh`'s header comment.
 
-## How to apply
+## Numbering gap
+
+Patch numbers `0001`-`0005`, `0010`, `0012`, `0013` exist in the same
+upstream patch set this directory was extracted from but are **not**
+LMCache patches and are **not** carried here:
+
+- `0001`-`0004` are the SPDK NVMe-KV command-set patches — see
+  [`patches/spdk/README.md`](../spdk/README.md) (this repo's copy of them).
+- `0005`, `0010`, `0012`, `0013` are vLLM/Dockerfile patches from the same
+  build-repo patch series, out of scope for this directory. `0010` in
+  particular is `0011`'s sibling — the guard applied to vLLM's *own*
+  built-in `LMCacheMPConnector` copy, which this deployment does not use
+  (see `0011`'s own patch header for why both copies exist and why only
+  one of them is live here).
+
+Do not copy `0001`-`0005`/`0010`/`0012`/`0013` into this directory —
+they belong to different components.
+
+## Provenance (sha256)
 
 ```
-scripts/common/20-build-vllm-lmcache.sh          # installs LMCache into ${VENV} first
-patches/lmcache/apply-patches.sh                  # applies, backs up, prints diff
-scripts/common/25-validate-lmcache-config.sh <cfg-file>   # confirms it took
+14b8e693322422124de83f47c4aef70456fd5382c3f30889b10dbaca25a4c8bd  0006-lmcache-l2-adapter-kv-backends.patch
+d6ab8d0ad3efc6bff77e185c2e11bc586db2f9231936a472dacd1911de04db39  0007-lmcache-l2-adapter-value-size-split.patch
+bd8af542f1b795c644a1cd52a49da2df6a3fa1119ce3777cbdfc35a4b4712f8e  0008-lmcache-nixl-storage-backend-kv.patch
+a43253d3596fcc22e500ef28bbda401f78ff9d0b96f0abae2701c11dd70edec2  0009-lmcache-fused-kv-plane-count.patch
+7f0eac137c783108fe854be17c7ee19d2d2bc85ac838df4020ff68cf05afb8a1  0011-lmcache-guard-mp-connector-num-external-tokens.patch
 ```
 
-Flags:
-- `--dry-run` — show what WOULD change, write nothing, exit 0.
-- `--force` — required to re-run after a prior successful apply (reverts the
-  prior apply from its `.orig-kvstack` backups first, then re-applies
-  fresh — never stacks edits on top of edits).
-- `--revert` — restore every patched file from its `.orig-kvstack` backup
-  and stop (does not re-apply).
-
-## How to verify it took
-
-Three independent checks, cheapest first:
-
-1. `patches/lmcache/apply-patches.sh --dry-run` reports "already applied,
-   0 new edits" instead of finding fresh candidates.
-2. `scripts/common/25-validate-lmcache-config.sh <lmcache.yaml>` — its
-   "NIXL backend allowlist (installed LMCache source)" section must print
-   `ACCEPTED` for both `validate_nixl_backend()` and the OBJ mem_type
-   check, not `FAIL`.
-3. `scripts/verify/30-verify-kv-roundtrip.sh` and
-   `scripts/verify/40-verify-disagg.sh` — the only checks that prove data
-   actually crosses the network instead of merely proving the config is
-   internally consistent.
-
-## What is VERIFIED vs. what is ASSUMED
-
-This project has **no ability to fetch or diff the real upstream LMCache
-0.5.4 source tree from this environment** (no installed `lmcache` package,
-no network fetch of PyPI/GitHub performed as part of writing this patch).
-Being honest about that boundary is the entire point of this section.
-
-**VERIFIED** (grounded in files that already exist in this repo, written by
-a prior agent who — per this repo's own comments — DID have the installed
-source in front of them):
-- The module path: `lmcache.v1.storage_backend.nixl_storage_backend`
-  (imported successfully by `scripts/common/25-validate-lmcache-config.sh`
-  against a real install; that script degrades to a `WARN` rather than
-  crashing if the import fails, which is itself evidence the path was
-  confirmed to work at least once).
-- The two function names: `NixlStorageConfig.validate_nixl_backend` and
-  `NixlDynamicStorageAgent.__init__`. Both are `inspect.getsource()`'d by
-  `25-validate-lmcache-config.sh` today — meaning both exist and are
-  introspectable in whatever LMCache version was installed when that script
-  was written.
-- The failure message text `AssertionError: Invalid NIXL backend & device
-  combination`, quoted verbatim in this file and in
-  `patches/lmcache/_patch_engine.py`.
-  This specific wording implies the real assertion is checking a
-  **(backend, device) pair**, not a bare backend name — i.e. the allowlist
-  is plausibly a collection of 2-tuples (`("GDS", "cuda")`,
-  `("POSIX", "cpu")`, ...), not a flat set of strings. `apply-patches.sh`
-  handles BOTH shapes (flat string collection, and collection-of-tuples
-  keyed on the first element) for exactly this reason — see its
-  `_patch_file()` docstring.
-- `nixl_backend_params` (`trid`, `max_value_size`, `kv_slot_offset`) is read
-  structurally (not via individual `extra_config.get("nixl_backend_params")`
-  calls) per `25-validate-lmcache-config.sh`'s comment — i.e. LMCache passes
-  this dict through to `create_backend()` more or less verbatim. This is
-  why the multipart-split half of this fix targets consumption of
-  `max_value_size` inside the OBJ dynamic-storage code path rather than
-  `nixl_backend_params` itself.
-- The plugin-side contract this patch has to satisfy:
-  `plugins/nvme-kv/spdk_nvme_kv_backend.h` documents `getSupportedMems()`
-  returning `{DRAM_SEG, VRAM_SEG, FILE_SEG, OBJ_SEG}` and states plainly:
-  *"OBJ_SEG alongside FILE_SEG: LMCache's key-addressed storage pool
-  (NixlObjectPool) uses OBJ_SEG descriptors, handled identically to FILE_SEG
-  in registerMem()/prepXfer() below."* That is the exact behavior this
-  patch's mem-type-dispatch fix needs LMCache to produce for
-  `SPDK_NVMe_KV`/`XNVME_KV`: treat them exactly like `OBJ` is already
-  treated, nothing more exotic.
-
-**ASSUMED** (best-effort, and the reason `apply-patches.sh` refuses to
-succeed silently if these assumptions don't hold against what's actually
-installed):
-- The EXACT literal syntax of the two allowlists in the installed 0.5.4
-  source (flat tuple vs. set-of-tuples vs. something else entirely).
-  `apply-patches.sh`'s scanner is written to handle the shapes described
-  above but this has not been confirmed against real upstream source in
-  this environment.
-- That both allowlists live in files whose path contains the substring
-  `nixl` (case-insensitive). This matches the one confirmed module path
-  above; if a future LMCache version moves this logic to a differently
-  named file, `apply-patches.sh` will find zero candidates and refuse to
-  proceed (see its "FAIL LOUDLY on zero sites" behavior) rather than
-  silently doing nothing.
-- That extending the allowlist(s) alone is sufficient — i.e. that no OTHER
-  code path elsewhere in LMCache (a third hardcoded list, a schema
-  validator, a CLI arg choices=[...]) also gates on backend name. The
-  scanner searches the WHOLE nixl-path-matching subtree, not just the two
-  named functions, specifically to reduce this risk, but "the whole
-  installed tree, searched today" is still a weaker guarantee than a
-  diff against a known-good upstream tag.
-- The NIXL python API surface used by `scripts/verify/20-verify-nixl-plugin.sh`
-  and `scripts/verify/30-verify-kv-roundtrip.sh` (`nixl_agent`,
-  `nixl_agent_config`, `create_backend`, `register_memory`,
-  `get_reg_descs`/`get_xfer_descs`, `initialize_xfer`, `transfer`,
-  `check_xfer_state`, `release_xfer_handle`, and a `query_memory`-shaped
-  call for the `queryMem()` existence probe) is modeled on the public NIXL
-  project's conventions and on the two calls this repo's own
-  `25-validate-lmcache-config.sh` already uses successfully
-  (`get_plugin_list`, `get_plugin_params`) — extended by inference for the
-  calls that script doesn't happen to exercise. Those verify scripts print
-  the exact `AttributeError`/exception if a given call doesn't exist on the
-  installed NIXL build, rather than masking it, so a wrong guess fails
-  loudly and specifically instead of silently passing.
-
-If you have the ability to install the real `lmcache==0.5.4` wheel and
-diff it yourself, doing so and replacing this file's ASSUMED section with
-VERIFIED facts (and, ideally, a captured `applied-0.5.4.diff` committed
-alongside this README) is strictly better than trusting this document.
-That diff is exactly what running `patches/lmcache/apply-patches.sh` on a
-real node produces.
+Verify with `sha256sum patches/lmcache/*.patch` and diff against the list
+above before trusting a checkout that claims to carry these unmodified.

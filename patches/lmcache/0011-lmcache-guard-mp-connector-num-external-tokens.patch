@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kv-cache <noreply@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] lmcache: gate LMCacheMPConnector's load path on num_external_tokens
+
+The other half of patches/0010. Same one-line guard, applied to the copy that
+ACTUALLY RUNS.
+
+There are two near-identical LMCacheMPConnector implementations in this image
+and the naming misleads. KVConnectorFactory registers "LMCacheMPConnector"
+against vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector, so
+that looks like the live one -- but at the bottom of that module
+_resolve_lmcache_mp_connector() does:
+
+    if os.environ.get("LMCACHE_USE_UPSTREAM_MP"):  -> vLLM's builtin
+    try: from lmcache.integration.vllm.lmcache_mp_connector import ...
+                                                   -> THIS file  (default)
+    except ImportError:                            -> vLLM's builtin
+
+LMCache is installed, so the import succeeds and the DEFAULT path is this file.
+The vLLM module logs "Using external LMCacheMPConnector from
+lmcache.integration.vllm.lmcache_mp_connector" when it hands off. 0010 alone
+therefore fixes only the LMCACHE_USE_UPSTREAM_MP / ImportError fallback and is
+a no-op on a stock deployment -- it applies cleanly, the build succeeds, and the
+bug survives. Both patches are needed; neither is redundant.
+
+This was caught by running the mechanism check against an UNPATCHED image first
+and watching it fail in the wrong file. It would not have been caught by
+inspection, by a clean `git apply`, or by any needle count.
+
+The bug is identical to 0010's: update_state_after_alloc() never reads
+num_external_tokens, so a non-chosen MultiConnector sub-connector -- which since
+vLLM #46865 receives the request's real blocks with num_external_tokens=0 --
+decides purely on tracker.needs_retrieve() and wrongly moves
+PREFETCHING -> WAITING_FOR_LOAD, creating a retrieve task for a load that must
+not happen. The same `condition` then selects the lock-release range, so only
+num_vllm_hit_tokens is freed instead of num_lmcache_hit_tokens and the
+difference leaks; end_session() does not release lookup locks either.
+
+This copy accounts in TOKENS (num_lmcache_hit_tokens / num_vllm_hit_tokens)
+where the vLLM copy uses blocks * vllm_block_size, and is engine-group aware in
+the block-tracking above the hunk. The guard is the same either way, and the
+block tracking stays unconditional -- that is the store path.
+
+Verify by mechanism, never by needles: the unguarded build answers correctly
+while locks accumulate. See lab/verify_0010_guard.py, which drives the real
+tracker and asserts non-chosen -> READY with all locks freed, chosen ->
+WAITING_FOR_LOAD with only the vLLM prefix freed.
+
+Upstream: vLLM #47505, LMCache #4028 (still open; #47294 was closed as the wrong
+fix direction). Re-check both before dropping this.
+
+Carried out-of-tree. See README.md.
+---
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -1138,7 +1138,11 @@
+             tracker.append_block_ids(tuple(new_block_ids))
+ 
+         # Update the state of the tracker
+-        condition = tracker.needs_retrieve()
++        # Gate the LOAD path on num_external_tokens, not on `blocks`: since
++        # vLLM #46865 a non-chosen MultiConnector sub-connector receives the
++        # request's real blocks and must not load. 0 also frees ALL lookup
++        # locks below, which is what stops them leaking.
++        condition = num_external_tokens > 0 and tracker.needs_retrieve()
+         if tracker.state == LMCacheMPRequestState.PREFETCHING:
+             # If need to retrieve, change to WAITING_FOR_LOAD
+             # Otherwise, change to READY

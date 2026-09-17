@@ -64,8 +64,10 @@ check "proxy /health"   curl -fsS --max-time 5 "${PROXY_BASE}/health"  || true
 # ─────────────────────────────────────────────────────────────────────────────
 # Metric extraction helpers.
 #
-# ASSUMED metric names (see patches/lmcache/README.md's ASSUMED philosophy —
-# same honesty applies here): LMCache and vLLM's exact Prometheus metric
+# ASSUMED metric names (see patches/lmcache/README.md's re-verification
+# recipe for the same "verify against the real installed thing, don't
+# assume" discipline applied to the LMCache patches): LMCache and vLLM's
+# exact Prometheus metric
 # names have moved across versions in the past and are not something this
 # repo has a confirmed-installed copy to check against. Rather than
 # hardcode one name and hard-fail when it's wrong, try several plausible

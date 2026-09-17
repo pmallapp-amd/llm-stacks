@@ -24,10 +24,10 @@
 # KV_MAX_VALUE_SIZE_EFFECTIVE (config/cluster.env's XNVME_KV per-value
 # ceiling, 32768 B), and this script deliberately uses several multiples
 # of it (6x), not something merely-larger-by-one-byte. Reason (see
-# patches/lmcache/README.md's "multipart-split" section and
-# tmp/TOPOLOGY-KV-DATAPATH.md §4.5's "`mem_split_n` — and the `#{j}`
-# landmine"): LMCache's nixl_store L2 adapter splits any page bigger than
-# the backend's declared max_value_size into ceil(page_size/max_value_size)
+# patches/lmcache/README.md's per-patch table for 0007, the "`mem_split_n`
+# — and the `#{j}` landmine" patch): LMCache's nixl_store L2 adapter splits
+# any page bigger than the backend's declared max_value_size into
+# ceil(page_size/max_value_size)
 # sub-objects, each carrying a distinct `#{j}` suffix on its metaInfo key.
 # XNVME_KV keys OFF metaInfo and IGNORES addr/offset entirely — collapse or
 # lose that suffix (e.g. by only ever testing a payload <= max_value_size,

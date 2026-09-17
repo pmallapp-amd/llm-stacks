@@ -125,26 +125,36 @@ genuinely exists — check `KV_TRID` matches on both sides and that
 **Symptom:** `AssertionError: Invalid NIXL backend & device combination` the
 first time the NIXL storage backend is constructed.
 
-**Cause:** the LMCache backend-allowlist patch
-(`patches/lmcache/apply-patches.sh`) was not applied to the installed
-LMCache — stock LMCache's `validate_nixl_backend()` does not recognize
-`SPDK_NVMe_KV`/`XNVME_KV` at all (see `patches/lmcache/README.md`).
+**Cause:** stock LMCache's `validate_nixl_backend()` hardcodes an allowlist
+of NIXL backend names that does not include `SPDK_NVMe_KV`/`XNVME_KV`. **This
+is NOT a from-source-only failure mode that is "already resolved" on the
+vendor image regardless of patches** — a 2026-09-17 pass through this entry
+said exactly that, and it was wrong, corrected the same day. The vendor
+container image this lab actually runs (`rocm-aic:mp-pd-ionic2609`, LMCache
+0.5.3) carries both backends in all three of its hardcoded allowlist sites
+**because it was built with `patches/lmcache/0006`/`0008` applied** — on any
+image lacking those patches, this exact `AssertionError` returns. A
+from-source-install generator script used to apply the equivalent edit at
+deploy time; it was withdrawn 2026-09-17 because that from-source build
+path has never completed and is deprioritised (`docs/TODO.md` §6.2), and
+survives in git history if the from-source path is ever revived — but its
+withdrawal has nothing to do with whether the underlying allowlist widening
+is needed. It is needed, and it is applied — just at image-build time
+instead of by that generator.
 
-**Fix:**
+**Fix:** on the container path, there is nothing to apply — this symptom
+should not occur on `rocm-aic:mp-pd-ionic2609`. Confirm with:
 ```bash
 # [SMC1 or SMC2]
-patches/lmcache/apply-patches.sh --dry-run     # see what would change
-patches/lmcache/apply-patches.sh               # apply
 scripts/common/25-validate-lmcache-config.sh "${STACK_ROOT}/etc/lmcache-prefill.yaml"
 ```
 The validator's "NIXL backend allowlist (installed LMCache source)" section
 must show `ACCEPTED` for both `validate_nixl_backend()` and the OBJ
-mem_type check. If `apply-patches.sh` itself reports
-`FAIL: zero "GDS"/"POSIX"/"OBJ" allowlist-shaped brackets found`, the
-installed LMCache version has moved this logic to a different shape/location
-than this patch engine expects — see `patches/lmcache/README.md`'s "What is
-ASSUMED" section for exactly which parts of the patch are unverified against
-a real source tree.
+mem_type check. If it ever reports the backend **REJECTED** on some future
+image, that is the signal to run
+[`patches/lmcache/README.md`](../patches/lmcache/README.md)'s
+re-verification recipe against that image — the build most likely dropped
+`0006`/`0008` — rather than assuming a runtime patch step is missing.
 
 ---
 
@@ -162,12 +172,21 @@ in *this* list, LMCache silently takes the `FILE` mem_type path instead of
 `OBJ`: real `os.open()`/`os.path.join(extra_config.nixl_path, key)` calls
 against the **local filesystem** of whichever node ran the store. Nothing
 anywhere logs an error, because as far as LMCache is concerned this
-succeeded. See `patches/lmcache/README.md`'s "Silent, dangerous failure"
-paragraph.
+succeeded. As with the previous entry, **this is not simply
+"already-resolved, from-source-only"** — a 2026-09-17 pass through this
+entry said the vendor container "already routes both backends to `OBJ`
+mem_type natively"; corrected the same day. The vendor container's LMCache
+0.5.3 routes both backends to `OBJ` mem_type
+(`nixl_store_l2_adapter.py:1056-1067`) because `patches/lmcache/0006`
+(daemon path) and `0008` (in-process path) put them there at image-build
+time — on an image lacking those patches, this exact silent-local-write
+failure returns. See `docs/HANDOFF.md` §20 and
+[`patches/lmcache/README.md`](../patches/lmcache/README.md) for the
+correction, the per-patch table, and a re-verification recipe.
 
-**Fix:** same as the previous entry (apply/re-verify the patch). To
-**prove** traffic is or isn't actually crossing the network rather than
-trusting the config alone:
+**Fix:** on the container path, this should not occur — confirm via the
+previous entry's validator check. To **prove** traffic is or isn't actually
+crossing the network rather than trusting the config alone:
 ```bash
 # [SMC1 or SMC2] — is there an open TCP connection to the target at all?
 ss -tnp | grep ":4420"                      # NVMF_TRSVCID; should show an ESTABLISHED socket
