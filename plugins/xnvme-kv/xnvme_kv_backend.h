@@ -78,15 +78,24 @@ extern "C" {
 //     RESULT:MAX_VALUE_SIZE_MISMATCH:reported='32768' expected=4096.
 //
 // DO NOT "FIX" THIS BY LOWERING IT TO 4096. That was tried on 2026-09-17 and
-// reverted the same day. The advertised 4096 is NOT known to be the device's
-// true capability: the hardware owner states this DSC supports up to 65536
-// with 32768 as the reliable operating point, which is consistent with the
-// first measurement above and inconsistent with the advertised field. Nobody
-// has yet stored 32768 B against the CURRENT firmware and observed the
-// result — the cross-node roundtrips run on 2026-09-17 all used 4096 B parts,
-// so they proved 4096 WORKS, not that 32768 FAILS. Advertised-vs-actual is an
-// open measurement, not a settled fact; see query_max_value_size()'s
-// non-fatal handling and docs/TODO.md for the probe that settles it.
+// reverted the same day, then DISPROVEN BY MEASUREMENT later that day. The
+// advertised 4096 understates the real ceiling by 8x. Single-value stores
+// (num_parts=1) with NIXL_XNVME_KV_DEBUG=1, reading the device completion:
+//
+//     32768   ok=1 sct=0 sc=0     <- PASS, and reads back cross-node
+//     33792   ok=0 sct=7 sc=234
+//     34816   ok=0 sct=7 sc=234
+//     36864   ok=0 sct=7 sc=234
+//     40960   ok=0 sct=7 sc=234
+//     49152   ok=0 sct=7 sc=234
+//     65536   ok=0 sct=7 sc=234   <- 64k FAILS
+//    131072   ok=0 sct=7 sc=234   <- 128k FAILS
+//
+// 32768 + 1 KiB already fails, so 32768 is the EXACT ceiling, not a
+// conservative guess — and it reproduces the original finding above byte for
+// byte. sct=7 (vendor specific) sc=234 arrives as a COMPLETION after a
+// successful submit (rc=0, ~70-85 us), i.e. the device rejecting the size,
+// not a host-side or transport error.
 //
 // The default is therefore the RELIABLE MEASURED value, not the advertised
 // one. Note the two failure directions are not symmetric: under-claiming just

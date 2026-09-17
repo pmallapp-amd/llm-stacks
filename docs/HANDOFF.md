@@ -27,6 +27,19 @@ assumed, and what is still wrong.
 > recorded (§19.1) — see it before assuming a reboot has left the stack in
 > a known state.
 >
+> **Update, same day, 2026-09-17 (§21):** §18.3's applied fix is now
+> **retracted, with a measurement that settles it**: the device's
+> advertised `value_max=4096` understates its true ceiling by 8x — the
+> real boundary is EXACTLY 32768, confirmed byte-for-byte against 65536
+> failing (`sct=7 sc=234`), the same signature this repo established at
+> §10.4/TODO 6.4. `KV_MAX_VALUE_SIZE_XNVME` is back to 32768, not 4096 —
+> do not "fix" the resulting startup WARNING by lowering it or by setting
+> `NIXL_KV_STRICT_DEVICE_CEILING=1`. The retrieve-length `cdw0` MUST-MEASURE
+> §19's own validation work left open is answered (this DSC does report
+> it, §21.2), the plugin is rebuilt and green (6/6) on both nodes (§21.3),
+> and §19.1's DSC boot-time race now has a validated, repeatable recovery
+> rather than a one-off (§21.4).
+>
 > **Headline, session 4 (2026-09-16), superseded above but not wrong:** leg
 > A works — a direct P→D NIXL transfer, proven by decode doing **zero**
 > prefill at a 100% external cache hit rate (§11). Two silent defects had
@@ -3323,3 +3336,179 @@ re-run `patches/lmcache/README.md`'s verification recipe against that
 image — the patches may be missing from that build, not that this repo
 needs a runtime patch step. `patches/spdk/` is unaffected — it is
 unrelated, still live, target-side SPDK support.
+
+---
+
+## 21. The max_value_size ceiling is exactly 32768, `cdw0` confirms retrieve length, the plugin is rebuilt on both nodes, and the DSC boot-race recovery is validated (2026-09-17)
+
+Everything below was measured directly on `smc1`/`smc2`, later the same
+session as §19/§20, after both compute nodes were rebooted and the DSC
+brought back up. As with every other section in this document that
+overturns a same-day conclusion, the earlier conclusion is retracted
+explicitly below, not quietly edited away.
+
+### 21.1 The `max_value_size` ceiling is EXACTLY 32768. QUESTION CLOSED — and §18.3/TODO 6.24's "lower it to 4096" resolution is RETRACTED
+
+§18.3 recorded the device's KV Identify Namespace advertising
+`value_max=4096` (down from the previously-established 32768) and, on the
+strength of that field, applied a config-side fix: `creds/active.env` set
+`KV_MAX_VALUE_SIZE_XNVME=4096`, and both §18.3/§19.6 and TODO 6.24 called
+that "resolved, config side," leaving only the plugin's compiled-in 32768
+default and `20-verify-nixl-plugin.sh`'s mismatch as "still open."
+
+**That resolution is retracted in full, with a measurement that settles
+it byte for byte.** The device does not advertise its true ceiling — the
+KV Identify Namespace's `value_max=4096` UNDERSTATES the real ceiling by
+8x. Measured by storing a SINGLE value of each size (`num_parts=1`) with
+`NIXL_XNVME_KV_DEBUG=1` and reading the device completion directly:
+
+```
+   32768   ok=1 sct=0 sc=0      PASS - and read back cross-node (smc1 -> smc2)
+   33792   ok=0 sct=7 sc=234
+   34816   ok=0 sct=7 sc=234
+   36864   ok=0 sct=7 sc=234
+   40960   ok=0 sct=7 sc=234
+   49152   ok=0 sct=7 sc=234
+   65536   ok=0 sct=7 sc=234    64k FAILS
+  131072   ok=0 sct=7 sc=234    128k FAILS
+```
+
+32768 + 1 KiB already fails, so 32768 is the EXACT boundary, not a
+conservative safe point. This reproduces the repo's ORIGINAL empirical
+finding — 32768 clean, 65536 `sct=7 sc=234`, first recorded at TODO
+6.4/§10.4 — byte for byte.
+
+`sct=7` (vendor specific) `sc=234` arrives as a COMPLETION after a
+SUCCESSFUL submit (`rc=0`, ~70-85 us latency): the device is rejecting the
+size; it is not a host-side or transport error.
+
+**What this overturns, named explicitly:** §18.3's applied fix and TODO
+6.24's framing both concluded, from the advertised field alone, that the
+advertised 4096 was the real ceiling and `KV_MAX_VALUE_SIZE_XNVME` should
+be lowered to it. That rested on (a) the advertised field and (b) the
+cross-node roundtrips at §19.2/TODO 6.25, which happened to use 4096 B
+parts — i.e. it proved 4096 WORKS, never that 32768 FAILS. Nobody had
+stored 32768 against the CURRENT firmware and observed the result until
+this session. `KV_MAX_VALUE_SIZE_XNVME` is now **32768**.
+
+**Consequence to note, so it is not "fixed" by someone unfamiliar with
+this history:** because 32768 exceeds the advertised 4096, the plugin
+logs a loud WARNING at every backend init. That is EXPECTED and CORRECT.
+Do not silence it by lowering `KV_MAX_VALUE_SIZE_XNVME`, and do not set
+`NIXL_KV_STRICT_DEVICE_CEILING=1` — that flag turns the warning into
+`NIXL_ERR_BACKEND` at `create_backend()`, i.e. a refusal to start on
+exactly the configuration this session measured working.
+
+**Also note: this is NOT a destructive geometry change on the live
+path.** LMCache's `_resolve_mem_split()` returns 1 whenever
+`page_size <= max_value_size`, and the MP daemon's `nixl_store` unit
+tiles at `--l1-align-bytes` = 4096 B (§17.4/§17.5), so `mem_split_n == 1`
+under both 4096 and 32768 — the same reasoning §18.3/TODO 6.24 already
+established for the 32768→4096 transition holds unchanged for the
+reverse. Nothing has ever been split at either of these sizes on the path
+this repo runs.
+
+### 21.2 The DSC DOES report retrieve length in `cdw0`
+
+When the retrieve-length validation was added to `completion_trampoline()`
+(`plugins/xnvme-kv/xnvme_kv_backend.cpp`), whether this specific Pensando
+DSC populates completion DWORD 0 with the retrieved value's length on
+Retrieve at all was left as an open MUST-MEASURE — the guard was written
+defensively (treat `cdw0==0` as "not reported" and skip the check)
+precisely because the answer was unknown, and getting it wrong in the
+other direction would fail every retrieve on a device that simply doesn't
+report a length.
+
+**ANSWERED: the DSC populates `cdw0` on Retrieve with the value length.**
+Measured across a 6-part 196,608 B cross-node read, every part reporting:
+
+```
+op=retrieve len=32768 t=complete ok=1 sct=0 sc=0 cdw0=32768
+```
+
+So the new validation is LIVE on this hardware, not a no-op: the silent
+short-read corruption path it guards against — the device returns `M<N`
+bytes WITH a success status, the rest of the caller's buffer stays stale,
+and no error surfaces at any layer — is genuinely closed, on this DSC.
+The `cdw0==0` guard remains in the code regardless, for devices that do
+not report a length; `m_retr_len_checked`/`m_retr_len_unreported` in the
+metrics JSON (schema 2) are how a future image or a different device's
+behaviour on this axis shows up in the metrics rather than being silently
+assumed.
+
+### 21.3 Plugin rebuilt on both nodes; full ladder green
+
+- `scripts/common/container.sh plugin-build` run on `smc1` AND `smc2` —
+  identical artifact both nodes (md5
+  `12cc2b06c13ba0b479a40732d60f473b` before the final comment-only
+  rebuild that followed §21.1/§21.2's header/source updates), the
+  queryMem-override gate (`nm -D ... | grep nixlXnvmeKvEngine::queryMem`)
+  passed on both.
+- `scripts/verify/20-verify-nixl-plugin.sh`: **6/6 on BOTH nodes** —
+  `get_plugin_params(XNVME_KV) = {'max_value_size': '32768', ...}`. This
+  rung had been FAILING with
+  `RESULT:MAX_VALUE_SIZE_MISMATCH:reported='32768' expected=4096` since
+  §18.3/TODO 6.24; it now passes. The params call happens BEFORE
+  `create_backend()` in this script, which is what proves the
+  call-order-independence fix (`xnvme_kv_configured_max_value_size()` as
+  the single source both `getParams()` and `query_max_value_size()` now
+  read) actually works, not merely that it compiles.
+- Cross-node roundtrip at the new production geometry: 196,608 B / 6
+  parts of 32768, write `smc1` → read `smc2`, `RESULT:OK` both sides.
+- `scripts/verify/50-verify-pd-direct.sh`: **9/9**, external prefix cache
+  hit rate 0.0% → 100.0%, decode `Avg prompt throughput` 0.0 tokens/s.
+- `scripts/verify/40-verify-disagg.sh`: **9/9**.
+
+### 21.4 The DSC boot-race recovery is validated
+
+§19.1 recorded the DSC NVMe boot-time race — the kernel probes
+`0000:36:00.0` before the DPU-side application is ready, `CSTS=0x0`,
+"Device not ready", and nothing re-probes it — as a new finding, with a
+manual-recovery command shown to work once. **This session, both nodes
+came up with `/dev/ng1n1` absent** — the identical signature §19.1
+describes: the probe raced ahead of the DPU-side agent, the driver
+detached, and nothing re-probed. Once the DPU side was confirmed up, the
+documented one-liner
+
+```
+echo -n "0000:36:00.0" > /sys/bus/pci/drivers/nvme/bind
+```
+
+recovered **BOTH nodes, with no reboot**, succeeding with
+`nvme nvme1: 63/0/0 default/read/poll queues` and then
+`block device for nsid 1 not supported (csi 1)` — the latter EXPECTED,
+not an error, exactly as §19.1 already documents (`csi 1` has no
+block-device semantics, hence char-only `/dev/ng1n1`). `eui64
+e46cfefeffcdae01` identical on both nodes afterward, matching
+§18.2/§19.2.
+
+**Per the hardware owner, the boot race itself is not a defect** — it is
+expected on this hardware and needs a manual DPU-side agent start. §9.4
+and TODO 6.26 already describe the recovery step; this session is the
+first time it has been exercised as an actual recovery (not merely
+documented) on both nodes in the same session, and it worked both times
+with no reboot. Treat §9.4's step 2 as a **validated procedure**, not an
+untested suggestion — TODO 6.26 is updated accordingly, not left as an
+open bug report.
+
+### 21.5 What this session changes
+
+- **§21.1 RETRACTS §18.3's applied config fix and TODO 6.24's "resolved,
+  config side" framing.** `KV_MAX_VALUE_SIZE_XNVME` is 32768, not 4096 —
+  the device's advertised `value_max=4096` understates its true,
+  measured, exact ceiling by 8x. The startup WARNING on this
+  configuration is expected and must not be silenced by lowering the
+  value or by setting `NIXL_KV_STRICT_DEVICE_CEILING=1`.
+- **§21.2 answers the retrieve-length MUST-MEASURE**: this DSC does
+  populate `cdw0` on Retrieve with the value length — the short-read
+  corruption path the validation exists to close is genuinely closed on
+  this hardware, not merely defended against a hypothetical.
+- **§21.3 closes TODO 6.24's "still open, plugin side" half**: the
+  plugin is rebuilt on both nodes, `20-verify-nixl-plugin.sh` passes 6/6
+  on both, and the call-order-independence fix is proven working, not
+  just present in source. `50-verify-pd-direct.sh`/`40-verify-disagg.sh`
+  re-pass 9/9 against the rebuilt stack.
+- **§21.4 validates §19.1/TODO 6.26's DSC boot-race recovery** as a
+  working, repeatable procedure on both nodes — the boot race itself
+  remains expected hardware behaviour per the hardware owner, not an open
+  bug.

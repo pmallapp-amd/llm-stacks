@@ -20,7 +20,7 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 3 | 0 |
 | 4 | Open items and known limitations | 6 | 1 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 23 | 12 | 6 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 23 | 14 | 6 |
 
 **Read [HANDOFF §9](HANDOFF.md#9-how-to-resume) first** — it carries the
 cluster state as handed over and the ordered plan. This block is the index.
@@ -86,13 +86,13 @@ file and in HANDOFF.md predates. See HANDOFF §18.1. `config/cluster.env`'s
 tracked default is unchanged; this is a creds-level override for the
 current deployment.
 
-**The KV device geometry still hasn't been reconciled on the plugin side
-(6.24, unchanged), but the DSC wedge that used to be the top open
-operational issue is CLEARED, and the storage tier's remaining blocker is
-now isolated to one thing — see 6.24, 6.21 (updated 2026-09-17), 6.22
-(updated 2026-09-17), 6.25 (updated 2026-09-17).** `XNVME_KV`'s
-device-reported `value_max` is still 32768 → 4096
-(`20-verify-nixl-plugin.sh` still fails on the mismatch until a plugin
+**The KV device geometry's plugin-side gap (6.24) is addressed further
+below — read the paragraph after next before treating it as settled —
+and the storage tier's remaining blocker is isolated to one thing — see
+6.24, 6.21 (updated 2026-09-17), 6.22 (updated 2026-09-17), 6.25 (updated
+2026-09-17), 6.27 (new, 2026-09-17).** `XNVME_KV`'s device-reported
+`value_max` was still 32768 → 4096 as of earlier today
+(`20-verify-nixl-plugin.sh` failing on the mismatch until a plugin
 rebuild lands — 6.24). The DSC stall watchdog 6.22 first recorded and
 §18.5 found worsening (`completions_err`/`stalls` climbing within a
 session, a standalone verify script wedging on its first store) is now
@@ -107,6 +107,18 @@ the identical plugin/device/namespace supports cross-node store+retrieve
 in both directions (6.25), while the live engines' `store=36,864` /
 `retrieve=0` persisted unchanged alongside it. See HANDOFF §19.
 
+**RETRACTED, later the same day, 2026-09-17 — do not read the paragraph
+above (or 6.24 as it stood) as settled.** `XNVME_KV`'s device-reported
+`value_max=4096` does **not** mean 4096 is the real ceiling — measured by
+storing a single value at each size with `NIXL_XNVME_KV_DEBUG=1`: 32768
+passes (`ok=1 sct=0 sc=0`, reads back cross-node), 33792 through 131072
+all fail (`sct=7 sc=234`). **32768 is the EXACT ceiling.** The
+config-side fix this session applied earlier the same day
+(`KV_MAX_VALUE_SIZE_XNVME=4096`) is reverted; the value is **32768**
+again, and the plugin has been rebuilt on both nodes to match
+(`20-verify-nixl-plugin.sh` now passes 6/6 on both, closing 6.24 for
+real). See 6.24's own retraction block and HANDOFF §21.1/§21.3.
+
 **New this session, 2026-09-17 — a DSC boot-time race, not previously
 recorded: see 6.26.** At boot the kernel can probe the DSC NVMe
 controller before the DPU-side application is ready
@@ -114,7 +126,17 @@ controller before the DPU-side application is ready
 re-probes it — `/dev/ng1n1` then never appears until a manual rebind,
 which itself only succeeds once the DPU side is actually up. Added to the
 per-boot ritual: confirm `/dev/ng1n1` exists before starting anything.
-HANDOFF §19.1/§9.4.
+HANDOFF §19.1/§9.4. **Validated, later the same day: both nodes came up
+with `/dev/ng1n1` absent, and the documented rebind recovered both, no
+reboot required — 6.26 is closed as a validated per-boot procedure, not
+an open bug.** See HANDOFF §21.4.
+
+**Also new this session, 2026-09-17 — 6.27: the retrieve-length `cdw0`
+MUST-MEASURE the validation in `completion_trampoline()` shipped with is
+answered.** This DSC DOES populate `cdw0` on Retrieve with the value
+length (measured across a 6-part 196,608 B cross-node read, every part
+reporting `cdw0=32768`), so the silent short-read guard is live on this
+hardware, not a no-op. See HANDOFF §21.2.
 
 **The P→D verify ladder had four false-negative defects, now fixed and
 re-passing 9/9 against the new model — see the note appended to 1.7.**
@@ -1594,7 +1616,7 @@ otherwise.*
       path needs no vfio-pci, no hugepages and no DPDK/SPDK version
       pairing. Note a backend switch still requires draining the
       namespace — see 4.2 and the `KV_MAX_VALUE_SIZE_*` comments.
-- [ ] **6.26** **NEW, 2026-09-17 — the DSC NVMe controller has a boot-time
+- [x] **6.26** **NEW, 2026-09-17 — the DSC NVMe controller has a boot-time
       race; nothing re-probes it if the kernel wins the race.** At boot
       the kernel probes the DSC NVMe controller (`0000:36:00.0`,
       `[1dd8:1005]`) roughly 3 s after PCIe enumeration — before the
@@ -1627,6 +1649,19 @@ otherwise.*
       that gate will not, and will instead report a confusing device-open
       failure that looks unrelated to boot order. Full account: HANDOFF
       §19.1.
+
+      **VALIDATED, later the same day, 2026-09-17 — closing this item as a
+      confirmed procedure, not just a documented one.** Both nodes were
+      rebooted, both came up with `/dev/ng1n1` absent — the identical
+      signature above — and once the DPU side was confirmed up, the exact
+      rebind command recovered BOTH nodes with no reboot required:
+      `nvme nvme1: 63/0/0 default/read/poll queues` then the expected
+      `block device for nsid 1 not supported (csi 1)`, `eui64
+      e46cfefeffcdae01` identical on both afterward. **Per the hardware
+      owner, the boot race itself is not a defect** — it needs a manual
+      DPU-side agent start and is expected on this hardware; treat this as
+      a validated per-boot step, not an open bug. Full account: HANDOFF
+      §21.4.
 
 ### 6.21 The image's XNVME_KV plugin predates `queryMem()` — REBUILT, but it does not unlock cross-instance reuse
 
@@ -1892,7 +1927,27 @@ this repo's MP daemon runs. The live storage-tier config surface is, and
 remains, `scripts/common/start-lmcache-daemon.sh`'s `--l2-adapter <JSON>`
 flag — unmodified by this change.
 
-### 6.24 XNVME_KV's device `value_max` moved 32768 → 4096 — resolved on the config side, still open on the plugin side
+### 6.24 XNVME_KV's device `value_max` moved 32768 → 4096 — ~~resolved on the config side, still open on the plugin side~~ CLOSED 2026-09-17: the ceiling is 32768, not 4096, and the plugin is rebuilt to match
+
+> **RETRACTED, later the same day, 2026-09-17 — read this before the body
+> below.** This section's own "Resolved, config/comment side" bullet list
+> set `KV_MAX_VALUE_SIZE_XNVME=4096` on the strength of the device's
+> *advertised* `value_max=4096` alone. That was wrong: storing a single
+> value at each size with `NIXL_XNVME_KV_DEBUG=1` shows 32768 passes
+> (`ok=1 sct=0 sc=0`, reads back cross-node) and every size from 33792
+> through 131072 fails (`sct=7 sc=234`) — the advertised field
+> UNDERSTATES the real, exact ceiling by 8x. Nobody had tried a 32768
+> store against the current firmware before concluding 4096 was the
+> limit; the earlier bullets below proved 4096 *works*, never that 32768
+> *fails*. `KV_MAX_VALUE_SIZE_XNVME` is reverted to **32768**, the
+> plugin's compiled-in default (which was never wrong) needed no change,
+> and `container.sh plugin-build` has now been re-run on both nodes so
+> `20-verify-nixl-plugin.sh` passes 6/6 rather than merely being
+> internally consistent with a wrong config value. See the closing update
+> at the end of this item and HANDOFF §21.1/§21.3 for the full account.
+> The body below is left in place, not deleted, because the measurement
+> history and the call-order bug it documents are still correct — only
+> the "4096 is the ceiling" conclusion was wrong.
 
 **Measured 2026-09-16/17.** The plugin now logs, at backend init:
 
@@ -1954,6 +2009,44 @@ compiled-in `xnvme_kv_backend.h:71` constant is untouched. This did
 harness does its own splitting at `KV_MAX_VALUE_SIZE_EFFECTIVE=4096`
 regardless of what the plugin reports — the two facts are independent.
 Do not read 6.25's success as having resolved this item; it has not.
+
+**CLOSED, later the same day, 2026-09-17 — both halves, for real this
+time.** Single-value stores at `num_parts=1` with
+`NIXL_XNVME_KV_DEBUG=1` settle the question the "STILL OPEN" and
+"RE-CONFIRMED" paragraphs above left hanging: 32768 passes cleanly
+(`ok=1 sct=0 sc=0`, and reads back cross-node `smc1` → `smc2`), and
+33792/34816/36864/40960/49152/65536/131072 all fail identically
+(`ok=0 sct=7 sc=234`). 32768 is the EXACT boundary — 32768+1 KiB already
+fails. This reproduces 6.4's original finding byte for byte and RETRACTS
+this item's own "resolved, config side" bullet above: `4096` was never
+the real ceiling, only the advertised one, and the advertised field
+understates the true ceiling by 8x.
+
+`KV_MAX_VALUE_SIZE_XNVME` is back to **32768**. `scripts/common/container.sh
+plugin-build` was run on both `smc1` and `smc2` — identical artifact both
+nodes (md5 `12cc2b06c13ba0b479a40732d60f473b` before a final comment-only
+rebuild), queryMem-override gate passed — and
+`scripts/verify/20-verify-nixl-plugin.sh` now passes **6/6 on BOTH
+nodes**, `get_plugin_params(XNVME_KV) = {'max_value_size': '32768', ...}`,
+proving the call-order-independence fix (`getParams()`-before-
+`create_backend()`, which this script itself exercises) actually works.
+This item's own "Recommended durable fix" section above — an explicit
+`NIXL_KV_MAX_VALUE_SIZE` override plus promoting the mismatch to a hard
+failure — is unaffected by this closure and remains a good idea for a
+future device whose advertised value is trustworthy; it is not required
+to close this item, because there is no longer a mismatch to promote.
+
+**Consequence to record, not to "fix":** because 32768 exceeds the
+advertised 4096, the plugin logs a WARNING at every backend init on this
+configuration. That is expected and correct — do not lower
+`KV_MAX_VALUE_SIZE_XNVME` to silence it, and do not set
+`NIXL_KV_STRICT_DEVICE_CEILING=1`, which would turn the warning into a
+startup refusal on exactly the configuration just proven working. Also
+not destructive: LMCache's `_resolve_mem_split()` returns 1 whenever
+`page_size <= max_value_size`, and `page_size` is `--l1-align-bytes` =
+4096, so `mem_split_n == 1` under both 4096 and 32768 — no object has
+ever been split by this transition in either direction. Full account:
+HANDOFF §21.1/§21.3.
 
 ### 6.25 The KV namespace is confirmed SHARED across P and D, and cross-node store+retrieve is now PROVEN, in both directions — the topology blocker this project has carried since HANDOFF §1 is GONE
 
@@ -2031,3 +2124,41 @@ not merely inferred from matching `eui64`s. It also directly sharpens
 layer, the live vLLM engines' `store=36,864`/`retrieve=0` (see 6.21's
 2026-09-17 update) can no longer be attributed to anything but LMCache's
 own key-derivation scheme. Full account: HANDOFF §19.2/§19.4.
+
+**RE-VERIFIED at the production geometry, later the same day, 2026-09-17,
+after 6.24's `max_value_size=4096` config value was retracted back to
+32768.** The roundtrip above used `max_value_size=4096` because that was
+the config in force at the time — re-run at `max_value_size=32768`
+(6.24's closure): 196,608 B / 6 parts of 32768, write `smc1` → read
+`smc2`, `RESULT:OK` both sides. Both geometries work; this is not a
+correction of the result above, only a re-confirmation that the topology
+proof holds at the value this repo now actually ships. Full account:
+HANDOFF §21.3.
+
+### 6.27 The DSC DOES report retrieve length in `cdw0` — the MUST-MEASURE the length-validation guard shipped with is ANSWERED
+
+When the retrieve-length validation was added to `completion_trampoline()`
+(`plugins/xnvme-kv/xnvme_kv_backend.cpp`), whether this specific Pensando
+DSC populates completion DWORD 0 with the retrieved value's length on
+Retrieve at all was left an open MUST-MEASURE — the guard treats `cdw0==0`
+as "not reported" and skips the check, deliberately, because getting this
+wrong in the other direction (assuming a length is always reported) would
+fail every retrieve on a device that simply doesn't report one.
+
+**ANSWERED, 2026-09-17: yes, this DSC populates `cdw0` on Retrieve with
+the value length.** Measured across a 6-part 196,608 B cross-node read,
+every part reporting:
+
+```
+op=retrieve len=32768 t=complete ok=1 sct=0 sc=0 cdw0=32768
+```
+
+So the validation is LIVE on this hardware, not a no-op — the silent
+short-read corruption path it exists to close (device returns `M<N` bytes
+with a SUCCESS status, the rest of the caller's buffer stays stale, and
+nothing at any layer reports an error) is genuinely closed here. The
+`cdw0==0` guard stays in the code regardless, for devices that do not
+report a length; the metrics JSON's (schema 2) `retrieve_len_checked` /
+`retrieve_len_unreported` fields are how a future image or a different
+device's behaviour on this axis is discovered from a live run rather than
+assumed. Full account: HANDOFF §21.2.

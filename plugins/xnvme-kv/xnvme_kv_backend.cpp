@@ -194,17 +194,24 @@ void nixlXnvmeKvEngine::completion_trampoline(struct xnvme_cmd_ctx *ctx, void *c
     // real status error — if the device already reported failure, that
     // failure is unambiguous without this check.
     if (ok && work->op != NIXL_WRITE) {
-        // CRITICAL SAFETY GUARD. It is NOT yet confirmed that this specific
-        // Pensando DSC populates cdw0 on Retrieve at all (see
-        // QueueWorker::m_retr_len_checked/m_retr_len_unreported in the
-        // header, added specifically to answer this from a live run). If it
-        // does not, cdw0 is always 0, and a naive `cdw0 != work->buf_len`
-        // check would then fail EVERY retrieve on this device — turning an
-        // intended data-integrity fix into a total outage, which is a far
-        // worse failure than the silent-corruption bug it targets. Treating
-        // cdw0==0 as "not reported" and skipping the check makes this a
-        // no-op on a device that doesn't report a length, and a real check
-        // on one that does.
+        // CRITICAL SAFETY GUARD, and it is load-bearing on OTHER devices
+        // even though it does not trip on this one.
+        //
+        // CONFIRMED 2026-09-17 on the Pensando DSC: it DOES populate cdw0 on
+        // Retrieve with the value length. Measured with NIXL_XNVME_KV_DEBUG=1
+        // across a 6-part 196608 B read, every part reporting
+        //     op=retrieve len=32768 t=complete ok=1 sct=0 sc=0 cdw0=32768
+        // so on this hardware the check below is LIVE, not a no-op, and the
+        // silent short-read path it targets is genuinely closed.
+        //
+        // The guard stays anyway: a device that does NOT report a length
+        // returns cdw0=0, and a naive `cdw0 != work->buf_len` would then
+        // fail EVERY retrieve on it — turning a data-integrity fix into a
+        // total outage, a far worse failure than the silent corruption it
+        // targets. m_retr_len_checked / m_retr_len_unreported (see the
+        // header) report which side of this any given device landed on, so
+        // a future image or firmware that stops reporting is visible in the
+        // metrics JSON rather than silently disabling the check.
         if (ctx->cpl.cdw0 == 0) {
             work->qw->m_retr_len_unreported.fetch_add(1, std::memory_order_relaxed);
         } else {
