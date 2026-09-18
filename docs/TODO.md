@@ -20,9 +20,9 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 3 | 0 |
 | 4 | Open items and known limitations | 6 | 1 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 38 | 27 | 6 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 39 | 28 | 6 |
 
-Counts are per **ID**, so §6's include its `###` subsections (6.23–6.38), not
+Counts are per **ID**, so §6's include its `###` subsections (6.23–6.39), not
 just its checkbox bullets — a subsection counts as Done when its heading says
 so (`✅`, CLOSED, ANSWERED, PROVEN). §6's row had drifted, reading 28/18: that
 was correct through 6.28 and was never updated as 6.29–6.33 were appended.
@@ -1424,3 +1424,69 @@ risk.
 survive `container.sh down/up` — `/usr/local` is not bind-mounted, only
 `REPO_ROOT`, `STACK_ROOT` and `HF_HOME` are. Re-run
 `01-install-benchy.sh` after any container recreation.
+
+### 6.39 ✅ RETRACTION — the "1 GiB namespace" limit is NOT a byte limit, and does not come from smc3
+
+**The 1 GiB figure repeated in 6.18, 6.29 and 6.36 is wrong as a capacity
+bound.** It was derived by reading NVM-command-set LBA fields on a
+namespace that has no LBAs, and it is retracted here rather than quietly
+edited, because it drove a real (bad) operational recommendation: 6.36
+told the next operator to treat capacity as exhausted.
+
+**Where the number came from.** `nvme id-ns /dev/ng1n1` reports
+`nsze = ncap = 0x200000` (2,097,152) with `lbaf 0: lbads:9` (512 B), and
+2,097,152 x 512 = exactly 1 GiB. That arithmetic is an **NVM command set**
+reading. This namespace is `csi 0x1` — the KV command set — and has no
+block device and no LBAs; `/dev/nvme1n1` does not exist beside
+`/dev/ng1n1` precisely because of that.
+
+**What the KV command set actually reports.** Identify Namespace with
+`CNS=0x00, CSI=0x01` (the structure the plugin already queries at
+`xnvme_kv_backend.cpp:933`) returns the *same* `NSZE = NCAP = 2,097,152`,
+and `NUSE = 0`. For a KV namespace that value is a count of **KV pairs**,
+not bytes — which is why it is identical in both structures and why it is
+suspiciously round.
+
+**Disproven empirically, not argued.** In one session, through this single
+namespace:
+
+| write | ops | bytes | completions_err | submit_fail | stalls |
+|---|---|---|---|---|---|
+| live serving eviction | 248,859 | 972.1 MiB | 0 | 0 | 0 |
+| capacity probe (6.39) | 49,344 | 192.8 MiB | 0 | 0 | 0 |
+| **total** | **298,203** | **~1.16 GiB** | **0** | **0** | **0** |
+
+**~1.16 GiB sailed past the supposed 1 GiB ceiling with zero errors.** If
+`nsze` bounded bytes, the probe could not have completed a single round.
+
+**The corrected picture.** Reading `nsze` as KV pairs gives 2,097,152 keys.
+At the 4096 B page this stack actually uses that is ~8 GiB; at the measured
+32768 B value ceiling it is ~64 GiB. We have consumed roughly 298k of
+~2.1M key slots — about **14%**, not 95%.
+
+**Three things this does NOT change:**
+
+1. **There is still no delete primitive and no usage telemetry.** `NUSE`
+   reads 0 in both Identify structures, and `nuse` does not track KV writes
+   (HANDOFF §5). Space is still never reclaimed, and we still cannot
+   measure consumption — we can only count our own `store_ops`. Sizing runs
+   (BRINGUP §3.6) remains correct practice; the *reason* is key-slot
+   exhaustion and unreclaimable space, not a 1 GiB byte budget.
+2. **It has nothing to do with smc3.** `bdev_kvmalloc` is an in-memory
+   red-black tree with no total-size RPC parameter at all — `cluster.env`
+   has said so since `KV_BDEV_SIZE_GB` was deleted. Combined with 6.36
+   (smc3 has served zero I/O, its listener is unreachable), the target's
+   capacity is irrelevant to this stack in both directions: it is neither
+   the source of the limit nor a place freeing space would help.
+3. **The real ceiling is still unmeasured.** 1.16 GiB is a lower bound
+   established by the largest write we have done, not a limit. Whether the
+   DPU enforces `nsze` as a key count, or is bounded by DPU memory, or
+   enforces nothing at all, is **untested**. Do not replace one
+   unmeasured-number-stated-as-fact with another.
+
+**Lesson worth keeping:** the failure mode here was applying block-device
+arithmetic to a device that deliberately has no block semantics — on a
+namespace whose whole point is that `csi 0x1` has no LBAs. The same
+instinct that made `block device for nsid 1 not supported (csi 1)` an
+*expected* log line should have made `nsze x 512` an obviously invalid
+computation.
