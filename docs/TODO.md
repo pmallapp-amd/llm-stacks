@@ -20,9 +20,9 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 3 | 0 |
 | 4 | Open items and known limitations | 6 | 1 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 40 | 28 | 7 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 39 | 28 | 6 |
 
-Counts are per **ID**, so §6's include its `###` subsections (6.23–6.40), not
+Counts are per **ID**, so §6's include its `###` subsections (6.23–6.39), not
 just its checkbox bullets — a subsection counts as Done when its heading says
 so (`✅`, CLOSED, ANSWERED, PROVEN). §6's row had drifted, reading 28/18: that
 was correct through 6.28 and was never updated as 6.29–6.33 were appended.
@@ -1490,86 +1490,3 @@ namespace whose whole point is that `csi 0x1` has no LBAs. The same
 instinct that made `block device for nsid 1 not supported (csi 1)` an
 *expected* log line should have made `nsze x 512` an obviously invalid
 computation.
-
-### 6.40 KV Delete/List: the API EXISTS and we never used it — device support is UNRESOLVED, and probing for it wedged the DSC
-
-**The design point is right and this repo has been sloppy about it.** 6.29
-and the adapter's `delete()` both say "no device delete primitive". That is
-a statement about **our plugin**, not about the device or the stack
-beneath it, and it has been repeated as though it were a hardware fact.
-
-**What actually exists.** `libxnvme` exports the full KV command set:
-
-```
-$ nm -D /usr/local/lib/x86_64-linux-gnu/libxnvme.so.0 | grep kvs
-  T xnvme_kvs_delete      <-- never called by us
-  T xnvme_kvs_exist
-  T xnvme_kvs_list        <-- never called by us
-  T xnvme_kvs_retrieve
-  T xnvme_kvs_store
-```
-
-`plugins/xnvme-kv/xnvme_kv_backend.cpp` implements store, retrieve and
-exist (via `queryMem`) and **nothing else** — every `delete` token in that
-file is the C++ operator. So teardown has no way to reclaim anything, by
-construction, and `NixlKvL2Adapter.delete()` correctly degrades to
-dropping an index entry and warning that device space is monotonic.
-
-**The proposed shape (both halves are viable and they are complementary):**
-
-1. **Delete down the same path.** The adapter knows every name it wrote —
-   `{ns}@{key}~{ordinal}` for `page_count` pages plus `{ns}@{key}!c`. A
-   teardown can reconstruct them from the index and issue `xnvme_kvs_delete`
-   per name. Needs a NIXL verb to carry it, the same way `queryMem` carries
-   Exist. Reclaims only what this daemon knows about.
-2. **Ask the device to list keys.** `xnvme_kvs_list` walks the namespace
-   independently of any index, which is the only thing that can reclaim
-   **orphans** — objects from crashed runs, pre-fix corrupt objects, and
-   old per-run nonces. Filtering by the `{ns}@` prefix makes it safe on a
-   shared namespace. This is the one that actually fixes the standing
-   problem, because our orphans outnumber our live objects.
-
-**Device support is NOT established, and the probe that tried to establish
-it is invalid.** A C probe (`xnvme_kvs_store/exist/delete/list` over the
-plugin's own async `io_uring_cmd` queue) returned `sct=7 sc=237` for
-**every** command — including `STORE`, which demonstrably works when the
-device is healthy. A store/lookup/load control run immediately afterward
-also failed (`max_value_size query failed err=-19 sct=0 sc=19`). The probe
-was therefore measuring a broken device, not Delete support. **Do not cite
-it as evidence either way.**
-
-**The DSC went down during this work, and the writes are the likely
-cause.** Sequence: ~1.16 GiB written through the namespace in one session
-(972 MiB serving eviction + a deliberate 192 MiB capacity probe, 6.39),
-then the raw KV probe, then `/dev/ng1n1` and `nvme1` disappeared on
-**smc1** and the card re-enumerated as `nvme2` with the documented
-`Device not ready; aborting initialisation, CSTS=0x0`. Config space still
-reads `10051dd8` and the other DSC PCI functions bind fine, so the card is
-alive — this is 6.26's signature, plausibly triggered by 6.22's
-wedge-under-sustained-load. **smc2 was unaffected** (`/dev/ng1n1` present,
-`nvme1` state `live`), which is itself informative: the failure is
-per-DSC, not in the shared medium.
-
-Recovery is the documented rebind
-(`echo -n "0000:36:00.0" > /sys/bus/pci/drivers/nvme/bind`), which needs
-retries over minutes (6.26). **smc1 was left mid-recovery.**
-
-**Next steps, in order:**
-
-1. Recover smc1's DSC and confirm `/dev/ng1n1` returns.
-2. Re-run the Delete/List probe **on a healthy device**, with a
-   store/exist control in the same run so a wedged device cannot be
-   mistaken for an unsupported opcode. The probe is
-   `/tmp/kvprobe2.c` in shape; it should move into `scripts/verify/` with
-   the control built in before being trusted.
-3. Only if Delete is supported: add it to the plugin, expose it through
-   NIXL, and implement teardown. If List is also supported, prefer the
-   list-and-filter form — it is the only one that reclaims orphans.
-4. If Delete is NOT supported, say so as a measured device fact (which
-   6.29 never actually established) and stop implying a plugin limitation
-   is a hardware one.
-
-**Standing caution this reinforces:** sustained write load against this
-DSC is not free. Two independent sessions have now ended with the
-controller needing a rebind. Budget for that before any large write test,
-and prefer smc2 for probing while smc1 is recovering.
