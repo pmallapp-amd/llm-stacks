@@ -20,9 +20,9 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 3 | 0 |
 | 4 | Open items and known limitations | 6 | 1 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 39 | 28 | 6 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 40 | 29 | 6 |
 
-Counts are per **ID**, so §6's include its `###` subsections (6.23–6.39), not
+Counts are per **ID**, so §6's include its `###` subsections (6.23–6.40), not
 just its checkbox bullets — a subsection counts as Done when its heading says
 so (`✅`, CLOSED, ANSWERED, PROVEN). §6's row had drifted, reading 28/18: that
 was correct through 6.28 and was never updated as 6.29–6.33 were appended.
@@ -1490,3 +1490,80 @@ namespace whose whole point is that `csi 0x1` has no LBAs. The same
 instinct that made `block device for nsid 1 not supported (csi 1)` an
 *expected* log line should have made `nsze x 512` an obviously invalid
 computation.
+
+### 6.40 smc3 IS effectively infinite — it advertises 16 EiB, and its real bound is RAM. Neither is our limit, because nothing of ours reaches it
+
+**Investigated 2026-09-18 at the principal's prompting: "the target is
+supposed to be infinite storage, but should at least exhaust RAM".** Both
+halves of that are correct, and measuring them closes the capacity
+question.
+
+**smc3's bdev declares an unbounded namespace.** `bdev_get_bdevs`:
+
+```
+name=dev1_ns1  product="KVMalloc disk"  block_size=1
+num_blocks=18446744073709551615        # UINT64_MAX -> 16 EiB
+```
+
+`block_size=1` with `num_blocks=UINT64_MAX` is `bdev_kvmalloc` saying "I
+have no byte budget" — consistent with `cluster.env`'s standing note that
+it is an in-memory red-black tree sized only by per-key/per-value
+ceilings, and that `KV_BDEV_SIZE_GB` was deleted because it mapped to
+nothing. **Theoretically infinite, confirmed from the device's own
+report.**
+
+**Its real bound is smc3's RAM, exactly as predicted.** The tree is
+RAM-backed, so capacity is whatever the host can hold: `free -g` shows
+**62 GiB total, ~32 GiB available**. A KV workload actually landing here
+would grow `nvmf_tgt`'s RSS roughly 1:1 and then exhaust memory somewhere
+north of 30 GiB — not at any number the namespace advertises. That is the
+honest ceiling, and it is ~30x larger than the 1 GiB this repo wrongly
+recorded and retracted in 6.39.
+
+**But none of our data goes there — now confirmed three independent ways.**
+After ~1.16 GiB of KV written through `/dev/ng1n1` in one session:
+
+| Evidence | Reading | Expected if smc3 were storing ours |
+|---|---|---|
+| `bdev_get_iostat` on `dev1_ns1` | `reads=0 writes=0 bytes_written=0` | ~298k writes, ~1.16 GiB |
+| `nvmf_tgt` hugepages | 7,986 of 8,192 **free** (~412 MiB in use) | hundreds more 2 MiB pages consumed |
+| `nvmf_tgt` RSS | 6.56 GiB, flat, over 1d16h uptime | +1.16 GiB against baseline |
+
+Three different mechanisms, one answer. Combined with 6.36 (listener
+TCP-unreachable from compute; `/dev/ng1n1` is `transport=pcie` on a
+Pensando subsystem), the conclusion is not reasonably in doubt.
+
+**A fourth, sharper discriminator fell out of this.** The two stores
+disagree about their own size by twelve orders of magnitude:
+
+| Store | Advertised capacity |
+|---|---|
+| smc3 `dev1_ns1` (KVMalloc) | `num_blocks = 2^64-1` — unbounded |
+| DSC `/dev/ng1n1` (KV Identify) | `NSZE = NCAP = 2,097,152` |
+
+If `/dev/ng1n1` were a re-export of smc3's namespace these would match.
+They do not, which settles the re-export question without reference to any
+I/O counter.
+
+**So where is the real limit?** The Pensando DSC/DPU's own store, and it
+remains **unmeasured**. We know a lower bound of ~1.16 GiB (written, zero
+errors) and that KV Identify reports 2,097,152 — most plausibly KV pairs,
+which at the 4096 B page is ~8 GiB (6.39). Nothing has established the
+enforced ceiling, and this session's attempt to push further contributed
+to taking both DSCs down.
+
+**Operational status at time of writing: both DSCs are DOWN.** `/dev/ng1n1`
+is absent on smc1 *and* smc2; the hosts are up (7h uptime, no reboot) and
+config space reads `10051dd8`, so the cards are alive. Host-side rebind was
+attempted on both and failed identically at ~128 s with
+`Device not ready; aborting initialisation, CSTS=0x0` — the DPU-side
+application is not serving. Per 6.22 only a DPU-side restart clears this
+and **host-side resets make it worse**, so repeated rebinding was stopped
+rather than continued. This needs the hardware owner.
+
+**Practical upshot for sizing a run:** stop treating the namespace as a
+1 GiB budget. The constraints that actually bite are (a) no delete
+primitive, so consumption is monotonic, (b) no usage telemetry — `NUSE`
+reads 0 in both Identify structures and `nuse` does not track KV writes,
+so you can only count your own `store_ops`, and (c) sustained write load
+destabilises the DSC, which is now the second session to end that way.
