@@ -20,9 +20,9 @@ Status: `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked on som
 | 3 | Acceptance (Phase 2, RDMA compute leg) | 10 | 3 | 0 |
 | 4 | Open items and known limitations | 6 | 1 | 0 |
 | 5 | Done | 14 | 14 | — |
-| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 35 | 25 | 5 |
+| 6 | Storage-tier integration (XNVME_KV / SPDK_NVMe_KV as an LMCache tier) | 38 | 27 | 6 |
 
-Counts are per **ID**, so §6's include its `###` subsections (6.23–6.35), not
+Counts are per **ID**, so §6's include its `###` subsections (6.23–6.38), not
 just its checkbox bullets — a subsection counts as Done when its heading says
 so (`✅`, CLOSED, ANSWERED, PROVEN). §6's row had drifted, reading 28/18: that
 was correct through 6.28 and was never updated as 6.29–6.33 were appended.
@@ -1316,3 +1316,111 @@ confound (vLLM's own prefix cache sitting upstream of every connector)
 does not exist here at all — this never goes through vLLM. 1.13 and 6.15
 remain the right tools for the *engine-level* question; they are not the
 right tool for KV-block accounting.
+
+### 6.36 🔴 The KV data does NOT reach smc3 — `/dev/ng1n1` is a LOCAL Pensando PCIe function, and 6.18's open question is answered
+
+**Measured 2026-09-18, end to end, with the full stack live.** This
+answers 6.18's standing question ("where does our KV data physically
+live, given our NQN is absent from smc3's target?") and **contradicts**
+the re-export model HANDOFF §2 has been carrying.
+
+**Evidence, four independent strands:**
+
+1. **smc3's target has never served a single I/O.** `bdev_get_iostat` on
+   `dev1_ns1`: `read=0 bytes_read=0 write=0 bytes_written=0`, across an
+   `nvmf_tgt` uptime of 1d05h — while we wrote 972 MiB through
+   `/dev/ng1n1` minutes earlier.
+2. **Its listener is unreachable from compute.** `1.1.0.2:4420` routes via
+   the management gateway and the TCP connect fails. 6.19 predicted this
+   ("neither compute node has an address on `1.1.0.x`"); it is still true.
+3. **The controller is local PCIe, not fabric.**
+   `/sys/class/nvme/nvme1/transport` = `pcie`, address `0000:36:00.0`,
+   `nvme list-subsys` reports NQN
+   `nqn.2019-08.com.pensando:nvm-subsystem-sn-8001-0-0`, and `nvme id-ctrl`
+   reports `mn=PDSNVME sn=PDSNVME-00`. That is the DSC presenting its own
+   NVMe function — there is no NVMe-oF connection from the host at all.
+4. **smc3 serves only the other party's subsystem**,
+   `nqn.2016-06.io.spdk:cnode1` / `dev1_ns1`.
+
+**Conclusion: writes terminate in the Pensando DSC/DPU's own KV store.**
+The claim that each DSC is an NVMe-oF initiator peered to smc3 and
+transparently re-exports smc3's namespace is **not supported by any
+measurement**, and is contradicted by (1) and (2).
+
+**What remains genuinely true, and is NOT explained by this:** the medium
+really is shared across `smc1` and `smc2` — rungs 30/35 store on one node
+and read back byte-exact on the other, with negative controls. So the two
+DSCs reach a common store by some path that is **not** smc3's `nvmf_tgt`.
+The matching `eui64 e46cfefeffcdae01` on both nodes is weaker evidence
+than it looked: it is equally consistent with a fixed identifier in
+Pensando firmware. **Open: what actually backs the shared namespace.** Ask
+the hardware owner; do not infer it again from `eui64`.
+
+**Operational consequence — the namespace is nearly full.** One driving
+run (13 requests, ~7,000 prompt tokens each) wrote **972.1 MiB of a 1 GiB
+namespace** with no delete primitive (6.29). Anything further risks
+ENOSPC-class failures on a medium shared with another party. Draining is
+still blocked (6.34's operational note). **Treat remaining capacity as
+exhausted until this is resolved.**
+
+### 6.37 ✅ The full eviction chain L1 → L2 → device is PROVEN under live traffic
+
+Measured 2026-09-18 with `LMCACHE_MP_L1_SIZE_GB=1` (the tracked default of
+4 GiB never evicts under any load this cluster can generate, which is why
+`retrieve_ops=0` was historically read as a bug — it is not; 6.21).
+
+| Level | Surface | Observed |
+|---|---|---|
+| Proxy | `:8000/status` | 13 requests, 0 prefill failures, 0 `prefill_no_handoff` |
+| vLLM prefill | `:8100/metrics` | `prompt_tokens_total=112,230` |
+| LMCache L1 (prefill) | `:8080/status` | 22 objects, 792 MiB / 1024 MiB = **77.3%**, LRU @ 0.8 watermark |
+| LMCache L2 (prefill) | `:8080/status` | `l2_commit_writes=103`, `stored_object_count=103` |
+| NIXL XNVME_KV plugin | metrics JSON | `store_ops=248,859`, `store_bytes=972.1 MiB`, `err=0`, `stalls=0` |
+| Device | `/dev/ng1n1` | 8 queues, `peak_in_flight=512` |
+
+**The arithmetic cross-checks exactly:** 27 commit groups × 9,217 device
+ops (9,216 pages of 4096 B + 1 commit object) = **248,859** = `store_ops`,
+and `248,859 × 4096 = 972.1 MiB` = `store_bytes`. This independently
+confirms the 36 MiB-per-ObjectKey geometry the design doc predicts.
+
+**A genuine cross-node L2 hit was observed under live traffic:** during
+the llama-benchy sweep, decode's adapter reported `l2_device_hits=2` with
+`l2_index_hits=0` — decode found on the device content only prefill had
+written. Small because the workload was deliberately unique-per-request
+(no reuse); the point is that it is non-zero on a path with the writer
+still running, which 6.34's fix is what made possible.
+
+**MP + ZMQ confirmed, not assumed:** the daemon listens on
+`tcp://127.0.0.1:6557` (ZMQ) and `0.0.0.0:8080` (HTTP status), and vLLM's
+`--kv-transfer-config` carries
+`MultiConnector[NixlConnector(kv_consumer), LMCacheMPConnector(kv_both)]`
+with `lmcache.mp.host=tcp://127.0.0.1`, `lmcache.mp.port=6557` — the MP
+rendezvous, not the removed in-process surface.
+
+**Device behaviour worth carrying forward:** `submit_retry=175,890,426`
+against 248,859 completed ops — ~707 retries per op — and mean device
+latency 3,521 µs with 330 ops beyond 64 ms. Zero errors, zero stalls, but
+the reactor is busy-spinning hard on `-EBUSY`. Same signature as 6.35's
+microbenchmark, now confirmed on the live serving path.
+
+### 6.38 `benchmarks/storage_backend_io` does not cover this stack's KV path
+
+LMCache's `benchmarks/storage_backend_io` (dev branch) benchmarks the v1
+**storage_backend** layer: `local_disk`, `rust_raw_block`, `hf3fs_backend`,
+`fs_backend`, `bigtable`. It contains **zero** references to nixl, xnvme,
+or L2 adapters, so it cannot measure `nixl_kv`/`XNVME_KV`. Use 6.35's
+`lmcache bench l2` path for that.
+
+Run for reference only (`local_disk`, 512 ops, concurrency 32):
+**206.96 ops/s**, 2.474 s, at 28 MiB/op — but O_DIRECT was off, so that is
+page-cache bandwidth (~5.8 GB/s), not disk.
+
+**Do not point `--backend rust_raw_block --raw-device /dev/ng1n1` at this
+cluster.** That device is a KV namespace (`csi=0x1`) shared with another
+party; raw block writes to it are semantically wrong and a corruption
+risk.
+
+**Operational note:** `pip install` inside a role container does **not**
+survive `container.sh down/up` — `/usr/local` is not bind-mounted, only
+`REPO_ROOT`, `STACK_ROOT` and `HF_HOME` are. Re-run
+`01-install-benchy.sh` after any container recreation.
