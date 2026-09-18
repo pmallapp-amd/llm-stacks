@@ -46,6 +46,11 @@ logs/
 *.sock
 /run/
 
+# Scratch research notes and topology dumps. Working material for a single
+# session, not part of the documented system — nothing tracked references
+# them. Promote anything durable into docs/ rather than tracking tmp/.
+/tmp/
+
 # ---- Generated configs -------------------------------------------------------
 *.orig-kvstack
 **/lmcache-prefill.yaml
