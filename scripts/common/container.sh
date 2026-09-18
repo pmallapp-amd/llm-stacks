@@ -52,6 +52,21 @@
 #       these nodes is the Micron BOOT DRIVE, not a KV namespace.
 #   --device /dev/kfd --device /dev/dri, --group-add
 #       ROCm. vLLM sees no GPU otherwise.
+#   --device /dev/infiniband + --ulimit memlock=-1 + --cap-add IPC_LOCK
+#       RDMA. Measured 2026-09-18: WITHOUT these the host shows 8 uverbs
+#       devices and a full RoCEv2 GID table, while `ucx_info -d` INSIDE the
+#       container enumerates only cma/posix/rocm_copy/rocm_ipc/self/sysv/tcp
+#       — no rc_verbs, no ud_verbs, no IB transport of any kind. UCX is
+#       built WITH verbs (libuct_ib.so is present, HAVE_DECL_IBV_* are set);
+#       it simply finds no device, because /dev/infiniband was never mapped
+#       in. So the P->D leg could not have used RDMA no matter how UCX_TLS
+#       was set, and every "RDMA does not work here" measurement taken on
+#       the HOST was answering a different question than the serving path
+#       asks. memlock must be unlimited because verbs pins registered
+#       memory, and IPC_LOCK is what permits that pinning inside a
+#       container. This does NOT by itself make RDMA work — see TODO 3.9
+#       for the UD-QP defect, which is a separate, real problem — but
+#       without it the question cannot even be asked.
 #   --ipc host / --shm-size
 #       vLLM worker shared memory.
 #   --network host
@@ -574,12 +589,34 @@ cmd_up() {
         " node — refusing to start a container that would silently fall" \
         " back to the plugin's /dev/ng0n1 default (the BOOT DRIVE)."
 
+    # RDMA passthrough. Conditional rather than unconditional: a node with
+    # no /dev/infiniband (or a future GPU-less role) must still start, and
+    # `docker run --device` on a missing path is a hard failure, not a
+    # warning. Absence is reported loudly because a silently TCP-only
+    # container is exactly the state that made the P->D leg look like an
+    # RDMA-capability problem for several sessions.
+    local -a rdma_args=()
+    if [ -d /dev/infiniband ]; then
+        rdma_args+=(--device /dev/infiniband)
+        # verbs pins registered memory; without unlimited memlock
+        # registration fails at a size that varies with the default limit,
+        # which presents as a confusing mid-transfer error rather than a
+        # clean refusal at startup.
+        rdma_args+=(--ulimit memlock=-1:-1 --cap-add IPC_LOCK)
+        info "mapping /dev/infiniband into ${cname} ($(ls /dev/infiniband | grep -c uverbs) uverbs device(s), memlock unlimited)"
+    else
+        warn "/dev/infiniband is ABSENT on this host — ${cname} will have NO" \
+             " RDMA access and the P->D leg can only use TCP, whatever" \
+             " UCX_TLS says. If you expected RDMA, this is the reason."
+    fi
+
     step "Starting ${cname} from ${IMAGE} (KV device ${dev})"
     docker run -d --name "${cname}" \
         --network host --ipc host --shm-size "${SHM_SIZE}" \
         --security-opt seccomp=unconfined \
         --cap-add SYS_PTRACE \
         --device /dev/kfd --device /dev/dri --device "${dev}" \
+        "${rdma_args[@]}" \
         --group-add video --group-add render \
         -v "${REPO_ROOT}:${REPO_ROOT}" \
         -v "${STACK_ROOT}:${STACK_ROOT}" \

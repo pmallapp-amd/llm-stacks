@@ -332,7 +332,53 @@ counters rather than inferred from throughput.*
       and would have made it self-diagnosing. `require_rdma_access` (1.9)
       already hard-gates in RDMA mode, satisfying that half independently.
       2026-09-16.
-- [ ] **3.9** 🔴 **The sole remaining RDMA-stack blocker.** `UCX_TLS=ib`
+- [ ] **3.9** 🔴 **The sole remaining RDMA-stack blocker. SHARPENED
+      2026-09-18 — the premise was wrong twice over.**
+
+      **(a) The container never had RDMA access at all.** `container.sh`
+      mapped only `/dev/kfd`, `/dev/dri` and the KV char device. The host
+      showed 8 uverbs devices and a full RoCEv2 GID table (`VER v2`,
+      IPv4 GID at index 1, `PORT_ACTIVE`, MTU 4096) while `ucx_info -d`
+      **inside the container** enumerated only
+      `cma/posix/rocm_copy/rocm_ipc/self/sysv/tcp` — no IB transport of
+      any kind. UCX is built with verbs (`libuct_ib.so` present, the
+      `HAVE_DECL_IBV_*` block is set); it simply had no device. **Every
+      earlier in-container RDMA conclusion was therefore answering a
+      different question than the serving path asks.** Fixed: `container.sh`
+      now maps `/dev/infiniband` with `--ulimit memlock=-1` and
+      `--cap-add IPC_LOCK`, and warns loudly when the host has no
+      `/dev/infiniband` rather than silently producing a TCP-only container.
+
+      **(b) There is no RC transport to narrow to.** This item previously
+      proposed "naming RC explicitly instead of the `ib` alias". Measured
+      after fix (a): `ucx_info -d -t rc_verbs` returns **0 transport/device
+      pairs**, and `UCX_TLS=rc_verbs ucx_info -u t -d` falls through to
+      `tcp` on the `benicN` interfaces. UCX never attempts RC on ionic at
+      all. The only IB transport it offers is `ud_verbs`, on all 8 devices,
+      and opening it fails on every one:
+
+      ```
+      ib_iface.c:1269 UCX ERROR ionic_N: iface failed to create UD QP
+        TX wr:256 sge:6 inl:64 resp:0 RX wr:4096 sge:1 resp:0
+        failed: Invalid argument
+      ```
+
+      Constraining the parameters named in that message
+      (`UCX_IB_TX_MAX_SGE=1`, `UCX_UD_VERBS_TX_INLINE=0`) does **not** change
+      the outcome. Note `ibv_rc_pingpong` works on the host (3.7), so the
+      hardware does support RC queue pairs — UCX's `rc_verbs` iface needs
+      more from the provider than pingpong does, and the ionic userspace
+      provider does not satisfy it.
+
+      **Consequence, stated plainly: P→D over RDMA RoCEv2 is NOT achievable
+      on this stack today.** Not for want of configuration — UCX has no
+      usable RDMA transport here. This is now a driver/provider issue to
+      raise with AMD (the `ud_verbs` QP rejection and the absent `rc_verbs`
+      support), not a UCX_TLS tuning exercise. Do not spend more time on
+      transport-spec permutations until the provider exposes a working
+      transport.
+
+      *Original framing, retained for context:* `UCX_TLS=ib`
       pulls in UD transports; UD QP creation fails outright on this
       driver/firmware (`Couldn't create QP`), and `rdma_cm` fails with it
       (HANDOFF §7.5). A firmware update that levelled 15/16 cards did NOT
