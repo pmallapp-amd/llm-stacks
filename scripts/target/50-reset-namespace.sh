@@ -56,8 +56,19 @@ step "Reset KV namespace: ${TARGET_NAME} (${TARGET_HOST})"
 banner_config
 
 is_running "kv-target" \
-    || die "kv-target is not running — nothing to reset." \
-           " Start it first: scripts/target/03-start-kv-target.sh"
+    || die "kv-target is not running under THIS repo's PID file — nothing" \
+           " here to reset." \
+           $'\n' "  This check is about ownership, not liveness: an nvmf_tgt" \
+           " started by someone else can be serving right now and still land" \
+           " you here (measured on smc3 2026-09-18 — TODO 6.18). Note also" \
+           " that pgrep -x nvmf_tgt will NOT find it, because SPDK renames" \
+           " its main thread to reactor_N." \
+           $'\n' "  To start ours:     scripts/target/03-start-kv-target.sh" \
+           $'\n' "  To inspect what IS running, and reset it safely:" \
+           " scripts/target/51-reset-smc3-storage.sh" \
+           $'\n' "  Before doing either, read TODO 6.36: this project's KV" \
+           " data does NOT live on smc3 — it terminates in the Pensando DSC," \
+           " so resetting smc3 reclaims none of it."
 
 warn "This will RESTART nvmf_tgt and DELETE every KV object stored in" \
      " '${KV_BDEV_NAME}' (bdev_kvmalloc is RAM-backed — this data does not" \
