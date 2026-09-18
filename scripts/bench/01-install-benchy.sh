@@ -88,6 +88,23 @@ ok "tokenizer cached under HF_HOME=${HF_HOME}"
 
 step "Verifying llama-benchy CLI"
 require_cmd python
+# WHY a symlink step exists at all: inside the vendor container ${VENV} is
+# a SHIM, not a virtualenv — container.sh's `shim` subcommand creates
+# ${VENV}/bin/{python,python3} as symlinks to /usr/bin/python3 and an
+# activate that is a deliberate no-op, because the rocm-aic image already
+# carries vllm/lmcache/nixl on its SYSTEM interpreter. pip therefore
+# installs console scripts to /usr/local/bin, and ${VENV}/bin/llama-benchy
+# never appears. Measured 2026-09-18: ${VENV}/bin contained only
+# activate, python, python3. Without this bridge both the check below and
+# lib-bench.sh's `[ -x "${VENV}/bin/llama-benchy" ]` guard fail, on an
+# install that actually succeeded.
+if [ ! -x "${VENV}/bin/llama-benchy" ]; then
+    _benchy_real="$(command -v llama-benchy 2>/dev/null || true)"
+    if [ -n "${_benchy_real}" ]; then
+        info "bridging ${_benchy_real} -> ${VENV}/bin/llama-benchy (container shim, not a venv)"
+        ln -sfn "${_benchy_real}" "${VENV}/bin/llama-benchy"
+    fi
+fi
 "${VENV}/bin/llama-benchy" --help >/dev/null || die "llama-benchy --help failed"
 
 RESOLVED_VERSION="$(python -c 'import importlib.metadata as m; print(m.version("llama-benchy"))' 2>/dev/null || echo unknown)"

@@ -313,12 +313,30 @@ benchy_run() {
         --depth ${BENCHY_DEPTH}
         --concurrency ${BENCHY_CONCURRENCY}
         --runs "${BENCHY_RUNS}"
-        --warmup-runs "${BENCHY_WARMUP_RUNS}"
         --latency-mode "${BENCHY_LATENCY_MODE}"
         --save-result "${rundir}/result.json"
         --format json
         --emit-progress "${rundir}/progress.jsonl"
     )
+    # Warmup. llama-benchy 0.4.0 has NO --warmup-runs flag — verified
+    # 2026-09-18 against the installed CLI (`--help | grep -c -- --warmup-runs`
+    # returns 0). It always runs exactly ONE warmup iteration whose result is
+    # discarded (`total_runs = num_runs + 1`), and the only control it offers
+    # is --no-warmup to suppress that one. This file previously passed
+    # --warmup-runs unconditionally, which made argparse reject EVERY sweep
+    # with "unrecognized arguments" — the harness could not run at all.
+    #
+    # So BENCHY_WARMUP_RUNS is honoured as far as the tool allows: 0 means
+    # --no-warmup, anything else means the tool's built-in single warmup.
+    # A value >1 cannot be expressed; warn rather than silently delivering 1.
+    if [ "${BENCHY_WARMUP_RUNS}" -eq 0 ] 2>/dev/null; then
+        cmd+=(--no-warmup)
+    elif [ "${BENCHY_WARMUP_RUNS}" -gt 1 ] 2>/dev/null; then
+        warn "BENCHY_WARMUP_RUNS=${BENCHY_WARMUP_RUNS}, but llama-benchy" \
+             " ${BENCHY_VERSION} supports only one built-in warmup iteration" \
+             " (no --warmup-runs flag). Proceeding with 1."
+    fi
+
     cmd+=("${extra_args[@]}")
 
     info "running: ${cmd[*]}"
