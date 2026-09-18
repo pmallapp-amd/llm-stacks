@@ -361,7 +361,93 @@ case "${KV_BACKEND}" in
         ;;
 esac
 
-_L2_ADAPTER_JSON="{\"type\":\"nixl_store\",\"backend\":\"${KV_BACKEND}\",\"backend_params\":${_L2_BACKEND_PARAMS_JSON},\"pool_size\":${_L2_POOL_SIZE}}"
+# ─────────────────────────────────────────────────────────────────────────────
+# L2 ADAPTER TYPE — "nixl_kv" (this repo's) or "nixl_store" (the vendor's).
+#
+# nixl_kv is the content-addressed adapter that makes the L2 tier a SHARED,
+# cross-node cache (docs/design/nixl-kv-l2-adapter.md, TODO 6.21). nixl_store
+# is kept reachable, unmodified, as the A/B control: it names objects
+# obj_{i}_{uuid4} per daemon, so its L2 tier is a per-daemon capacity
+# extension that can never serve a peer's key. Flipping between them is one
+# env var, which is what makes a negative control cheap on a cluster where
+# every measurement has historically needed one.
+_L2_ADAPTER_TYPE="${LMCACHE_L2_ADAPTER_TYPE:-nixl_kv}"
+
+case "${_L2_ADAPTER_TYPE}" in
+    nixl_kv)
+        # ── The geometry fingerprint (design §5) ───────────────────────────
+        # ObjectKey carries model_name, kv_rank, object_group_id, chunk_hash
+        # and cache_salt — and NO dtype, and NO KV-plane layout. Two daemons
+        # on different --kv-cache-dtype, or on a fused-vs-split KV cache,
+        # therefore produce THE SAME KEY FOR DIFFERENT BYTES, at an identical
+        # byte count, which no length check can catch. Patch 0009 exists
+        # because exactly that plane mismatch corrupts every chunk without
+        # raising.
+        #
+        # So every object name is prefixed with a hash over everything that
+        # changes on-wire meaning. Both nodes derive it from the same
+        # config/cluster.env (and invariant 8 already requires both roles to
+        # agree on LMCACHE_CHUNK_SIZE), so they agree BY CONSTRUCTION — and
+        # any divergence changes the namespace, turning what would have been
+        # silent corruption into an ordinary miss.
+        #
+        # It is also the migration lever: this backend has no delete
+        # primitive, so a schema change cannot drain the namespace. Bumping
+        # the leading version term moves to a fresh key space instead of
+        # colliding with stale data. It additionally isolates us from the
+        # 36,864 stale obj_N_uuid objects and from the other party sharing
+        # smc3 (KV_SLOT_OFFSET_* gives NO isolation here: XNVME_KV's
+        # make_key() ignores devId entirely once metaInfo is set).
+        #
+        # Override LMCACHE_L2_NAMESPACE to force a fresh key space by hand.
+        if [ -n "${LMCACHE_L2_NAMESPACE:-}" ]; then
+            _L2_NAMESPACE="${LMCACHE_L2_NAMESPACE}"
+            info "L2 namespace: ${_L2_NAMESPACE} (forced via LMCACHE_L2_NAMESPACE)"
+        else
+            _L2_NS_INPUT="v1|${MODEL}|${TP_SIZE}|${LMCACHE_CHUNK_SIZE}|${KV_CACHE_DTYPE}|${LMCACHE_L1_ALIGN_BYTES:-4096}|${KV_MAX_VALUE_SIZE_EFFECTIVE}"
+            _L2_NAMESPACE="$(printf '%s' "${_L2_NS_INPUT}" | sha256sum | cut -c1-12)"
+            info "L2 namespace: ${_L2_NAMESPACE}  <- sha256(${_L2_NS_INPUT})"
+        fi
+
+        # Refuse the characters the adapter's own name grammar reserves
+        # (@ field separator, ~ tile ordinal, ! commit suffix). from_dict()
+        # and 25-validate-lmcache-config.sh both check this too; checking
+        # here as well means a bad value is caught at the layer that BUILT
+        # it, naming the variable to fix.
+        case "${_L2_NAMESPACE}" in
+            *@*|*~*|*!*)
+                die "start-lmcache-daemon.sh: L2 namespace" \
+                    " '${_L2_NAMESPACE}' contains one of the reserved" \
+                    " characters @ ~ ! — these separate fields, tile" \
+                    " ordinals and the commit suffix in the adapter's object" \
+                    " names (docs/design/nixl-kv-l2-adapter.md §4), so a" \
+                    " namespace containing one makes names ambiguous." \
+                    " Set LMCACHE_L2_NAMESPACE to a value without them."
+                ;;
+        esac
+        [ -n "${_L2_NAMESPACE}" ] || die "start-lmcache-daemon.sh: computed" \
+            " an empty L2 namespace — sha256sum or cut is missing/broken" \
+            " on this node."
+
+        # NOTE: no pool_size. nixl_kv is content-addressed and has no pool;
+        # its from_dict() REJECTS pool_size rather than ignoring it, so that
+        # a config copied from a nixl_store deployment fails loudly instead
+        # of looking accepted while the key it set does nothing.
+        _L2_ADAPTER_JSON="{\"type\":\"nixl_kv\",\"backend\":\"${KV_BACKEND}\",\"backend_params\":${_L2_BACKEND_PARAMS_JSON},\"namespace\":\"${_L2_NAMESPACE}\"}"
+        ;;
+    nixl_store)
+        warn "L2 adapter type is 'nixl_store' (the vendor's). Its object" \
+             " names carry a per-daemon uuid4, so this tier is a per-daemon" \
+             " capacity extension and CANNOT serve a key stored by the peer" \
+             " node or by a previous run of this one. This is the A/B" \
+             " control, not a working shared cache — see TODO 6.21."
+        _L2_ADAPTER_JSON="{\"type\":\"nixl_store\",\"backend\":\"${KV_BACKEND}\",\"backend_params\":${_L2_BACKEND_PARAMS_JSON},\"pool_size\":${_L2_POOL_SIZE}}"
+        ;;
+    *)
+        die "start-lmcache-daemon.sh: LMCACHE_L2_ADAPTER_TYPE must be" \
+            " nixl_kv|nixl_store, got '${_L2_ADAPTER_TYPE}'."
+        ;;
+esac
 
 # Parse the spec with the SAME installed config classes the daemon itself
 # uses, before ever spawning it — a typo'd key or a bad JSON escape fails

@@ -107,13 +107,41 @@ print(
     file=sys.stderr,
 )
 
+# nixl_kv-specific check: 'namespace' is this adapter's whole isolation
+# and geometry-mismatch defense (docs/design/nixl-kv-l2-adapter.md §5,
+# §7 assert 3) -- NixlKvL2AdapterConfig.from_dict() already enforces
+# this (so a bad namespace would have failed above), but check it again
+# explicitly and visibly here: a future refactor of that adapter's
+# from_dict() must not be able to silently loosen this invariant without
+# this script noticing.
+if type_name == "nixl_kv":
+    namespace = getattr(adapter_cfg, "namespace", None)
+    if not isinstance(namespace, str) or not namespace:
+        print(
+            "FAIL: nixl_kv config has no non-empty 'namespace' "
+            "(docs/design/nixl-kv-l2-adapter.md §7 assert 3)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    _ns_forbidden = set("@~!") & set(namespace)
+    if _ns_forbidden:
+        print(
+            f"FAIL: nixl_kv 'namespace' {namespace!r} contains forbidden "
+            f"character(s) {sorted(_ns_forbidden)!r} -- must not contain "
+            "'@', '~', or '!' (docs/design/nixl-kv-l2-adapter.md §7 "
+            "assert 3)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"  nixl_kv namespace={namespace!r} (ok)", file=sys.stderr)
+
 # Best-effort cross-check against a live NIXL agent: confirm the backend
 # name is actually dlopen()-able on THIS host and echo its declared
 # max_value_size (relevant to mem_split_n — see start-lmcache-daemon.sh's
 # header) so a human can eyeball it. Not fatal if nixl/the plugin dir isn't
 # set up in whatever environment is running this check (e.g. a laptop with
 # no NIXL_PLUGIN_DIR) — this is a bonus check, not the primary one above.
-if type_name in ("nixl_store", "nixl_store_dynamic"):
+if type_name in ("nixl_store", "nixl_store_dynamic", "nixl_kv"):
     backend_name = getattr(adapter_cfg, "backend", None)
     try:
         from nixl._api import nixl_agent, nixl_agent_config

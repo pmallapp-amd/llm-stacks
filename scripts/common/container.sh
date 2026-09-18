@@ -62,6 +62,11 @@
 #
 # usage:
 #   container.sh shim                       # write the /opt/kvstack shim
+#   container.sh vllm-patch                 # derive the nixl_utils.py override
+#   container.sh lmcache-patch              # derive the 0011 override
+#   container.sh adapter-overlay            # resolve the nixl_kv mount target
+#   container.sh adapter-check <role>       # prove nixl_kv is registered
+#   container.sh plugin-build               # rebuild libplugin_XNVME_KV.so
 #   container.sh up <prefill|decode>        # start the long-lived container
 #   container.sh exec <role> <cmd...>       # run something inside it
 #   container.sh logs <role> [-f]
@@ -245,6 +250,236 @@ PYEOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# lmcache-patch — re-derive the lmcache_mp_connector.py override (patch 0011)
+# from the IMAGE's own copy.
+#
+# WHY THIS IS NOT BAKED INTO THE IMAGE LIKE 0006-0009. Measured 2026-09-17
+# against rocm-aic:mp-pd-ionic2609, in a FRESH container with no mounts:
+# 0006/0007/0008/0009 are present, and 0011 is NOT. Its sibling 0010 (the
+# same guard on vLLM's own builtin copy) is absent too. See
+# patches/lmcache/README.md — that file is the per-patch table and carries a
+# re-verification recipe whose 0011 check now greps a string that exists only
+# in the PATCHED form (the previous recipe grepped `num_external_tokens`,
+# which matches the unpatched function signature and docstring, and so gave a
+# false pass for as long as it existed).
+#
+# WHAT BREAKS WITHOUT IT. This cluster runs
+# MultiConnector[NixlConnector, LMCacheMPConnector]. Since vLLM #46865 a
+# NON-CHOSEN MultiConnector sub-connector is handed the request's real blocks
+# with num_external_tokens=0. update_state_after_alloc() never reads that
+# argument, so it decides purely on tracker.needs_retrieve(), wrongly moves
+# PREFETCHING -> WAITING_FOR_LOAD and creates a retrieve task for a load that
+# must not happen. The same `condition` then selects the lock-release range,
+# so only num_vllm_hit_tokens is freed instead of num_lmcache_hit_tokens and
+# the difference LEAKS; end_session() does not release lookup locks either.
+#
+# THE TWO-COPY TRAP. There are two near-identical LMCacheMPConnector modules
+# in this image and the naming misleads. KVConnectorFactory registers
+# "LMCacheMPConnector" against vllm/distributed/kv_transfer/kv_connector/v1/
+# lmcache_mp_connector.py, which LOOKS live — but that module's
+# _resolve_lmcache_mp_connector() prefers
+# lmcache.integration.vllm.lmcache_mp_connector whenever LMCache is
+# importable, which it always is here. So THIS file is the live one and the
+# vLLM-side copy (patch 0010) only covers the LMCACHE_USE_UPSTREAM_MP /
+# ImportError fallback this deployment never takes.
+#
+# The target is resolved with importlib.util.find_spec(), NOT a filesystem
+# find: `find / -path '*/lmcache/integration/vllm/lmcache_mp_connector.py'`
+# matches THREE files in this image (dist-packages, /app/LMCache source tree,
+# and /app/LMCache/build/lib.*), and cmd_vllm_patch's `-print -quit` idiom
+# would pick whichever one find reached first. Mounting over a build-tree
+# copy is a SILENT no-op: Python imports from dist-packages and the guard
+# would simply never be there. find_spec() returns the module the interpreter
+# will actually import, which is the only definition of "the right file"
+# that matters. It needs no GPU — lmcache falls back to StubCPUDevice.
+_LMCACHE_PATCH_DIR() { echo "${STACK_ROOT}/lmcache-patch"; }
+
+cmd_lmcache_patch() {
+    local pdir; pdir="$(_LMCACHE_PATCH_DIR)"
+    mkdir -p "${pdir}"
+    step "Deriving lmcache_mp_connector.py override (patch 0011) from ${IMAGE}"
+
+    local target
+    target="$(docker run --rm --entrypoint python3 "${IMAGE}" -c \
+        'import importlib.util
+spec = importlib.util.find_spec("lmcache.integration.vllm.lmcache_mp_connector")
+print(spec.origin if spec else "")' 2>/dev/null | tr -d '\r' | tail -1)"
+    [ -n "${target}" ] || die "could not resolve" \
+        " lmcache.integration.vllm.lmcache_mp_connector inside ${IMAGE} —" \
+        " the module may have been renamed or LMCache may not be installed;" \
+        " re-read it and update this function rather than shipping an" \
+        " unpatched override."
+    info "image module path: ${target}"
+
+    docker run --rm --entrypoint cat "${IMAGE}" "${target}" \
+        > "${pdir}/lmcache_mp_connector.orig.py"
+
+    python3 - "${pdir}/lmcache_mp_connector.orig.py" \
+              "${pdir}/lmcache_mp_connector.py" <<'PYEOF'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+
+UNPATCHED = "        condition = tracker.needs_retrieve()\n"
+PATCHED_MARK = "num_external_tokens > 0 and tracker.needs_retrieve()"
+
+if PATCHED_MARK in text:
+    # A future image may ship 0011 itself. Copy through rather than emit a
+    # file that merely LOOKS patched, and say so loudly enough to prompt
+    # retiring this step.
+    print("already patched image-side; copying through", file=sys.stderr)
+    open(dst, "w").write(text)
+    sys.exit(0)
+
+n = text.count(UNPATCHED)
+if n != 1:
+    sys.exit(
+        f"expected exactly 1 occurrence of {UNPATCHED.strip()!r}, found {n} — "
+        "lmcache_mp_connector.py no longer has the shape patch 0011 rewrites. "
+        "Re-read the file and update container.sh rather than shipping an "
+        "unpatched override."
+    )
+
+# The replacement references num_external_tokens, so it is only valid inside
+# a function that HAS that parameter. Verify rather than assume: a NameError
+# here would surface at request time, deep inside the connector, long after
+# this script reported success.
+idx = text.index(UNPATCHED)
+enclosing = None
+for m in re.finditer(r'^    def (\w+)\(', text[:idx], re.M):
+    enclosing = m.group(1)
+if enclosing != "update_state_after_alloc":
+    sys.exit(
+        f"the target line is inside {enclosing!r}, not 'update_state_after_alloc' "
+        "— num_external_tokens would not be in scope and the override would "
+        "raise NameError at request time."
+    )
+sig_start = text.rindex("    def update_state_after_alloc(", 0, idx)
+if "num_external_tokens" not in text[sig_start:idx]:
+    sys.exit(
+        "'num_external_tokens' does not appear in update_state_after_alloc's "
+        "signature — refusing to emit an override that references it."
+    )
+
+REPLACEMENT = (
+    "        # Gate the LOAD path on num_external_tokens, not on `blocks`:\n"
+    "        # since vLLM #46865 a non-chosen MultiConnector sub-connector\n"
+    "        # receives the request's real blocks and must not load. 0 also\n"
+    "        # frees ALL lookup locks below, which is what stops them leaking.\n"
+    "        # Patched in by scripts/common/container.sh (patch 0011) — this\n"
+    "        # image does not ship it. See patches/lmcache/README.md.\n"
+    "        condition = num_external_tokens > 0 and tracker.needs_retrieve()\n"
+)
+text = text.replace(UNPATCHED, REPLACEMENT)
+open(dst, "w").write(text)
+print("patched 1 call site (update_state_after_alloc)")
+PYEOF
+
+    echo "${target}" > "${pdir}/target-path"
+
+    # Refuse to install an override that does not actually carry the guard.
+    # Same reasoning as cmd_plugin_build's nm check: a silently-unpatched
+    # overlay reproduces the exact bug it exists to fix while looking fixed.
+    grep -q 'num_external_tokens > 0 and tracker\.needs_retrieve()' \
+        "${pdir}/lmcache_mp_connector.py" \
+        || die "the derived override does NOT contain the 0011 guard —" \
+               " refusing to mount it."
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+        "${pdir}/lmcache_mp_connector.py" \
+        || die "the derived override is not valid Python — refusing to mount it."
+
+    ok "wrote ${pdir}/lmcache_mp_connector.py (mounts over ${target})"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# adapter-overlay — resolve where to mount THIS REPO's nixl_kv L2 adapter.
+#
+# WHAT. overlays/lmcache/nixl_kv_l2_adapter.py is the content-addressed,
+# cross-node-capable L2 adapter that fixes TODO 6.21. See
+# docs/design/nixl-kv-l2-adapter.md. It is mounted INTO the installed
+# lmcache l2_adapters package directory as a NEW FILE.
+#
+# WHY A NEW FILE AND NOT A PATCH. l2_adapters/__init__.py does
+#   for _finder, _module_name, _ispkg in pkgutil.iter_modules(__path__):
+#       if _module_name.endswith("_l2_adapter"):
+#           add_pending_module(...)
+# so ANY *_l2_adapter.py present in that directory is auto-discovered and
+# lazily imported when its type name is requested. Dropping a file in is
+# therefore the entire registration mechanism: ZERO vendor files edited,
+# and zero textual conflict with patches 0006/0007, which both modify
+# nixl_store_l2_adapter.py inside an image we cannot rebuild. It also
+# leaves nixl_store byte-identical as an A/B control — switching between
+# the broken and fixed adapter is one --l2-adapter JSON edit.
+#
+# WHY find_spec AND NOT A HARDCODED PATH. Same reasoning as
+# cmd_lmcache_patch: the package exists at more than one path in this image
+# (dist-packages plus the /app/LMCache build tree), and mounting into the
+# wrong one is a SILENT no-op — the container starts, the mount is present,
+# and pkgutil simply never sees the file because Python imports the package
+# from somewhere else. find_spec().submodule_search_locations[0] is the
+# directory the interpreter will actually scan.
+_ADAPTER_SRC() { echo "${REPO_ROOT}/overlays/lmcache/nixl_kv_l2_adapter.py"; }
+_ADAPTER_DIR() { echo "${STACK_ROOT}/lmcache-adapter"; }
+
+cmd_adapter_overlay() {
+    local src; src="$(_ADAPTER_SRC)"
+    local adir; adir="$(_ADAPTER_DIR)"
+    mkdir -p "${adir}"
+    step "Resolving mount target for nixl_kv_l2_adapter.py in ${IMAGE}"
+
+    [ -f "${src}" ] || die "adapter source not found: ${src}"
+
+    # Compile with the IMAGE's interpreter, not the host's: a syntax error
+    # or a 3.12-ism mismatch must fail here, not inside the daemon's log.
+    # compile() rather than py_compile: the repo is mounted read-only here
+    # and py_compile insists on writing __pycache__ beside the source.
+    docker run --rm -v "${REPO_ROOT}:${REPO_ROOT}:ro" \
+        --entrypoint python3 "${IMAGE}" -c \
+        'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
+        "${src}" \
+        || die "nixl_kv_l2_adapter.py does not compile under the image's" \
+               " python3 — refusing to mount it."
+
+    local pkgdir
+    pkgdir="$(docker run --rm --entrypoint python3 "${IMAGE}" -c \
+        'import importlib.util
+spec = importlib.util.find_spec("lmcache.v1.distributed.l2_adapters")
+print(spec.submodule_search_locations[0] if spec else "")' \
+        2>/dev/null | tr -d '\r' | tail -1)"
+    [ -n "${pkgdir}" ] || die "could not resolve the lmcache l2_adapters" \
+        " package directory inside ${IMAGE} — the package may have moved;" \
+        " re-read it and update this function rather than mounting into a" \
+        " guessed path, which would be a silent no-op."
+
+    echo "${pkgdir}/nixl_kv_l2_adapter.py" > "${adir}/target-path"
+    ok "nixl_kv adapter mounts over ${pkgdir}/nixl_kv_l2_adapter.py"
+}
+
+# adapter-check — prove the overlay is actually DISCOVERABLE, not just
+# present. A mounted-but-unseen file is this project's signature failure
+# mode: everything looks healthy and the tier silently never engages. Run
+# against a LIVE container.
+cmd_adapter_check() {
+    local role="$1"; local cname; cname="$(_cname "${role}")"
+    step "Checking nixl_kv is registered inside ${cname}"
+    docker exec "${cname}" python3 -c '
+import sys
+from lmcache.v1.distributed.l2_adapters.config import get_l2_adapter_config_class
+try:
+    cls = get_l2_adapter_config_class("nixl_kv")
+except Exception as exc:
+    sys.exit(f"FAIL: nixl_kv is NOT registered: {exc!r}")
+print(f"OK: nixl_kv -> {cls.__module__}.{cls.__name__}")
+import importlib.util
+spec = importlib.util.find_spec("lmcache.v1.distributed.l2_adapters.nixl_kv_l2_adapter")
+print(f"OK: module resolves to {spec.origin}")
+' || die "nixl_kv did not register inside ${cname} — the overlay is" \
+         " present but pkgutil did not discover it, or the module raised" \
+         " on import. Check: container.sh exec ${role}" \
+         " python3 -c 'import lmcache.v1.distributed.l2_adapters.nixl_kv_l2_adapter'"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # plugin-build — rebuild the XNVME_KV NIXL plugin from THIS REPO's source.
 #
 # WHY: the rocm-aic image ships a plugin built from the vendor's separate
@@ -317,6 +552,15 @@ cmd_up() {
         || cmd_vllm_patch
     local patch_target; patch_target="$(cat "${pdir}/target-path")"
 
+    local lpdir; lpdir="$(_LMCACHE_PATCH_DIR)"
+    [ -f "${lpdir}/lmcache_mp_connector.py" ] && [ -f "${lpdir}/target-path" ] \
+        || cmd_lmcache_patch
+    local lmcache_target; lmcache_target="$(cat "${lpdir}/target-path")"
+
+    local adir; adir="$(_ADAPTER_DIR)"
+    [ -f "${adir}/target-path" ] || cmd_adapter_overlay
+    local adapter_target; adapter_target="$(cat "${adir}/target-path")"
+
     if docker inspect "${cname}" >/dev/null 2>&1; then
         if [ "$(docker inspect -f '{{.State.Running}}' "${cname}")" = "true" ]; then
             ok "${cname} already running — not recreating"
@@ -341,6 +585,8 @@ cmd_up() {
         -v "${STACK_ROOT}:${STACK_ROOT}" \
         -v "${HF_HOME}:${HF_HOME}" \
         -v "${pdir}/nixl_utils.py:${patch_target}:ro" \
+        -v "${lpdir}/lmcache_mp_connector.py:${lmcache_target}:ro" \
+        -v "$(_ADAPTER_SRC):${adapter_target}:ro" \
         -v "${plugin_so}:${NIXL_PLUGIN_DIR_IN_IMAGE}/libplugin_XNVME_KV.so:ro" \
         -e HF_HOME="${HF_HOME}" \
         -e XNVME_DEV="${dev}" \
@@ -362,12 +608,16 @@ cmd_exec() {
 ACTION="${1:-}"; shift || true
 case "${ACTION}" in
     shim)   cmd_shim ;;
-    vllm-patch)   cmd_vllm_patch ;;
-    plugin-build) cmd_plugin_build ;;
+    vllm-patch)    cmd_vllm_patch ;;
+    lmcache-patch) cmd_lmcache_patch ;;
+    adapter-overlay) cmd_adapter_overlay ;;
+    adapter-check)   cmd_adapter_check "${1:?role required}" ;;
+    plugin-build)  cmd_plugin_build ;;
     up)     cmd_up "${1:?role required}" ;;
     exec)   cmd_exec "${1:?role required}" "${@:2}" ;;
     logs)   docker logs "${@:2}" "$(_cname "${1:?role required}")" ;;
     down)   docker rm -f "$(_cname "${1:?role required}")" >/dev/null && ok "removed" ;;
     status) docker ps -a --filter "name=$(_cname "${1:?role required}")" ;;
-    *) die "usage: container.sh {shim|up|exec|logs|down|status} ..." ;;
+    *) die "usage: container.sh" \
+           " {shim|vllm-patch|lmcache-patch|adapter-overlay|adapter-check|plugin-build|up|exec|logs|down|status} ..." ;;
 esac
