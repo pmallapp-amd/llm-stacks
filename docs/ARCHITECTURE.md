@@ -190,11 +190,18 @@ either ceiling, which is why some form of splitting is always in play.
    > First, `mem_split_n`/`_resolve_mem_split()` live in *this exact file*
    > (`nixl_store_l2_adapter.py`, the daemon's L2 adapter — the live path,
    > not the in-process one) and are supplied by
-   > `patches/lmcache/0007-lmcache-l2-adapter-value-size-split.patch`,
-   > baked into the vendor image and load-bearing right now. Second, the
+   > `patches/lmcache/0007`, baked into the vendor image. (As of
+   > 2026-09-17 that patch is verified present in the image and its
+   > `.patch` file is no longer carried in this repo — see the policy
+   > change in `patches/lmcache/README.md`. Note also that it is currently
+   > **dormant, not load-bearing**: measured `page_size=4096` against a
+   > declared `max_value_size=32768`, so `_resolve_mem_split()` returns 1
+   > and the `#{j}` split path never executes. It becomes live only if
+   > `--l1-align-bytes` rises above `max_value_size`.) Second, the
    > withdrawn generator targeted a *different* file entirely
    > (`nixl_storage_backend.py`, the in-process path's allowlist — see
-   > `patches/lmcache/0008` for that file's equivalent patch) and its
+   > `patches/lmcache/0008` for that file's equivalent patch, likewise
+   > verified present and no longer carried) and its
    > withdrawal has no bearing on whether this file's splitting exists —
    > it does, and it is not upstream LMCache. See
    > `patches/lmcache/README.md` for the full account.

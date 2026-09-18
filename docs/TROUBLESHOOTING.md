@@ -133,7 +133,10 @@ said exactly that, and it was wrong, corrected the same day. The vendor
 container image this lab actually runs (`rocm-aic:mp-pd-ionic2609`, LMCache
 0.5.3) carries both backends in all three of its hardcoded allowlist sites
 **because it was built with `patches/lmcache/0006`/`0008` applied** — on any
-image lacking those patches, this exact `AssertionError` returns. A
+image lacking those patches, this exact `AssertionError` returns. As of
+2026-09-17 those two diffs are verified present in the image and their
+`.patch` files are no longer carried in this repo (policy: if the image
+ships it, we don't carry the diff — see `patches/lmcache/README.md`). A
 from-source-install generator script used to apply the equivalent edit at
 deploy time; it was withdrawn 2026-09-17 because that from-source build
 path has never completed and is deprioritised (`docs/TODO.md` §6.2), and
@@ -154,7 +157,9 @@ mem_type check. If it ever reports the backend **REJECTED** on some future
 image, that is the signal to run
 [`patches/lmcache/README.md`](../patches/lmcache/README.md)'s
 re-verification recipe against that image — the build most likely dropped
-`0006`/`0008` — rather than assuming a runtime patch step is missing.
+`0006`/`0008` (recover the diffs from git history if so, since this repo no
+longer carries them as `.patch` files — see that README) — rather than
+assuming a runtime patch step is missing.
 
 ---
 
@@ -180,7 +185,9 @@ mem_type natively"; corrected the same day. The vendor container's LMCache
 (`nixl_store_l2_adapter.py:1056-1067`) because `patches/lmcache/0006`
 (daemon path) and `0008` (in-process path) put them there at image-build
 time — on an image lacking those patches, this exact silent-local-write
-failure returns. See `docs/HANDOFF.md` §20 and
+failure returns. As of 2026-09-17 `0006` and `0008` are verified present in
+the image and no longer carried as `.patch` files in this repo. See
+`docs/HANDOFF.md` §20 and
 [`patches/lmcache/README.md`](../patches/lmcache/README.md) for the
 correction, the per-patch table, and a re-verification recipe.
 

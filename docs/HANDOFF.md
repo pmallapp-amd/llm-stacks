@@ -1,7 +1,7 @@
 # Handoff
 
 State of the P/D-disaggregated KV cache project, for whoever picks this up
-next (including future me). Last updated 2026-09-17.
+next (including future me). Last updated 2026-09-18.
 
 Read this before [BRINGUP.md](BRINGUP.md). It tells you what is real, what is
 assumed, and what is still wrong.
@@ -11,15 +11,45 @@ assumed, and what is still wrong.
 > and what to do in what order. §§1–2 are background; §7 is the corrections
 > record — read it when you need the *why*, not to get started.
 >
-> **Headline, 2026-09-17:** cross-node storage-tier store+retrieve is
-> **PROVEN, in both directions**, on a clean namespace, with a negative
-> control (§2). The topology blocker this project carried since day one —
-> "can a KV backend even be a shared, cross-node tier" — is closed. What
-> remains broken is isolated to exactly one thing: LMCache's
-> `nixl_store_l2_adapter.py` L2 tier never retrieves anything a live vLLM
-> engine stored, because of a per-daemon random object-naming scheme (§2).
-> The P→D direct-transfer leg is proven working, independently of the
-> storage tier, against the model actually running today (§2).
+> **Headline, 2026-09-18: the storage tier now serves a genuine cross-node
+> L2 hit.** A replacement L2 adapter — **`nixl_kv`**, this repo's own,
+> content-addressed — is written, unit-tested (44/44), registered inside
+> the live daemon on both nodes, **proven cross-node byte-exact at the
+> naming layer** (8/8 including three negative controls, §2), and now
+> **proven at the engine level**: rung `60` step 5 — a genuinely cold
+> decode node, writer's vLLM and daemon killed and removed, served content
+> only prefill had ever computed — **PASSES**: `l2_device_hits=4`,
+> `l2_index_hits=0`, `l2_probe_errors=0`, `l2_load_aborts=0`, and TOKEN
+> IDENTITY matched the recompute baseline. 9 of 11 checks passed; the other
+> 2 are step 7's negative control, which is **VOID BY CONSTRUCTION** (this
+> run used `--no-drain`), not a fix failure.
+>
+> **The root cause (TODO 6.34) is FIXED and independently verified by
+> direct device inspection.** It was an OBJ descriptor aliasing bug in the
+> adapter's own store path: `register_obj_names()` built every OBJ
+> descriptor at `addr=0`, distinguished only by `devId` restarting at the
+> call's list position, so the live PAGE registration (`devId` 0..36863)
+> and the COMMIT registration (`devId` 0..3) were indistinguishable for
+> `devId` 0..3, and commit writes were submitted under the **page's**
+> device key instead of their own. **Fix:** `devId` is now allocated from a
+> daemon-global monotonic counter (disjoint by construction, across both
+> within-call and cross-task overlap), and the page dlist is deregistered
+> immediately after the page write is durable, before the commit
+> registration is created. Both consequences are confirmed gone by reading
+> the device directly: the commit object now exists (`<key>!c` HITs), and
+> page `~0` reads back as real bf16 KV bytes, not commit-record JSON.
+>
+> Two older framings are corrected here. TODO 6.21's root cause was
+> **incompletely stated** — per-daemon naming is the second of two
+> independent blockers, and the more fundamental one is that discovery is a
+> *missing operation*, not a wrong value (§2). And 6.21's "separate,
+> still-open question" about prefill-only `retrieve_ops=0` is **answered and
+> is not a bug** (§2). **What remains:** step 7's negative control needs a
+> namespace drain to validate, and the drain itself is blocked — the target
+> running `/dev/ng1n1`'s backing subsystem was not started by this repo's
+> scripts, and replacing or reconfiguring it risks the DSC/DPU peering
+> (§2, §3.3). TODO 6.15 (cross-instance reuse measurement) and 1.13
+> (benchmark rework) are the natural next items now that the tier works.
 
 ---
 
@@ -116,7 +146,8 @@ entirely on the separately-launched MP daemon**, via a repeatable
 `--l2-adapter '<JSON>'` flag:
 
 ```
-{"type":"nixl_store","backend":"XNVME_KV","backend_params":{"dev_uri":"..."},"pool_size":2000000}
+{"type":"nixl_store","backend":"XNVME_KV","backend_params":{"dev_uri":"..."}
+,"pool_size":2000000}
 ```
 
 `scripts/common/start-lmcache-daemon.sh` builds and validates this spec
@@ -141,8 +172,70 @@ calculation and should not be "fixed" toward one.
 
 ## 2. Current state
 
-Measured directly on `smc1`/`smc2`/`smc3`, 2026-09-17. This section states
+Measured directly on `smc1`/`smc2`/`smc3`, 2026-09-17/18. This section states
 what is true **now** — for how we got here, see §7.
+
+### 2.0 TODO 6.21, restated correctly — there were always TWO blockers
+
+This supersedes the previous framing, which named only the second one and
+was repeatedly read as a general impossibility claim.
+
+**Blocker 1 — discovery is a MISSING VERB (the fundamental one).**
+`NixlStoreL2Adapter._execute_lookup_in_the_loop()` consults **only** the
+in-process `_memory_objects` dict. A daemon never asks the shared medium
+about a key it did not itself store, so every cross-daemon lookup misses
+*before naming is ever consulted*. You cannot patch a name into existence.
+This is why restoring the plugin's `queryMem()` override was correct and
+**changed nothing**: the verb existed at the plugin layer and the adapter
+above it still never called it.
+
+**Blocker 2 — names are pool slots, not content.**
+`init_storage_handlers_object()` pre-registers `pool_size` names as
+`obj_{i}_{uuid4().hex[:4]}` at startup; the function never sees a content
+key.
+
+Neither fix alone changes the outcome. `start-lmcache-daemon.sh`'s claim
+that "no amount of index-keeping, existence-probing or plugin work can
+bridge that" is true **only of the current naming**, not in general.
+
+**The "separate, still-open question" is answered and is NOT a bug.**
+Prefill-only `retrieve_ops=0` has a benign cause: L1 never evicts, so L2 is
+never read back. Measured directly in the daemon log —
+`Prefetch request completed (L1+L2): 4/4 retained keys (4 L1, 0 L2)`.
+**Consequence for anyone measuring:** a *correct* implementation will also
+show `retrieve_ops≈0` on a warm same-daemon path. Only a cold reader proves
+anything.
+
+### 2.1 What runs is the IMAGE PLUS THREE OVERLAYS — not the image
+
+Verified 2026-09-17: `rocm-aic:mp-pd-ionic2609` is **vanilla** (every layer
+is `docker build`/buildkit, no `docker commit`; a **fresh container with no
+mounts** shows the same patch state as a running one). But
+`scripts/common/container.sh` bind-mounts three files over it at run time,
+and two of them are load-bearing:
+
+| Overlay | Why it matters |
+|---|---|
+| `libplugin_XNVME_KV.so` (repo-built) | **The image's own plugin has NO `nixlXnvmeKvEngine::queryMem` override** — 1 weak base-class symbol vs. our 2. Existence probing, and therefore all L2 discovery, exists *only* because of this mount. |
+| `lmcache_mp_connector.py` (patch `0011`) | Verified **absent** from the image. See §2.2. |
+| `nixl_utils.py` | Image ships a ROCm-patched `nixl` and no `rixl`; upstream's hardcoded platform test rejects a working install. |
+| `nixl_kv_l2_adapter.py` (new) | This repo's L2 adapter, dropped into the package dir; `pkgutil` auto-discovers it — **zero vendor files edited**. |
+
+### 2.2 Patch `0011` was NEVER in the image, and its check gave a false pass
+
+Measured 2026-09-17: line 1141 of the image's `lmcache_mp_connector.py`
+reads the unpatched `condition = tracker.needs_retrieve()`. Its sibling
+`0010` is absent too. The old re-verification recipe grepped
+`num_external_tokens`, which matches the **unpatched function signature and
+docstring**, so it passed either way — and `patches/lmcache/README.md`
+asserted a result it had never actually measured.
+
+This matters because this cluster runs
+`MultiConnector[NixlConnector, LMCacheMPConnector]`, exactly the composition
+`0011` guards: a non-chosen sub-connector creates a retrieve that must not
+happen and **leaks lookup locks**. It is now applied by
+`container.sh lmcache-patch` (derived from the image, five self-invalidation
+guards, all exercised).
 
 ### What works
 
@@ -170,6 +263,49 @@ what is true **now** — for how we got here, see §7.
   | `smc1` write → `smc2` read, production geometry | 196,608 B | 6 × 32768 | `RESULT:OK` |
   | negative control: never-written nonce | — | — | `RESULT:QUERY_MISS`, non-zero exit |
 
+- **The `nixl_kv` adapter's naming scheme is PROVEN cross-node, byte-exact,
+  both directions** — `scripts/verify/35-verify-nixl-kv-smoke.sh`, **8/8**,
+  exercising the real grammar (`{ns}@{key}~{ordinal}` pages plus a
+  `{ns}@{key}!c` commit object) with **three negative controls**: probe
+  before write MISSes, an unwritten nonce MISSes, and a foreign namespace
+  MISSes. Page content is per-ordinal, so a collapsed tile ordinal would
+  fail loudly rather than silently. A page-count disagreement is rejected by
+  the commit record (`COMMIT_INVALID`), never reassembled.
+  **Coverage gap, found 2026-09-18, closed 2026-09-18 (TODO 6.29/6.34):**
+  this rung writes its commit object through the raw NIXL agent path
+  (`register_memory` + `initialize_xfer`), one name at a time, not the
+  adapter's own commit-write path (`register_host_buffer` +
+  `register_obj_names` + `make_transfer`) — it validates the naming
+  SCHEME, and structurally still cannot hold two overlapping OBJ
+  registrations, so it never exercised (and still doesn't exercise) the
+  aliasing mechanism TODO 6.34 found. The gap is closed by six new offline
+  tests in `test_nixl_kv_naming.py` (44/44) that construct that overlap
+  directly — those tests, not this rung, are the regression guard for that
+  bug class.
+- **`nixl_kv` registers and initialises inside the live MP daemon on both
+  nodes** — `container.sh adapter-check`, plus its counters exposed at
+  the daemon's `http://127.0.0.1:8080/status`. Both nodes independently
+  derive the same geometry fingerprint `ns=d9dbd20693b2`. **All ten
+  counters — five outcome, five attempt — have now been observed on
+  hardware, both pre- and post-fix** (TODO 6.28/6.34): pre-fix,
+  `l2_lookup_calls=1`, `l2_lookup_executions=1`, `l2_keys_probed=4`,
+  `l2_probe_misses=4`, `l2_device_hits=0`, proving lookup ran end to end
+  and the device genuinely said absent; post-fix, the same sequence
+  returns `l2_device_hits=4`, `l2_probe_misses=0` — see below.
+- **The engine-level acceptance run (rung `60`) step 5 PASSES — a genuine
+  cross-node L2 hit, on a cold reader.** A decode node with its container
+  recreated (counters confirmed at zero) asked, with prefill's vLLM **and**
+  daemon killed and removed (port confirmed unreachable), for a prompt
+  only prefill had ever computed: `l2_device_hits=4`, `l2_index_hits=0`,
+  `l2_probe_errors=0`, `l2_load_aborts=0`, and TOKEN IDENTITY matched the
+  recompute baseline. Negative control A (unseen nonce) passed: no new
+  device hits (4 → 4). 9 of 11 checks passed overall; the 2 failures are
+  both step 7's negative control, VOID BY CONSTRUCTION because this run
+  used `--no-drain` (see below, and TODO 6.34) — not a partial failure.
+  Soundness: the run used a per-run nonce (`acc-<epoch>-<pid>`), so its
+  chunk hashes and ObjectKeys are unique to it and no prior run's object
+  could have satisfied it; negative control A independently confirms
+  unseen content misses.
 - **The KV namespace is confirmed SHARED across `smc1` and `smc2`**:
   `nvme ns-descs /dev/ng1n1` returns `csi: 0x1` and `eui64
   e46cfefeffcdae01`, **identical on both nodes**. The host is **not** the
@@ -181,8 +317,21 @@ what is true **now** — for how we got here, see §7.
 
 ### What does not work
 
-- **LMCache's L2 tier never retrieves anything a live vLLM engine
-  stored.** Measured on both roles: the live engines together store
+- **Rung `60` step 7's negative control is unvalidated, and validating it
+  is blocked.** This session's acceptance run used `--no-drain` (§3.2.2/6.18
+  forbid draining the shared target unilaterally), so step 2's commit
+  object was legitimately still on the device and step 7's "a drained
+  namespace yields no device hit" control cannot hold under that
+  condition — the script itself flags it as VOID, and it is not evidence
+  against the fix (soundness for *this* run instead rests on the per-run
+  nonce plus negative control A, both of which passed — see above).
+  Validating it for real needs a namespace drain, and the drain is itself
+  blocked: `scripts/target/50-reset-namespace.sh` refuses to run because
+  the live `nvmf_tgt` backing `/dev/ng1n1` was not started by this repo's
+  scripts (TODO 6.34's operational note, §3.3). This is the one open item
+  the fix itself did not close.
+- **The OLD adapter (`nixl_store`) never retrieves anything a live vLLM
+  engine stored.** Measured on both roles: the live engines together store
   **36,864 objects** into the (now-proven-working) namespace and retrieve
   **zero** of them (`retrieve_ops=0` on both, `store=36,864`).
   **Cause, isolated beyond argument**: `nixl_store_l2_adapter.py` names
@@ -199,11 +348,10 @@ what is true **now** — for how we got here, see §7.
   Cross-node KV movement on this stack happens over the P→D `NixlConnector`
   handoff (above), which is the only mechanism this architecture has for
   it; the storage tier is a reuse tier, not a substitute transport.
-- A separate, still-open question: `retrieve_ops=0` on **prefill by
-  itself** (same-daemon L1-eviction miss should force an L2 read-back, and
-  that needs no cross-daemon key agreement at all) is not explained by the
-  key-mismatch cause above and has not been investigated on its own (TODO
-  6.21's open half).
+  (The old "separate, still-open question" about prefill-only
+  `retrieve_ops=0` that used to sit here is **answered and is not a bug** —
+  L1 never evicts, so L2 is never read back. It is stated once, in §2.0;
+  do not restore it here as open.)
 
 ### Measured hardware facts to carry forward
 
@@ -248,15 +396,38 @@ what is true **now** — for how we got here, see §7.
   ends up on management, decode on fabric) and nothing has broken because
   of it yet, but resolve it to one class before trusting it under a
   topology change.
+- **What runs is the image PLUS three read-only bind-mount overlays, not
+  the image alone.** `scripts/common/container.sh` mounts: the repo-built
+  `libplugin_XNVME_KV.so` (**the image's own copy has no
+  `nixlXnvmeKvEngine::queryMem` override** — existence probes, and therefore
+  any L2 discovery, exist only because of this mount), a patched vLLM
+  `nixl_utils.py` (the image ships a ROCm-patched `nixl` and no `rixl`, so
+  upstream's hardcoded platform test rejects a working install), and a
+  patched LMCache `lmcache_mp_connector.py` (patch `0011`, see below). The
+  image itself is **vanilla** — verified 2026-09-17 by `docker history`
+  (every layer is `docker build`/buildkit, no `docker commit`) and by
+  re-running the patch check in a **fresh container with no mounts**.
 - **LMCache in the vendor image is patched at build time, not by
-  anything in this repo.** `patches/lmcache/` holds `0006`–`0009`, `0011`,
-  extracted from a sibling build repo and verified applied in the running
-  image. `0006` widens the NIXL-backend allowlist to include
+  anything in this repo.** `0006`–`0009` were extracted from a sibling
+  build repo, verified applied in the running image, and (policy change,
+  2026-09-17) their `.patch` files were then **deleted** from
+  `patches/lmcache/` — if the image ships it, this repo no longer carries
+  the diff. `0006` widens the NIXL-backend allowlist to include
   `XNVME_KV`/`SPDK_NVMe_KV`; `0007` is the **origin** of `mem_split_n`/
   `_resolve_mem_split()` and the `#{j}` multipart-suffix scheme — this is
-  not upstream LMCache. **Do not repeat the retracted claim that the
+  not upstream LMCache. `patches/lmcache/` now carries exactly one diff,
+  `0011`, precisely because it is verified **absent** from the image and
+  this cluster's `MultiConnector[NixlConnector, LMCacheMPConnector]`
+  composition needs its guard. It is applied at run time by
+  `scripts/common/container.sh lmcache-patch`, which derives the override
+  from the image's own copy and bind-mounts it read-only — the same
+  mechanism already used for vLLM's `nixl_utils.py` and the repo-built
+  `libplugin_XNVME_KV.so`. **The running stack is therefore image + three
+  overlays, not the image alone** (§2). **Do not repeat the retracted claim that the
   vendor image accepts these backends unpatched** (§7.8) — it does not;
-  it ships prebuilt with the patches already in place.
+  it ships prebuilt with `0006`–`0009` already in place. See
+  `patches/lmcache/README.md` for the per-patch table, checksums, and
+  re-verification recipe.
 
 ---
 
@@ -311,11 +482,13 @@ whatever you were actually testing rather than as itself.
 
 **Step 0 — bring up the one stack, on both nodes.** There is no
 "compute-first, storage-tier later" sequence — the MP daemon and its
-`nixl_store` L2 adapter are what "starting this stack" means now:
+`nixl_kv` L2 adapter are what "starting this stack" means now
+(`nixl_store` is kept byte-identical only as the A/B control, TODO 6.21):
 
 ```
 scripts/common/start-lmcache-daemon.sh     # on smc1 AND smc2 — idempotent
-scripts/prefill/03-start-prefill.sh        # on smc1 — starts the daemon itself first if needed
+scripts/prefill/03-start-prefill.sh        # on smc1 — starts the daemon
+itself first if needed
 scripts/decode/03-start-decode.sh          # on smc2 — same
 scripts/proxy/start-proxy.sh               # fronting both
 ```
@@ -328,17 +501,47 @@ the storage tier: a healthy daemon and a working `--l2-adapter` spec are
 required for vLLM to start at all now, but starting is not the same as
 the tier serving a hit.
 
-**To prove the storage tier itself is live**, look for a real LMCache hit
-served from the KV backend — non-zero `External prefix cache hit rate`
-**cross-instance or post-eviction** (§4 invariant 6's trap — same-instance
-repeats are served by vLLM's own prefix cache and prove nothing), via
-`scripts/verify/30-verify-kv-roundtrip.sh` or a request engineered to miss
-vLLM's own prefix cache first. **As of this handoff, no live vLLM-driven
-LMCache hit has been observed on real hardware** — the storage-tier
-plumbing below LMCache is proven (§2), the P→D leg is proven (§2), but
-LMCache's own retrieve path is the known-broken link between them (§2,
-TODO 6.21). Fixing `nixl_store_l2_adapter.py`'s key-naming scheme is the
-one live item blocking an actual end-to-end storage-tier hit.
+**Step 1 — TODO 6.34 is fixed and verified; pick up the drain decision,
+then 6.15/1.13.** The blocker rung `60` step 5 diagnosed is cleared:
+`register_obj_names()` now allocates `devId` from a daemon-global
+monotonic counter and the page dlist is deregistered before the commit
+registration is created, so the page and commit OBJ registrations can no
+longer alias. Rung `60` step 5 **PASSES** on the fix — a genuinely cold
+decode node served content only prefill had computed
+(`l2_device_hits=4`, token identity matched) — and both consequences of
+the old bug (missing commit object, page-0 corruption) are independently
+confirmed gone by direct device inspection. Do **not** re-run rung `60`'s
+step 5 expecting new information from it — this is closed.
+
+**What's next, in order:**
+
+1. **Decide how to drain the namespace**, so rung `60` step 7's negative
+   control (currently VOID BY CONSTRUCTION under `--no-drain`) can be
+   validated for real. `50-reset-namespace.sh` refuses to run because the
+   live `nvmf_tgt` backing `/dev/ng1n1` was not started by this repo's
+   scripts (TODO 6.34's operational note) — draining means either
+   replacing that target with this repo's own (`03-start-kv-target.sh`) or
+   an RPC-level bdev recreate against the one already running, and both
+   risk the DSC/DPU peering that currently makes `/dev/ng1n1` work (DSC
+   recovery is non-deterministic and slow, TODO 6.26). This decision, not
+   more adapter work, is what's blocking step 7.
+2. **TODO 6.15** — cross-instance reuse measurement, now that the composed
+   path genuinely serves a hit — and **TODO 1.13** (benchmark rework), so
+   6.15's number means something. Both are natural next work now that the
+   tier works, not blocked on the adapter anymore.
+
+**Ordering, and why it matters, for the record:** the ladder ran bottom-up
+this session and stopped correctly at the first red, before the fix
+landed. `20` (plugin) → `30` (device/namespace roundtrip) → `35`
+(**nixl_kv naming, cross-node** — green, 8/8) → `50` (P→D direct) → `60`
+(**L2 cross-node acceptance** — 10/11 pre-fix, the one red assertion
+diagnosed as TODO 6.34; 9/11 post-fix, the remaining 2 being step 7's void
+control). `35` green and `60` red correctly pointed at the LMCache→adapter
+seam per this section's own logic — the counters then narrowed that seam
+to the STORE side, not the LOOKUP side originally suspected. **`35`'s 8/8
+covered the naming SCHEME only, not the adapter's own commit-write
+MECHANISM** — the gap is now closed by offline regression tests, not by
+`35` itself (see §2's rung-35 entry).
 
 **Separately, and not blocking any of the above — RDMA acceptance.** This
 is a transport upgrade for the P→D path, independent work from the
@@ -555,7 +758,13 @@ Not hypothetical — each cost real time on this project.
 | `nixl_rocm._api.create_backend()` has no `return` statement. | It is always `None`, on success and on failure alike. Check `agent.backends[<name>]` instead of the return value. |
 | `ibv_rc_pingpong`'s `Mbit/s` figure is latency-bound loopback, not throughput. | It sends one message and waits for the reply, and (unless explicitly run cross-node with distinct GIDs) never leaves the host. Use `ib_write_bw`/`ib_send_bw`, cross-node, for a real number. |
 | A device's **advertised** ceiling (`value_max`, or any similar self-reported field) can understate real capability by a large factor. | Measured on this exact hardware: advertised 4096, real working ceiling 32768 — 8x. Measure the actual boundary (store increasing sizes until the device rejects one) before trusting a self-reported field, in either direction. |
+| `query_memory()` reports PRESENT as `{}` — an **empty, falsy dict** — and ABSENT as `None`. | Hit and miss are separable **by identity only**. Any code written `if resp[i]:` scores every hit as a miss and reproduces `retrieve_ops=0` with a brand-new root cause. Measured 2026-09-17; probe latency 57 µs/descriptor. |
+| `pkill -f lmcache.v1.multiprocess.http_server` does **not** kill the MP daemon. | Measured 2026-09-18: the daemon survived it (same pid before and after) while `pkill -f api_server` killed vLLM fine. A surviving daemon keeps **L1 and the in-process index warm**, which silently invalidates any cold-reader test. `container.sh down <role>` + `up <role>` (recreating the container) is the only reliable way to get a genuinely cold reader. |
+| `nuse` does **not** track KV writes on this device. | Stayed `0x0` after 256+ pages were written and read back successfully. It is not a capacity or progress signal — use the adapter's `l2_commit_writes`, or the plugin's `m_completions_ok`. Any check asserting "nuse grows" is asserting nothing. |
+| Counting only successes makes a failure undiagnosable. | The `nixl_kv` adapter counted `l2_device_hits`/`l2_probe_errors` but not *attempts*, so a zero reading could not distinguish "probed and missed" from "never probed" — precisely the state the 2026-09-18 acceptance run left open (TODO 6.28). Now instrumented: five attempt counters added. The sharper, transferable version of the lesson: the attempt must be counted at the *synchronous entry point*, not inside the async work — count it inside the coroutine instead and you reproduce the exact same ambiguity one layer down, because a call that never gets scheduled onto a wedged event loop never increments anything either way. |
+| A green low-level check can validate a SCHEME while never exercising the MECHANISM the production path actually uses. | Rung `35` writes its commit object through the raw NIXL agent path (`register_memory` + `initialize_xfer`); the adapter's own store path writes it through `register_host_buffer` + `register_obj_names` + `make_transfer` — a different call sequence entirely. `35` passed 8/8 while the adapter's real commit-write path was silently broken underneath it (TODO 6.34). Compare code paths, not just outcomes, before trusting a lower rung to cover a higher one. |
 | The NIXL Python API has several non-obvious shapes that are easy to get wrong silently. | `register_memory` takes `backends` as a **list**; OBJ transfer descriptors must come from `register_memory(...).trim()`, not a raw 4-tuple; `remote_agent` must be the agent's own name for a local storage transfer, not `""`; `nixl_agent_config(backends=[X])` auto-instantiates `X` with **default** params, so a later `create_backend(X, params)` fails "already created" and the real params silently never apply. |
+| Two live registrations that are indistinguishable by `(addr, len, devId)` will alias — and the symptom shows up at a DIFFERENT layer, with no error raised anywhere. | `NixlKvStorageAgent`'s page and commit OBJ registrations both use `addr=0`, `devId=`position; the page registration outlives the commit one, so the commit writes land under a page's device key instead of their own (TODO 6.34). The symptom is a missing object (the commit) plus a corrupted neighbour (the aliased page) — not an error on the commit write itself: zero adapter failures, zero exceptions, zero NIXL errors, and `l2_commit_writes` incremented 4 times for four writes that never created their object. A success counter that counts "the call returned" rather than "the effect happened" is not instrumentation. |
 
 ---
 
@@ -598,7 +807,8 @@ commit.
 ### 6.2 Repository map
 
 ```
-config/cluster.env          single source of truth; sources creds/active.env first
+config/cluster.env          single source of truth; sources creds/active.env
+first
 config/creds.env.template   tracked template for a per-setup creds file
 creds/                      UNTRACKED, gitignored — real addresses and passwords
 scripts/common/             lib.sh (shared vocabulary), init-creds, preflight,
@@ -609,17 +819,38 @@ scripts/target/             SPDK build + nvmf_tgt, verify, namespace reset,
                             chunk-ceiling guard
 scripts/prefill/             host prep, vLLM as kv_producer
 scripts/decode/               host prep, vLLM as kv_consumer
-scripts/proxy/                async disaggregation router (three-step XpYd handshake)
+scripts/proxy/                async disaggregation router (three-step XpYd
+handshake)
 scripts/verify/               10 network → 20 plugin → 30 KV roundtrip →
-                              40 end-to-end → 50 direct P/D transfer
+                              35 nixl_kv naming (cross-node, GREEN) →
+                              40 end-to-end → 50 direct P/D transfer →
+                              60 L2 cross-node acceptance (step 5 GREEN
+                              post-fix, TODO 6.34; step 7 void pending a
+                              namespace drain)
 scripts/bench/                llama-benchy harness + compare_runs.py
 patches/spdk/                 4 NVMe-KV patches (2 still required, see below)
-patches/lmcache/               patches baked into the vendor image at BUILD
-                              time, in a sibling build repo — not applied by
-                              anything in this repo; see
-                              patches/lmcache/README.md and §7.8
+patches/lmcache/               ONE diff (0011) carried here — verified NOT
+                              in the vendor image; we apply it ourselves by
+                              overlaying the file into the running
+                              container, and it needs to reach the next
+                              image build. 0006-0009 are baked into
+                              the image at BUILD time and, since
+                              2026-09-17, no longer carried as .patch
+                              files here; see patches/lmcache/README.md
+                              and §7.8
 plugins/                      vendored SPDK_NVMe_KV and XNVME_KV NIXL backends
-docs/                         ARCHITECTURE, BRINGUP, TROUBLESHOOTING, BENCHMARKING,
+overlays/lmcache/             THIS REPO's LMCache source, bind-mounted into
+                              the vendor container at run time (container.sh):
+                              nixl_kv_l2_adapter.py (the content-addressed L2
+                              adapter, TODO 6.21/6.28) + its offline tests.
+                              Distinct from plugins/ (vendored C++) and
+                              patches/ (diffs) — this is source we author.
+docs/design/                  nixl-kv-l2-adapter.md — the adapter's spec:
+                              problem statement, measured facts, protocol,
+                              init asserts, acceptance test, and §11's record
+                              of decisions taken where the spec was silent
+docs/                         ARCHITECTURE, BRINGUP, TROUBLESHOOTING,
+BENCHMARKING,
                               TODO, HANDOFF
 ```
 
@@ -783,13 +1014,41 @@ installed source" that the vendor image needed no patch at all — and
 staged `git rm -r patches/lmcache/` on that premise. That delete was
 caught and reverted before it reached a commit. **The image ships
 pre-patched**, built from a sibling repo's `patches/lmcache/`
-(`0006`–`0009`, `0011`) applied at image-build time — a conventional
+(`0006`–`0009`) applied at image-build time — a conventional
 `.patch` diff simply doesn't leave a marker string the way an in-repo
-generator's own edits would have. **Lesson:** "no marker of our tooling
-having run" is not evidence of "no patch" when a different toolchain could
-have produced the same file. `patches/lmcache/0007` is also worth knowing
-by name: it is the **origin** of the `mem_split_n`/`#{j}` multipart-split
-scheme the storage tier depends on — not upstream LMCache behavior.
+generator's own edits would have. (This section originally listed `0011`
+in that set too. **That was wrong** — `0011` was never applied to this
+image; it was assumed present because the re-verification recipe of the
+day gave a false pass on it. Corrected below.) **Lesson:** "no marker of
+our tooling having run" is not evidence of "no patch" when a different
+toolchain could have produced the same file. `patches/lmcache/0007` is also
+worth knowing by name: it is the **origin** of the `mem_split_n`/`#{j}`
+multipart-split scheme the storage tier depends on — not upstream LMCache
+behavior.
+
+**2026-09-17, later the same day — a related but opposite deletion, this
+time correct.** `patches/lmcache/0006`, `0007`, `0008`, `0009` were
+re-measured against `rocm-aic:mp-pd-ionic2609` with a rewritten recipe (the
+old one gave a false pass — see the end of this entry) and confirmed
+present in the image. On that basis their `.patch` files were deleted from
+this repo under a new policy: **if the vendor image ships it, this repo
+does not carry the diff; the image is the source of truth, and
+`patches/lmcache/README.md` is the record of what that truth must
+contain.** Do not confuse this with the delete above. The delete above was
+staged while *wrongly believing the image was unpatched* — deleting the
+record would have destroyed the only account of a dependency nothing else
+documents, with no image-side guarantee to fall back on. Today's deletion
+is the opposite: the image is **measured patched**, every entry stays in
+the README's table with a working, re-run-able check, and the one patch
+the image was measured to *lack* — `0011`, guarding
+`LMCacheMPConnector.update_state_after_alloc()` against a non-chosen
+`MultiConnector` sub-connector's spurious retrieve/lock-leak — is the one
+still carried as a `.patch` file here. The same investigation also found
+the *previous* re-verification recipe gave a false pass on `0011` (it
+grepped `num_external_tokens`, which matches that function's unpatched
+signature and docstring too); the recipe in `patches/lmcache/README.md` is
+rewritten so every check greps a string that exists only in the patched
+form.
 
 ### 7.9 A kernel-dependent fact was read as a flat contradiction
 
@@ -861,3 +1120,47 @@ oversized per-worker `LMCACHE_MAX_LOCAL_CPU_SIZE`, invariant 9); most are
 not. Check `uptime` before starting anything that takes minutes (§3.2).
 
 </content>
+
+### 7.14 A root cause stated as one thing when it was two
+
+2026-09-18: TODO 6.21's cause was recorded as LMCache's per-daemon
+`obj_{i}_{uuid4}` naming, "isolated beyond argument". That was true but
+**incomplete**, and the incompleteness mattered: the adapter also has no
+way to ASK the shared medium about a key it did not store
+(§2.0, Blocker 1). Reading source rather than re-deriving from the
+conclusion is what surfaced it. The tell was already in the record and had
+been misread as a dead end: restoring the plugin's `queryMem()` override
+changed nothing — because the verb existed one layer down and the layer
+above never called it. **Lesson:** "isolated beyond argument" is a claim
+about how hard you looked, not about the system. When a fix that should
+have helped changes nothing, that is evidence of a SECOND cause, not
+evidence the first one was wrong.
+
+### 7.15 A verification recipe that could not fail
+
+2026-09-18: `patches/lmcache/README.md` claimed all five LMCache patches
+were verified present in the vendor image. Its check for `0011` grepped
+`num_external_tokens` and expected hits at two line numbers — which are the
+**function signature and its docstring**, present in the unpatched file. The
+check passed whether or not the patch was applied, and `0011` had in fact
+never been in the image at all. Every check in that recipe now greps a
+string that exists only in the patched form, and each was tested against a
+deliberately-mutated input to prove it can report MISS. **Lesson:** a
+verification recipe is code. "It printed what I expected" is not the same as
+"it could have printed otherwise" — this is §7.6's instrument lesson applied
+to documentation, and it is why the 2026-09-17 deletion of `0006`–`0009`
+was only safe *after* the recipe was rebuilt.
+
+### 7.16 Deleting the record vs. deleting a redundant copy
+
+2026-09-17 (a): a pass concluded from "no marker of our edits in the
+installed source" that the image needed no patches, and staged
+`git rm -r patches/lmcache/` — reverted before commit (§7.8).
+2026-09-17 (b): `0006`–`0009` were deleted **deliberately and correctly**,
+after being measured present in a fresh container with no mounts, with each
+entry keeping a working check in the README and the one patch the image
+*lacks* (`0011`) still carried. These look like the same action and are
+opposites. The distinguishing question is not "is this redundant?" but
+**"if this claim were false, what would tell me?"** In (a) nothing would
+have; in (b) the recipe does. Record sha256s of anything deleted so a copy
+recovered from git history can be identity-checked.

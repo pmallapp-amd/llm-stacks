@@ -338,14 +338,17 @@ patches/spdk/
 
 patches/lmcache/
   README.md                  Per-patch table + a copy-pasteable docker-run re-verification
-                             recipe for the 5 LMCache patches (see below) — corrects a
-                             2026-09-17 error that claimed these were unnecessary.
-  0006/0007/0008-*.patch /
-  0009-lmcache-fused-kv-plane-count.patch /
+                             recipe for the 5 LMCache patches this stack depends on (see
+                             below) — records the 2026-09-17 policy change (0006-0009
+                             deleted, verified present in the image; 0011 kept, verified
+                             absent) and corrects an earlier false-pass in that recipe.
   0011-lmcache-guard-mp-connector-num-external-tokens.patch
-                             Already baked into rocm-aic:mp-pd-ionic2609 at image-build time,
-                             in a sibling build repo — NOT applied by anything in this repo.
-                             Tracked here for provenance and re-verification only.
+                             The one LMCache diff still carried here: verified NOT in
+                             rocm-aic:mp-pd-ionic2609, so it must be applied in the sibling
+                             build repo ourselves. 0006-0009 were deleted 2026-09-17 after
+                             being verified present in that image already — see
+                             patches/lmcache/README.md for the per-patch table, checksums,
+                             and re-verification recipe covering all 5.
 
 plugins/
   nvme-kv/                    SPDK_NVMe_KV NIXL plugin — NVMe-oF/TCP to the SMC3 target via
@@ -409,9 +412,12 @@ sudo scripts/common/10-build-stack.sh
 scripts/common/20-build-vllm-lmcache.sh
 # No LMCache backend-allowlist patch step to run here — the vendor
 # container image this lab actually runs was BUILT with the allowlist
-# already patched in (patches/lmcache/0006-0009/0011; see
-# patches/lmcache/README.md — corrects a 2026-09-17 error that claimed
-# no patch was needed at all). The old from-source generator this repo
+# already patched in (patches/lmcache/0006-0009; verified present in the
+# image and no longer carried as .patch files here — see
+# patches/lmcache/README.md, which also corrects a 2026-09-17 error that
+# claimed no patch was needed at all). 0011 is the one LMCache patch this
+# image is still missing and this repo still carries; it must be applied
+# in the sibling build repo. The old from-source generator this repo
 # used to run here is withdrawn (dead code on the from-source path,
 # docs/HANDOFF.md §20) and survives only in git history; if
 # 25-validate-lmcache-config.sh below ever reports a backend REJECTED,
@@ -570,12 +576,17 @@ negative result.
    [TODO.md §4.4](docs/TODO.md#4-open-items-and-known-limitations).
 2. **The LMCache allowlist patches this repo depends on are applied in a
    sibling build repo, not here — this repo has no CI signal if a future
-   image build drops one.** `patches/lmcache/0006`-`0009`/`0011` are baked
-   into `rocm-aic:mp-pd-ionic2609` at image-build time; this repo only
-   tracks the `.patch` files for provenance and re-verification (a manual
-   `docker run` recipe, not an automated check) — see
-   `patches/lmcache/README.md`. (An earlier version of this item described
-   a since-withdrawn from-source generator that applied a patch at deploy
+   image build drops one.** `patches/lmcache/0006`-`0009` are baked into
+   `rocm-aic:mp-pd-ionic2609` at image-build time; as of 2026-09-17 this
+   repo no longer carries their `.patch` files (deleted after verifying
+   they're in the image — the image is the source of truth, this repo's
+   README is the record of what that truth must contain) and tracks only
+   `0011`, which is verified **absent** from the image and so is still
+   carried and still needs applying in the sibling build repo. See
+   `patches/lmcache/README.md` for the per-patch table, checksums, and the
+   re-verification recipe (a manual `docker run` recipe, not an automated
+   check) covering all 5. (An earlier version of this item described a
+   since-withdrawn from-source generator that applied a patch at deploy
    time rather than build time; that mechanism is gone along with the
    from-source path it targeted, and this item now names the actual gap on
    the path this repo runs.)
