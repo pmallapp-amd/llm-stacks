@@ -33,12 +33,54 @@ replaces.** Recount from the IDs when you add one.
 cluster state as handed over and the ordered resume plan. This file is the
 task index.
 
-**Before anything:** `uptime` on both compute nodes (6.20), confirm who owns
-`smc3` right now (6.18), `modprobe amdgpu` (0.4 — needed every boot; it was
-NOT loaded at the start of the 2026-09-18 session), and the LMCache MP daemon
-must be up before `start-vllm.sh` will proceed (HANDOFF §1.1, §3.4).
+## 🔴 Current blocker: both DSCs are down (2026-09-18 late)
 
-**The storage tier now serves a cross-node hit — read 6.34.** 6.34's root
+`/dev/ng1n1` is absent on **smc1 and smc2 both**. Hosts are up (7 h, no
+reboot), cards are alive (`setpci -s 36:00.0 00.L` → `10051dd8`), but the
+host-side rebind fails on each at ~128 s with
+`Device not ready; aborting initialisation, CSTS=0x0`. **Per 6.22 only a
+DPU-side restart clears this and host-side resets make it worse — this
+needs the hardware owner, not another rebind loop.** Nothing in the storage
+tier will start until it clears. Second session to end this way, both after
+sustained write load; raise that pattern too. See HANDOFF's STOP block.
+
+Until it clears, the useful work is offline: the 44 adapter unit tests
+(`python3 overlays/lmcache/test_nixl_kv_naming.py`), docs, and the open
+questions in 6.36/6.40 (what backs the shared namespace) and 6.40's
+delete/teardown question.
+
+**Before anything, once the devices are back:** `uptime` on both compute
+nodes (6.20), confirm who owns `smc3` right now (6.18), `modprobe amdgpu`
+(0.4 — needed every boot), confirm `/dev/ng1n1` exists on both, and note
+the LMCache MP daemon must be up before `start-vllm.sh` will proceed
+(HANDOFF §1.1, §3.4). [BRINGUP.md](BRINGUP.md) §1 is this checklist in
+command-and-expected-output form.
+
+**Three results from the 2026-09-18 late session, and two are negative:**
+
+- **RDMA RoCEv2 for P→D is not achievable** (3.9). The container had no
+  `/dev/infiniband` at all (fixed), and with it mapped UCX still offers
+  **zero `rc_verbs`** pairs on ionic — only `ud_verbs`, which fails QP
+  creation on all 8 devices. 3.9's proposed "name RC explicitly" fix has no
+  target. Driver/provider matter for AMD.
+- **KV data does not reach smc3** (6.36, 6.40). `/dev/ng1n1` is a local
+  Pensando PCIe function; smc3 has served zero I/O, advertises
+  `num_blocks=UINT64_MAX`, and is bounded only by its 62 GiB RAM. The
+  re-export model is retracted. **Open: what actually backs the shared
+  medium.**
+- **The 1 GiB namespace limit was never real** (6.39). It was `nsze × 512`
+  arithmetic on a `csi 0x1` namespace with no LBAs; ~1.16 GiB was written
+  with zero errors. The DSC's real ceiling is unmeasured.
+
+**Proven and working while the hardware is up:** the full L1 → L2 → device
+eviction chain with every level's counters reconciling exactly, a live
+cross-node L2 hit, and MP-over-ZMQ confirmed (6.37). Benchmarking is
+answerable at the KV-block layer via `lmcache bench l2` (6.35) and at the
+engine layer via llama-benchy, both of which needed defects fixed before
+they would run at all (6.35, 6.38).
+
+**Earlier in the same session — the storage tier serves a cross-node hit
+— read 6.34.** 6.34's root
 cause (the page and commit OBJ registrations were indistinguishable by
 `(addr, len, devId)` and aliased, so every commit write landed on a *page*
 key) is **fixed and verified**: `devId` is now allocated from a

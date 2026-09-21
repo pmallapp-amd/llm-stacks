@@ -1,7 +1,7 @@
 # Handoff
 
 State of the P/D-disaggregated KV cache project, for whoever picks this up
-next (including future me). Last updated 2026-09-18.
+next (including future me). Last updated 2026-09-18 (late session).
 
 Read this before [BRINGUP.md](BRINGUP.md). It tells you what is real, what is
 assumed, and what is still wrong.
@@ -11,8 +11,86 @@ assumed, and what is still wrong.
 > and what to do in what order. §§1–2 are background; §7 is the corrections
 > record — read it when you need the *why*, not to get started.
 >
-> **Headline, 2026-09-18: the storage tier now serves a genuine cross-node
-> L2 hit.** A replacement L2 adapter — **`nixl_kv`**, this repo's own,
+> ## 🔴 STOP — read this before planning anything
+>
+> **Both compute nodes' KV devices are DOWN.** `/dev/ng1n1` is absent on
+> **smc1 and smc2 both**, as of the end of the 2026-09-18 late session.
+> The hosts are fine (7 h uptime, no reboot) and the cards are alive —
+> config space reads `10051dd8` on both — but the host-side rebind
+> (§3.4) was attempted on each and failed identically at ~128 s with
+> `Device not ready; aborting initialisation, CSTS=0x0`. The DPU-side
+> application is not serving.
+>
+> **Per TODO 6.22, only a DPU-side restart clears this, and host-side
+> resets make it worse.** Do not sit in a rebind loop. This needs the
+> hardware owner. **Nothing in the storage tier will start until it is
+> fixed** — `start-vllm.sh` hard-gates on `/dev/ng1n1` and will refuse
+> rather than silently serve from local cache.
+>
+> Worth raising with the owner at the same time: **this is the second
+> session to end with the DSC needing recovery, and both followed
+> sustained write load** (this one, ~1.16 GiB in a session plus a raw
+> xnvme probe). Sustained writes against this card are not free.
+>
+> ---
+>
+> **Everything below this line was true while the devices were up, and
+> should survive their recovery.**
+>
+> **Three results from the 2026-09-18 late session, two of them negative
+> and both of those load-bearing:**
+>
+> 1. **P→D over RDMA RoCEv2 is NOT achievable on this stack.** Not a
+>    tuning problem. Two layers were wrong: `container.sh` never mapped
+>    `/dev/infiniband`, so the container had **no RDMA access at all**
+>    while the host showed 8 uverbs devices (now fixed); and with the
+>    device visible, UCX offers **zero `rc_verbs` transport/device pairs**
+>    on ionic — `ucx_info -d -t rc_verbs` returns nothing and
+>    `UCX_TLS=rc_verbs` falls through to `tcp`. The only IB transport
+>    offered is `ud_verbs`, which fails QP creation on all 8 devices
+>    (`sge:6 inl:64 ... Invalid argument`), unaffected by SGE/inline
+>    tuning. TODO 3.9's proposed fix — "name RC explicitly" — **has no
+>    target**. This is a driver/provider matter for AMD. §7.17, TODO 3.9.
+> 2. **The KV data does NOT reach smc3.** `/dev/ng1n1` is
+>    `transport=pcie` at `0000:36:00.0`, subsystem
+>    `nqn.2019-08.com.pensando:...`, `mn=PDSNVME` — a **local Pensando DSC
+>    function**, not an NVMe-oF connection. smc3's bdev has served **zero
+>    I/O** over days of uptime, its listener is TCP-unreachable from
+>    compute, 7,986 of 8,192 hugepages are free, and `nvmf_tgt` RSS is
+>    flat. The re-export model this document used to carry is **retracted**.
+>    The medium is still genuinely shared between smc1 and smc2 (rungs
+>    30/35 prove byte-exact cross-node), so **what backs it is now an open
+>    question** — the matching `eui64` is weak evidence, equally consistent
+>    with fixed firmware identifiers. TODO 6.36, 6.40.
+> 3. **The "1 GiB namespace" limit was never real.** It came from reading
+>    NVM-command-set LBA fields (`nsze × 512`) on a `csi 0x1` namespace
+>    that has no LBAs. ~1.16 GiB was written through it in one session
+>    with zero errors. smc3 for its part advertises `num_blocks=UINT64_MAX`
+>    (16 EiB) and is bounded only by its 62 GiB of RAM. The DSC's real
+>    ceiling is **unmeasured**; treat ~1.16 GiB as a lower bound, not a
+>    limit. TODO 6.39, 6.40.
+>
+> **What is proven and working** (while the hardware is up): the full
+> eviction chain **L1 → L2 → device**, with every level's counters
+> reconciling exactly — 22 objects in a 1 GiB L1 at 77.3%, 103 groups
+> committed to L2, 248,859 device ops moving 972.1 MiB, and
+> `27 groups × 9,217 ops = 248,859`, `× 4096 = 972.1 MiB`. A genuine
+> cross-node L2 hit appeared under live traffic (`l2_device_hits=2`,
+> `l2_index_hits=0`). MP mode over ZMQ (`tcp://127.0.0.1:6557`) confirmed
+> from the daemon's listener and vLLM's own `--kv-transfer-config`. TODO
+> 6.37.
+>
+> **Benchmarking is now answerable at two layers** (§8): `lmcache bench l2`
+> for KV-block accounting, and llama-benchy for engine-level latency. Both
+> needed defects fixed before they would run at all. `nixlbench` is source
+> only. **[BRINGUP.md](BRINGUP.md) is now the benchmarking runbook** — it
+> carries the step-by-step, the sanity gates, and the problem/solution
+> table.
+>
+> ---
+>
+> **Earlier headline, 2026-09-18: the storage tier serves a genuine
+> cross-node L2 hit.** A replacement L2 adapter — **`nixl_kv`**, this repo's own,
 > content-addressed — is written, unit-tested (44/44), registered inside
 > the live daemon on both nodes, **proven cross-node byte-exact at the
 > naming layer** (8/8 including three negative controls, §2), and now
@@ -306,14 +384,25 @@ guards, all exercised).
   chunk hashes and ObjectKeys are unique to it and no prior run's object
   could have satisfied it; negative control A independently confirms
   unseen content misses.
-- **The KV namespace is confirmed SHARED across `smc1` and `smc2`**:
-  `nvme ns-descs /dev/ng1n1` returns `csi: 0x1` and `eui64
-  e46cfefeffcdae01`, **identical on both nodes**. The host is **not** the
-  NVMe-oF initiator here — the DSC is. Each compute node's own Pensando
-  DSC is itself an NVMe-oF initiator peered to `smc3`'s `nvmf_tgt`, and
-  transparently re-exports `smc3`'s namespace as a local PCIe function.
-  There is no "local, independent, unshareable" device here — `/dev/ng1n1`
-  on `smc1` and on `smc2` are the same backing store, one hop apart.
+- **The KV namespace is confirmed SHARED across `smc1` and `smc2`** —
+  rungs 30/35 store on one node and read back byte-exact on the other,
+  with negative controls. That result stands.
+
+  **What it is NOT, retracted 2026-09-18 (TODO 6.36, 6.40):** this entry
+  used to claim each DSC is an NVMe-oF initiator peered to `smc3`'s
+  `nvmf_tgt`, transparently re-exporting `smc3`'s namespace. **That is
+  false.** `/dev/ng1n1` is `transport=pcie` at `0000:36:00.0`, subsystem
+  `nqn.2019-08.com.pensando:nvm-subsystem-sn-8001-0-0`, `mn=PDSNVME` —
+  a local Pensando function, with no NVMe-oF connection from the host at
+  all. smc3 has served **zero I/O**, its listener is TCP-unreachable from
+  compute, and the two stores disagree about their own capacity by twelve
+  orders of magnitude (`num_blocks=UINT64_MAX` vs `NSZE=2,097,152`).
+
+  **So the medium is shared, but we do not know what backs it.** The
+  matching `eui64 e46cfefeffcdae01` is much weaker evidence than it was
+  read as — it is equally consistent with a fixed identifier in Pensando
+  firmware. **Open question for the hardware owner; do not re-derive it
+  from `eui64`.**
 
 ### What does not work
 
@@ -437,17 +526,22 @@ If you read nothing else in this document, read this section.
 
 ### 3.1 Cluster state as handed over
 
-Measured, not assumed, at the end of the 2026-09-17 session — re-measure
-before trusting any of it (§3.5):
+Measured, not assumed, at the end of the **2026-09-18 late** session —
+re-measure before trusting any of it (§3.5):
 
 | Node | State |
 |---|---|
-| `smc1` prefill | Rebooted during the session; GPUs and `/dev/ng1n1` require the per-boot ritual below before anything will start. |
-| `smc2` decode | Same. Has a documented history of reboot instability (§3.2). |
-| `smc3` target | Shared with another party. Confirm the subsystem `nqn.2024-01.io.nixl:kv0` / namespace this repo expects still exists before assuming it is available (§3.2). |
+| `smc1` prefill | **🔴 `/dev/ng1n1` ABSENT.** Host up 7 h, no reboot, GPUs fine. Card alive (`setpci -s 36:00.0 00.L` → `10051dd8`) but no nvme driver bound; rebind fails at ~128 s with `CSTS=0x0`. vLLM + daemon were running before the device dropped and are now broken. |
+| `smc2` decode | **🔴 `/dev/ng1n1` ABSENT.** Identical signature. It was healthy earlier in the same session and degraded without a reboot. |
+| `smc3` target | Shared, and **not ours** — the running `nvmf_tgt` serves `nqn.2016-06.io.spdk:cnode1` / `dev1_ns1`; our `nqn.2024-01.io.nixl:kv0` is absent. It has served **zero I/O** and is **not** where our KV data goes (§2, TODO 6.36). Do not restart it (§3.2.2). |
+
+**The blocker is the DSC, and it is not fixable from the host** — see the
+STOP block at the top. Everything else in this section is moot until
+`/dev/ng1n1` returns on at least one node.
 
 Nothing of this project's is left running deliberately at the end of a
-session — containers carry no `--restart` policy.
+session — containers carry no `--restart` policy. Note that the devices
+dropping is *not* an orderly teardown: prefill and decode were mid-session.
 
 ### 3.2 Check these things before touching anything
 
@@ -515,20 +609,41 @@ step 5 expecting new information from it — this is closed.
 
 **What's next, in order:**
 
-1. **Decide how to drain the namespace**, so rung `60` step 7's negative
-   control (currently VOID BY CONSTRUCTION under `--no-drain`) can be
-   validated for real. `50-reset-namespace.sh` refuses to run because the
-   live `nvmf_tgt` backing `/dev/ng1n1` was not started by this repo's
-   scripts (TODO 6.34's operational note) — draining means either
-   replacing that target with this repo's own (`03-start-kv-target.sh`) or
-   an RPC-level bdev recreate against the one already running, and both
-   risk the DSC/DPU peering that currently makes `/dev/ng1n1` work (DSC
-   recovery is non-deterministic and slow, TODO 6.26). This decision, not
-   more adapter work, is what's blocking step 7.
-2. **TODO 6.15** — cross-instance reuse measurement, now that the composed
-   path genuinely serves a hit — and **TODO 1.13** (benchmark rework), so
-   6.15's number means something. Both are natural next work now that the
-   tier works, not blocked on the adapter anymore.
+0. **🔴 GET THE DSCs BACK. Nothing below is actionable until this is
+   done, and it is not a host-side fix.** Both `/dev/ng1n1` devices are
+   gone; rebind fails at ~128 s with `CSTS=0x0` on both nodes. Raise with
+   the hardware owner, asking for a **DPU-side restart** (TODO 6.22 — host
+   resets make it worse). Raise the pattern at the same time: two sessions
+   have now ended this way, both after sustained write load. Until this
+   clears, useful work is limited to offline things — the 44 adapter unit
+   tests (`python3 overlays/lmcache/test_nixl_kv_naming.py`), doc work, and
+   reviewing the open questions below.
+1. **Answer: what actually backs the shared namespace?** 6.36/6.40 proved
+   it is *not* smc3 — three independent mechanisms (zero bdev I/O, 7,986
+   of 8,192 hugepages free, flat `nvmf_tgt` RSS) plus a twelve-order-of-
+   magnitude capacity disagreement (`UINT64_MAX` blocks vs
+   `NSZE=2,097,152`). But rungs 30/35 prove smc1 and smc2 genuinely share
+   a medium. **Ask the hardware owner** — do not infer it again from
+   `eui64`, which is equally consistent with a fixed firmware identifier.
+2. **Decide the delete/teardown story.** `libxnvme` exports
+   `xnvme_kvs_delete` and `xnvme_kvs_list`; the plugin implements
+   **neither** (every `delete` token in `xnvme_kv_backend.cpp` is the C++
+   operator). So "no delete primitive" is a statement about *our plugin*,
+   not established hardware fact. A list-and-filter teardown is the only
+   thing that could reclaim orphans (dead nonces, pre-fix corrupt
+   objects), which outnumber live objects. **Device support is
+   unverified** — probe it on a *healthy* device, with a store/exist
+   control in the same run so a wedged device cannot be misread as an
+   unsupported opcode.
+3. **TODO 6.15** — cross-instance reuse measurement — and **TODO 1.13**
+   (engine-level benchmark rework). Note 1.13 is now narrowed: KV-block
+   accounting is already answered by `lmcache bench l2` (§8), so do not
+   rebuild block-level measurement on llama-benchy.
+4. **Namespace drain remains undecided**, but it is *much* less urgent
+   than previously recorded: the 1 GiB pressure that motivated it was
+   retracted (6.39), and `50-reset-namespace.sh`'s refusal is now handled
+   by `51-reset-smc3-storage.sh` (inspect-only by default). Note that
+   resetting smc3 reclaims **nothing**, since our data never goes there.
 
 **Ordering, and why it matters, for the record:** the ladder ran bottom-up
 this session and stopped correctly at the first red, before the fix
@@ -1164,3 +1279,104 @@ opposites. The distinguishing question is not "is this redundant?" but
 **"if this claim were false, what would tell me?"** In (a) nothing would
 have; in (b) the recipe does. Record sha256s of anything deleted so a copy
 recovered from git history can be identity-checked.
+
+### 7.17 RDMA: two wrong premises, stacked
+
+The project spent sessions on "why does RDMA not work", and both layers of
+the answer were wrong in a way that is worth keeping.
+
+**Premise 1, wrong: that the container could use RDMA at all.** Every
+earlier RDMA measurement was taken **on the host**, where `ibv_devinfo`
+works, `show_gid` returns 24 GIDs/node, and `ibv_rc_pingpong` moves data.
+The serving path runs **inside a container** that `container.sh` never gave
+`/dev/infiniband` to. So `ucx_info -d` in-container enumerated only
+`cma/posix/rocm_copy/rocm_ipc/self/sysv/tcp` — no IB transport at all —
+while the host looked healthy. The P→D leg could not have used RDMA no
+matter what `UCX_TLS` said. Fixed by mapping the device with
+`--ulimit memlock=-1 --cap-add IPC_LOCK`.
+
+**Premise 2, wrong: that RC was available and just needed naming.** TODO
+3.9 concluded that `UCX_TLS=ib` pulls in UD, UD is broken, so the fix was
+to name RC explicitly. With the device finally visible, measured:
+
+```
+ucx_info -d -t rc_verbs      -> 0 transport/device pairs
+UCX_TLS=rc_verbs ucx_info ... -> falls through to tcp on benicN
+```
+
+UCX never attempts RC on ionic. The only IB transport it offers is
+`ud_verbs`, failing on all 8 devices with
+`failed to create UD QP TX wr:256 sge:6 inl:64 ... Invalid argument`,
+unaffected by `UCX_IB_TX_MAX_SGE=1` / `UCX_UD_VERBS_TX_INLINE=0`. Note
+`ibv_rc_pingpong` **works** — the hardware does RC; UCX's `rc_verbs` iface
+needs more of the provider than pingpong does.
+
+**The transferable lesson:** a capability measured at one layer says
+nothing about the layer that actually runs the workload. "The host can do
+RDMA" and "the serving process can do RDMA" were treated as the same claim
+for several sessions. When a capability check and the code under test sit
+in different namespaces, the check is measuring the wrong thing — the same
+error shape as §7.12's false negatives and rung 35's scheme-vs-mechanism
+gap.
+
+---
+
+## 8. Benchmarking — which harness answers which question
+
+Full step-by-step, sanity gates and a problem/solution table are in
+**[BRINGUP.md](BRINGUP.md)**, which is now the benchmarking runbook. Summary
+only here.
+
+| Harness | Layer | Answers | Status |
+|---|---|---|---|
+| `lmcache bench l2` | L2 adapter → NIXL → device | KV blocks stored/requested, **hit rate**, block size, **store/load MB/s** | ✅ verified; needs `scripts/bench/l2-block-bench.py` |
+| llama-benchy | HTTP / engine | TTFT, tokens/s, prefix-cache benefit | ✅ verified; prefix-cache number carries the F5 confound |
+| `nixlbench` | NIXL transport | raw per-backend bandwidth | ❌ source only, `etcd-cpp-api` missing |
+| `storage_backend_io` | LMCache v1 storage_backend | local_disk / raw_block / hf3fs / fs | ⚠️ does **not** cover `nixl_kv`/`XNVME_KV` |
+
+**Neither of the two working harnesses ran as committed.** Both needed
+defects fixed first, and the shape of those defects is the point:
+
+- `lmcache bench l2` cannot drive **any** NIXL-backed adapter in LMCache
+  0.5.3. `init_mem_handlers()` builds the L1 dlist base-relative while
+  `get_memory_indices()` returns an absolute page index; they agree only
+  when the buffer base is 0. Confirmed upstream by A/B against the
+  untouched vendor `nixl_store`, which fails identically. Corrected
+  **in the benchmark process only** — see the open question below.
+- llama-benchy passed `--warmup-runs`, which **does not exist** in 0.4.0,
+  so argparse rejected every sweep; and the install verified against
+  `${VENV}/bin/llama-benchy`, which never exists because `${VENV}` is a
+  container shim and pip writes to `/usr/local/bin`. Both fixed in
+  `scripts/bench/`.
+
+**Measured KV-block numbers** (32 keys/round × 3 rounds, align 4096, all
+ops 96/96, round-trip verified; device counters reconcile exactly):
+
+| block | pages/key | store MB/s | load MB/s |
+|---|---|---|---|
+| 16 KB | 4 | 12.2 | 10.0 |
+| 64 KB | 16 | 40.0 | 36.5 |
+| 256 KB | 64 | 119.5 | 136.1 |
+
+Per-key latency is nearly flat (1.29 → 2.10 ms) while bandwidth scales
+~10x: this regime is **per-key overhead bound, not device-bandwidth
+bound**. Concurrency is the lever — at 256 KB, `--in-flight 4` gives
+279/341 MB/s, while raising `NIXL_XNVME_NUM_QUEUES` alone gives nothing
+(the producer is serialized). `submit_retry` runs ~568–707 per completed
+op: the reactor busy-spins on `-EBUSY`, and that is where the time goes.
+
+Cold-reader hit rate is clean in both directions: 96/96 hits at
+`--lookup-max-hit-rate 1.0`, **0/96** at `0.0`. Device probe costs
+~70–90 µs/key and **hit and miss cost the same**; the warm in-process
+index serves the same lookup at ~3 µs/key.
+
+> **🔴 Open, and it matters beyond benchmarking.** The upstream indexing
+> defect above is corrected only in the benchmark process, deliberately.
+> Production uses the same absolute arithmetic and does not crash *because*
+> its 4 GiB L1 makes the bad index land in range — shifted by `ptr // 4096`,
+> not rejected. Whether the serving path is therefore silently mis-indexed
+> is **untested**. Rung 60's token-identity pass argues against real
+> corruption, which is why this is not stated as a bug. It needs its own
+> decisive test (store a known pattern, read it back by direct device
+> inspection at a known offset) **before** anyone changes
+> `get_memory_indices` on the serving path. TODO 6.35.
