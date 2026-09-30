@@ -455,6 +455,26 @@ confirm `libspdk_nvme_rdma_only.a` now exists before retrying
 
 ### `hipErrorInvalidDevicePointer` / KV-cache registration failure
 
+> **Updated 2026-09-25 — do not assume this is the current failure.** The
+> principal's original report under this title — literally
+> `hipErrorInvalidDevicePointer`, in `ipc_wrapper.py:81` — has **not
+> reproduced in any investigation session since**. Every KV-cache
+> registration failure actually observed across the 2026-09-24/25
+> sessions is a **different** failure, one line later: a genuine
+> CUDA/HIP-allocator out-of-memory at `ipc_wrapper.py:85`, with no named
+> HIP error enum anywhere in it — see the next entry below,
+> [`ipc_wrapper.py:85` KV-cache registration OOM](#ipc_wrapperpy85-kv-cache-registration-oom-root-cause-not-established).
+> **These are recorded here as two DISTINCT symptoms — do not merge
+> them** on current evidence; nothing ties `:81`'s symptom to `:85`'s
+> beyond both surfacing from the same call site. The
+> `expandable_segments:False` mitigation below is **unverified against
+> the current failure** — no session since 2026-09-24 has tried
+> toggling it, because the current failure is a genuine allocation
+> failure the ROCm runtime itself reports (see the next entry's
+> elimination record), not the stale-mapping mechanism this entry
+> describes. The rest of this entry is retained unchanged, for whichever
+> symptom (`:81`, verbatim) recurs.
+
 **Symptom:** vLLM fails during KV-cache tensor registration with the GPU
 runtime reporting an invalid device pointer, or the NIXL/UCX VRAM_SEG
 registration path throws around the same point in startup. (This is a
@@ -481,6 +501,281 @@ will not have it set:
 # [SMC1 or SMC2]
 grep PYTORCH_HIP_ALLOC_CONF /proc/$(cat /run/kvstack/vllm-prefill.pid)/environ 2>/dev/null | tr '\0' '\n'
 ```
+
+---
+
+### `ipc_wrapper.py:85` KV-cache registration OOM (root cause NOT established)
+
+**This entry records an ELIMINATION RECORD, not a fix.** Root cause is
+**NOT established** as of 2026-09-25. Every claim below is tagged MEASURED
+or INFERRED; treat the "still open" section as the actual state, not the
+elimination list — six candidate causes are ruled out, none is confirmed.
+
+> ### READ THIS FIRST — 2026-09-29: this is NOT an IPC failure, and not an LMCache failure
+>
+> Everything below this box is still accurate as *observation*, but its
+> framing — that something about the HIP **IPC import** is at fault — is
+> **REFUTED**. Four new measurements, all on `smc2`, all MEASURED:
+>
+> 1. **The allocator is already dead BEFORE the import.**
+>    `CudaIPCWrapper.to_tensor` was instrumented with an allocator probe
+>    either side of the `_new_shared_cuda` call at `:81`
+>    (`tmp/ipcdbg_patch.py` in this repo; applied to the decode
+>    container's `lmcache/v1/platform/cuda/ipc_wrapper.py`, backup at
+>    `ipc_wrapper.py.orig647`, revert with
+>    `python3 /tmp/ipcdbg_patch.py <target> --revert`). At
+>    `REGISTER_KV_CACHE` the daemon cannot allocate **1 byte** of VRAM on
+>    GPU 0 *before* it touches any IPC handle. `BEFORE_IMPORT` and
+>    `AFTER_IMPORT` are byte-identical: 1 B, 2 MiB, 64 MiB and 1 GiB all
+>    fail. **The import at `:81` is innocent; `:85` is merely the first
+>    allocation anything attempts.** Every "IPC" reading of this defect —
+>    including the named next experiment below, and TODO 6.47's — is
+>    aimed at the wrong layer.
+> 2. **It is not LMCache.** A fresh, unrelated
+>    `python -c "torch.empty(2<<20, device='cuda:0')"` in the same
+>    container — no LMCache, no NIXL, no IPC — fails identically while
+>    vLLM decode is resident.
+> 3. **The free memory is REAL — the counter is not lying.** The KFD's own
+>    per-process accounting (`/sys/class/kfd/kfd/proc/<pid>/vram_*`)
+>    attributes exactly **175,682,224,128 B (163.6 GiB)** to vLLM's
+>    `EngineCore` out of 206,141,652,992 B. The **30,459,035,648 B
+>    (28.37 GiB)** that `hipMemGetInfo` reports free is genuinely
+>    unallocated *according to the driver*. So this is not a capacity
+>    problem and not a stale/wrong free figure — the memory is there and
+>    the allocator refuses to hand out any of it.
+> 4. **Occupancy is NOT the trigger — something vLLM does specifically
+>    is.** A synthetic holder allocating the **exact same**
+>    175,682,224,128 B (KFD-confirmed at 175,682,617,344 B) leaves
+>    27.9 GiB free, and a second process then allocates 1 B / 2 MiB /
+>    64 MiB **fine**. "A big first tenant" does not reproduce it. This
+>    independently confirms elimination #7 below, now at the exact
+>    production size rather than an approximation.
+>
+> **Also eliminated 2026-09-29 (MEASURED):**
+> - **UCX/NIXL RDMA GPU-memory registration.** `KV_TRANSPORT=tcp` (no
+>   `ib` in `UCX_TLS`) reproduces the failure identically. The temporal
+>   correlation with RDMA coming up in 6.46 is coincidence.
+> - **GPU partitioning.** All 8 GPUs are `SPX` / `NPS1`. The
+>   `amdgpu_xcp_*` device nodes in `dmesg` are artifacts, not CPX.
+>
+> **What the question now is, stated precisely:** *what does vLLM do,
+> beyond allocating 163.6 GiB, that leaves every other process on that
+> GPU unable to allocate any VRAM at all?*
+>
+> **Named next experiment (supersedes the one at the bottom of this
+> entry).** vLLM logs `Wrapping 36 KV cache tensors for IPC`
+> (`kv_wrap.py:63`) immediately before the daemon fails — that is the
+> **export** side, `storage._share_cuda_()`, running inside the vLLM
+> process. The synthetic holder in (4) never called it. So: repeat (4),
+> but have the holder call `_share_cuda_()` on each of its slabs before
+> the second process probes. If that reproduces, the trigger is the
+> IPC *export*, in the exporting process — the opposite end from where
+> this entry has been looking. If it does not, the next candidates are
+> HIP graph capture and `torch.compile`/AITER warmup, neither tested.
+>
+> **Operational note, unrelated to the OOM but found alongside it:** the
+> role container's PID 1 is `sleep infinity`, which never reaps. Dead
+> daemons and vLLM workers therefore linger as **zombies**, and
+> `start-lmcache-daemon.sh`'s pid-liveness check reports
+> `already running (pid N) — not restarting` for a **defunct** process,
+> so it silently refuses to restart a daemon that is dead. Observed
+> directly on pids 149 and 4200. `stop-lmcache-daemon.sh` clears the
+> pidfile and unblocks it. NOT FIXED.
+
+**Symptom (MEASURED):** the LMCache MP daemon on the decode node fails
+`REGISTER_KV_CACHE`. Verbatim:
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 191.98 GiB of which 28.37 GiB is free. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated.
+```
+at `lmcache/v1/platform/cuda/ipc_wrapper.py:85` (`t = torch.empty(...)`),
+immediately **after** a successful `torch.UntypedStorage._new_shared_cuda`
+call at `:81`. Caller chain: `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py:878`
+→ `lmcache/v1/platform/base/cache_context.py:53`
+(`device_types = {w.to_tensor().device.type for w in kv_caches}`) →
+`ipc_wrapper.py:85`. Fails on **IPC import 1 of 36**. Production
+per-slab size is 2,945,974,272 B (2.74 GiB); vLLM's KV budget is
+~98.31 GiB; `TP_SIZE=1`, model `Qwen/Qwen3-8B`, so only GPU0 is in play.
+GPU0 at the moment of failure: 175,980,625,920 B used (~163.9 GiB — ~15.27
+GiB weights + ~146.77 GiB vLLM KV pool) at `GPU_MEM_UTIL=0.85`.
+
+Downstream, vLLM's decode `EngineCore` then fails after the 300.0s
+`lmcache.mp.mq_timeout` with:
+```
+ConnectionError: LMCache server did not respond to register_kv_caches within 300.0s
+```
+at `lmcache/integration/vllm/vllm_multi_process_adapter.py:1278`.
+
+**A note on the naming, because it will waste your time otherwise:** this
+is a full AMD ROCm/HIP stack. There is **no NVIDIA CUDA anywhere on
+either node**. PyTorch-ROCm and LMCache both retain CUDA-named
+identifiers as HIPify/compatibility artifacts — `torch.cuda`,
+`torch.OutOfMemoryError`'s own message text ("CUDA out of memory"),
+`_new_shared_cuda`, `CudaIPCWrapper`, `CudaIPCTypes.cpp`, the
+`lmcache/v1/platform/cuda/` directory itself. None of these name real
+CUDA. The allocator that actually refuses the request is
+`HIPCachingAllocator.cpp`. If you go looking for an NVIDIA driver, a
+CUDA runtime, or `nvidia-smi` output on this cluster to explain this,
+you are chasing a name, not a component that exists here.
+
+**The OOM is genuine, not a mistranslated HIP error (MEASURED,
+2026-09-25, `AMD_LOG_LEVEL=4`):** the raw ROCm runtime trace at the
+moment of failure, verbatim:
+```
+Fail allocation local memory
+Failed creating memory
+Video memory allocation failed!
+Can't allocate memory size - 0x00200000 bytes!
+failed to create a svm hidden buffer!
+Unable to allocate aligned memory
+Allocation failed : Device memory : required :2097152 | free :30465327104 | total :206141652992
+```
+No named HIP error enum (`hipErrorInvalidDevicePointer`,
+`hipErrorInvalidValue`, `hipErrorIllegalAddress`) appears anywhere in this
+trace. This is a genuine low-level allocation failure reported by the
+ROCm runtime itself, using the same free-byte figure PyTorch's own
+message surfaces (`free :30465327104` = 28.37 GiB). Note the specific
+phrase **"failed to create a svm hidden buffer"** — the failing path is
+SVM (shared virtual memory), not a plain device allocation; this is the
+strongest lead toward a discriminator and is not yet followed up.
+**Caveat that limits how far this trace can be trusted:** despite
+`AMD_LOG_MASK=0x7FFFFFFF`, **no per-call HIP API trace lines were
+emitted at all**, and **no trace output whatsoever appeared for the
+`_new_shared_cuda` import at `:81`**. That `:81` succeeded is therefore
+**INFERRED** from the absence of an exception there, not directly
+observed in this trace.
+
+**The segfault is a separate, downstream defect (MEASURED):** `dmesg`,
+verbatim, 10 occurrences at an **identical** offset:
+```
+python[127758]: segfault at 34 ip 0000764b7a644f00 sp 00007609d35f9a70 error 4 in libhsa-runtime64.so[764b7a622000+120000] likely on CPU 80 (core 32, socket 1)
+```
+Two corrections worth recording explicitly, because both were initially
+assumed wrong in-session:
+- The crashing process is **not** the LMCache MP daemon. The daemon
+  **survives** the OOM, catches the exception, and returns it as an
+  ERROR response over ZMQ. The segfault is in vLLM's decode `EngineCore`
+  worker, during its own HSA teardown after receiving that error
+  response.
+- The library is **not** `/opt/rocm/lib/libhsa-runtime64.so.1.21.0`. It
+  is PyTorch's **vendored** copy at
+  `/usr/local/lib/python3.12/dist-packages/torch/lib/libhsa-runtime64.so`
+  (BuildID `7bc7d10b47fd65809bca2a7db951dbe8d7c8de90`), fully stripped —
+  no `.symtab`, no debug info, `addr2line` returns `??`.
+
+Faulting instruction, resolved by mapping-base arithmetic plus `objdump`
+(`addr2line` is unusable here, and there is no exported `hsa_*` symbol
+below this address — the first export is `hsa_ext_program_create@@ROCR_1`
+at `0x6c690`):
+```
+ip - vma_start = 0x22f00; file offset = 0x1e000 + 0x22f00 = 0x40f00
+40f00: 41 83 7c 24 34 03     cmpl   $0x3,0x34(%r12)
+```
+`%r12 == NULL` at the compare, and `dmesg`'s fault address is literally
+`34` — an exact self-consistent confirmation this is the faulting
+instruction (MEASURED). The containing function (starting ~`0x40ee0`)
+walks an intrusive object list (head at `+0x4f0`, cursor from `+0x68` of
+arg2, a type/state tag at `+0x34`) with refcount bookkeeping at
+`+0x538`/`+0x540`/`+0x554` and nearby `operator delete` /
+`_ZSt28_Rb_tree_rebalance_for_erase` calls — the shape of a
+handle/resource-table teardown loop. **The specific attribution to an
+IPC-release path is INFERRED only** — structural inference from a
+stripped binary, not confirmed by any symbol or source.
+
+**ELIMINATION RECORD (all MEASURED — this is the most valuable part of
+this entry):**
+
+1. **Kernel OOM killer / host DRAM. ELIMINATED.** Zero oom-kill lines in
+   `dmesg`/`journalctl`; `docker inspect` shows `OOMKilled=false`,
+   `ExitCode=0`; host DRAM 1409 GiB free of 1511; zero hugepages
+   reserved; container `MemLimit` unlimited.
+2. **Physical HBM capacity. ELIMINATED.** Identical failure reproduces
+   at 27.79 GiB, 28.37 GiB, and 75.74 GiB free. Tripling headroom
+   (`gpu-memory-utilization` 0.85 → 0.60) changed nothing. A 2 MiB
+   request is not a capacity problem at 75 GiB free.
+3. **GPU virtual address space exhaustion. ELIMINATED.** Fails on IPC
+   import index 1 of 36 with only 2.74 GiB mapped. `amdgpu`'s `vm_size`
+   is 262144 GB (256 TB) — identical on both nodes, roughly 2600x the
+   ~98 GiB working set. All `amdgpu` module params (`vm_size`,
+   `vm_fragment_size`, `vm_block_size`, `gartsize`, `gttsize`,
+   `vramlimit`, `vis_vramlimit`) are identical decode vs. prefill.
+4. **`HSA_ENABLE_IPC_MODE_LEGACY`. ELIMINATED as the discriminator.**
+   An A/B on the real stack from independently-verified **clean driver
+   state** (`modprobe -r amdgpu` / `modprobe amdgpu` between arms):
+   flag=1 and flag-unset produce byte-identical failures — same
+   `file:line`, same free-byte count, same segfault offset. Presence/
+   absence verified via `/proc/<pid>/environ` on both the daemon and
+   vLLM PIDs. This **corroborates** the 2026-09-24 removal in
+   `scripts/common/container.sh` (`cmd_shim`, the `unset
+   HSA_ENABLE_IPC_MODE_LEGACY` line) from a second, independent angle —
+   **this is not a reason to revert that removal.** That removal's own
+   flagged caveat (not tested at `TP_SIZE=8`) is still untested; both
+   arms in this A/B were `TP_SIZE=1`.
+5. **A ROCm `dma_buf` IPC leak (freeing an IPC handle not releasing
+   VRAM at driver level, ROCm 7.0+). ELIMINATED for this failure.** A
+   direct leak probe compared REPORTED-free against
+   ACTUALLY-ALLOCATABLE (fresh-process binary search, 8 MiB
+   granularity) across ≥3 export/import/clean-exit cycles:
+   actually-allocatable stayed flat at 205,625,795,584 B under both
+   flag settings, with no per-cycle shrink. The failure also reproduces
+   on run #1 after a driver reload with zero prior IPC cycles —
+   accumulated leakage cannot explain a first-run failure. Versions:
+   host ROCm 7.13.0, container `amdrocm-base` 7.14.0-3,
+   `torch.version.hip` 7.2.53211, `amdgpu` KMD 6.18.4, kernel
+   6.8.0-139-generic.
+6. **Container/host ROCm version skew. ELIMINATED as actionable.** An
+   earlier reading of "container ROCm 7.8.0" was the `rocm-smi` **tool**
+   version, not the ROCm userspace — that reading is corrected here.
+   Actual container userspace is `amdrocm-base` 7.14.0-3 vs. host
+   7.13.0 — aligned within a minor version, container newer.
+   Additionally, all seven locally-available `rocm-aic:*` image tags
+   (`mp-pd-ionic2609`, `mp-pd-abi1`, `kv-mppd-assertfix`, `kv-mppd`,
+   `mp-pd`, `pr4467`, `kv-planefix`/`latest`) share a byte-identical
+   ROCm/HIP userspace (7.14.0-3 / HIP 7.2.53211) and differ only in
+   application patches. The two stock images that DO carry different
+   HIP versions (`rocm/pytorch:latest` ROCm 7.2.4, `rocm/vllm:latest`
+   ROCm 7.0.0) lack LMCache and the NIXL plugins entirely and ship an
+   incompatible upstream vLLM. Container-userspace alignment is **not
+   actionable** with what is currently on disk.
+7. **Cross-process IPC handle transport / process lineage, as a
+   sufficient cause. ELIMINATED.** A synthetic 36-slab / 106 GiB
+   reproducer via `mp.spawn` **PASSES** at production scale. A second
+   reproducer using two **independently launched** processes (separate
+   `docker exec`, no fork/spawn lineage) exchanging a real handle at the
+   exact production slab size (2,945,974,272 B) under the exact
+   production margin (~31.5 GiB free, 160 GiB holder) **also PASSES**
+   (`READER_OK`, correct data read back). Neither "large import", nor
+   "independent process", nor "cross-process handle" is sufficient to
+   reproduce the failure in isolation. Only the real vLLM + LMCache
+   daemon pair fails.
+
+**What is still open (state plainly):** root cause is **NOT
+established**. The discriminator between the passing reproducers (#7
+above) and the failing production pair is **unidentified**. Candidates
+not yet tested (INFERRED, not measured):
+- the real daemon's own long-lived runtime state — NIXL agent init, the
+  `XNVME_KV` backend's threads, OTel/Prometheus periodic threads —
+  exhausting or fragmenting the SVM allocation path specifically (see
+  the "failed to create a svm hidden buffer" phrase above);
+- routing the handle through `lmcache/v1/multiprocess/mq.py`'s literal
+  ZMQ REQ/REP framing, rather than a pickled file, as reproducer #7 did.
+
+**Named next experiment:** stand up a full LMCache MP daemon skeleton
+(real NIXL agent + `XNVME_KV` backend + OTel threads, **no vLLM**) and
+perform the identical file-based IPC import into *that* process. If it
+fails, the discriminator is the daemon's own runtime state, not ZMQ. If
+it passes, literal ZMQ framing is the remaining untested variable.
+
+**Also record:** the principal's original report of
+`hipErrorInvalidDevicePointer` at `ipc_wrapper.py:81` (previous entry)
+has **not** reproduced in any session since. On current evidence, `:81`
+and `:85` are **distinct symptoms**, not confirmed to be one defect — do
+not merge them. And the cheapest outstanding follow-up was **not**
+performed this session: a real `gdb` backtrace of the segfaulting
+`EngineCore` was never obtained — `core_pattern` is piped to `apport`
+and `gdb` is not installed in the container.
+
+See `docs/TODO.md` §6.46/§6.47 for the task-tracker entries for this
+investigation.
 
 ---
 
