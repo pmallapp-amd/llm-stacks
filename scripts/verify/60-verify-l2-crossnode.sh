@@ -75,16 +75,11 @@ PASS=0; FAIL=0
 
 _ssh() {
     local role="$1"; shift
-    local host user pass
-    case "${role}" in
-        prefill) host="${PREFILL_HOST}"; user="${PREFILL_USER:-root}"; pass="${PREFILL_PASS}" ;;
-        decode)  host="${DECODE_HOST}";  user="${DECODE_USER:-root}";  pass="${DECODE_PASS}" ;;
-    esac
-    SSHPASS="${pass}" sshpass -e ssh -o ConnectTimeout=10 \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -o PubkeyAuthentication=no \
-        -o PreferredAuthentications=keyboard-interactive,password \
-        "${user}@${host}" "$@"
+    # kv_ssh (lib.sh) tries KEY auth first and only falls back to sshpass.
+    # This used to pass -o PubkeyAuthentication=no unconditionally, which
+    # disabled key auth outright — on a key-only lab this rung could never
+    # run at all, and said so only as a missing RESULT line.
+    kv_ssh "${role}" "$@"
 }
 _in() { local role="$1"; shift; _ssh "${role}" "cd ${NODE_ROOT} && ./scripts/common/container.sh exec ${role} \"$*\""; }
 

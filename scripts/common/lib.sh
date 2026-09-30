@@ -206,6 +206,85 @@ srcip_to() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SSH to the cluster nodes — key auth first, password only as a fallback
+# ─────────────────────────────────────────────────────────────────────────────
+# Callers that drive another node (verify rungs 35 and 60) used to build their
+# own `sshpass -e ssh ... -o PubkeyAuthentication=no` invocation inline. That
+# option DISABLES key auth outright, so on a lab where the nodes take a key and
+# no password those rungs could never run — and they reported it only as a
+# missing RESULT line, which reads as a broken check rather than a failed
+# login. These helpers try the key first and fall back to exactly the previous
+# sshpass invocation, so a password lab behaves as before.
+#
+# SSH_IDENTITY_FILE (optional, creds/active.env): ssh does NOT try a key whose
+# filename is not one of its defaults (id_rsa, id_ed25519, ...) unless it is
+# named explicitly — which is how "it works when I ssh by hand" and "the script
+# says key auth failed" end up both being true.
+kv_ssh_base_opts() {
+    printf '%s\n' -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+    if [ -n "${SSH_IDENTITY_FILE:-}" ]; then
+        printf '%s\n' -i "${SSH_IDENTITY_FILE}" -o IdentitiesOnly=yes
+    fi
+}
+
+# kv_ssh <prefill|decode|target> <cmd...> — run a command on that role's node.
+#
+# Probes key auth once per role and caches the verdict in KV_SSH_AUTH_MODE.
+# Dies naming the host if neither key nor password auth is usable — an
+# unreachable node must not surface as a failed assertion.
+#
+# The cache is per-SHELL, so a caller that wraps this in command substitution
+# (`out="$(kv_ssh decode ...)"` — which is most of rungs 35 and 60) re-probes
+# on every call and pays one extra ssh handshake for it. That is deliberate:
+# the alternative is to run the caller's real command under key auth and retry
+# on ssh's exit 255, which would RE-EXECUTE a command that had already run if
+# it happened to exit 255 itself. Rung 60 restarts services, so a spurious
+# double execution is far worse than an extra round trip.
+declare -A KV_SSH_AUTH_MODE=()
+
+kv_ssh() {
+    local role="${1:?kv_ssh: no role given}"; shift
+    local host user pass
+    case "${role}" in
+        prefill) host="${PREFILL_HOST}"; user="${PREFILL_USER:-${SSH_USER:-root}}"; pass="${PREFILL_PASS:-}" ;;
+        decode)  host="${DECODE_HOST}";  user="${DECODE_USER:-${SSH_USER:-root}}";  pass="${DECODE_PASS:-}"  ;;
+        target)  host="${TARGET_HOST}";  user="${TARGET_USER:-${SSH_USER:-root}}";  pass="${TARGET_PASS:-}"  ;;
+        *) die "kv_ssh: unknown role '${role}' (expected prefill|decode|target)" ;;
+    esac
+
+    local -a base=()
+    mapfile -t base < <(kv_ssh_base_opts)
+
+    if [ -z "${KV_SSH_AUTH_MODE[${role}]:-}" ]; then
+        if ssh "${base[@]}" -o BatchMode=yes "${user}@${host}" true 2>/dev/null; then
+            KV_SSH_AUTH_MODE["${role}"]="key"
+        elif [ -n "${pass}" ] && command -v sshpass >/dev/null 2>&1 &&
+             SSHPASS="${pass}" sshpass -e ssh "${base[@]}" \
+                 -o PubkeyAuthentication=no \
+                 -o PreferredAuthentications=keyboard-interactive,password \
+                 "${user}@${host}" true 2>/dev/null; then
+            KV_SSH_AUTH_MODE["${role}"]="password"
+        else
+            die "kv_ssh: cannot reach ${role} (${user}@${host}). Key auth" \
+                " failed$([ -n "${pass}" ] && echo ' and so did password auth' || echo " and no ${role^^}_PASS is set")." \
+                " If this lab uses a key whose filename is not an ssh" \
+                " default, set SSH_IDENTITY_FILE in creds/active.env — ssh" \
+                " will not try such a key unless it is named."
+        fi
+    fi
+
+    if [ "${KV_SSH_AUTH_MODE[${role}]}" = "key" ]; then
+        ssh "${base[@]}" -o BatchMode=yes "${user}@${host}" "$@"
+    else
+        SSHPASS="${pass}" sshpass -e ssh "${base[@]}" \
+            -o PubkeyAuthentication=no \
+            -o PreferredAuthentications=keyboard-interactive,password \
+            "${user}@${host}" "$@"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # UCX / NIXL transport selection
 # ─────────────────────────────────────────────────────────────────────────────
 # setup_ucx_env <prefill|decode> — exports UCX_TLS and its RDMA-mode
