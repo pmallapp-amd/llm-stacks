@@ -153,6 +153,15 @@ export LD_LIBRARY_PATH="${NIXL_PREFIX}/lib/x86_64-linux-gnu:${UCX_PREFIX}/lib:${
 # 03-start-prefill.sh/03-start-decode.sh) so it applies to any tooling that
 # sources this file, including ad hoc debugging sessions and nixlbench.
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False"
+
+# REMOVED 2026-09-24: HSA_ENABLE_IPC_MODE_LEGACY. Kept in lockstep with the
+# container-path writer in scripts/common/container.sh — see that file's
+# comment for the full 2026-09-24 measurement trail (RoCEv2 with GPU
+# buffers, HIP IPC import at 36 slabs / 145 GiB, and UCX rocm_ipc, all
+# showing no dependency on the flag). It is set to 1 in the rocm-aic image's
+# ENV layer, not by this repo. Unset here too so the from-source path and
+# anything else sourcing this file agree with the container path.
+unset HSA_ENABLE_IPC_MODE_LEGACY
 EOF
 ok "wrote ${STACK_ROOT}/etc/env.sh"
 

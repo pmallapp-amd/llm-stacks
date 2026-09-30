@@ -161,6 +161,38 @@ export NIXL_PLUGIN_DIR="${NIXL_PLUGIN_DIR:-/opt/nixl/lib/x86_64-linux-gnu/plugin
 # device pointer for VRAM_SEG registration.
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False"
 
+# REMOVED 2026-09-24: HSA_ENABLE_IPC_MODE_LEGACY. The rocm-aic image bakes
+# HSA_ENABLE_IPC_MODE_LEGACY=1 into its ENV layer (the same layer as
+# NIXL_PLUGIN_DIR/PYTHONPATH/LD_LIBRARY_PATH), so every process started by
+# `docker exec` inherits it — both vLLM and the LMCache MP daemon were
+# measured carrying it. Nothing in this repo asked for it and no vendor note
+# explains it. ROCr does read it (the symbol is present in
+# /opt/rocm/lib/libhsa-runtime64.so), so it is not inert by accident.
+#
+# Measured 2026-09-24 on smc1/smc2, set vs unset, everything else identical:
+#   - RoCEv2 cross-node with GPU buffers (ucx_perftest -t tag_bw -m rocm,
+#     UCX_TLS=ib,rocm,self,sm, ionic_2:1, GID index 1): 14791 MB/s set vs
+#     15124 MB/s unset. Not required for RoCEv2.
+#   - HIP IPC import at vLLM scale: 36 slabs / 145 GiB through the exact
+#     _share_cuda_ -> _new_shared_cuda -> torch.empty(()) -> set_() sequence
+#     of LMCache 0.5.3 ipc_wrapper.py:81-88. Both configurations import all
+#     36 handles and exit 0.
+#   - UCX rocm_ipc intra-node: bimodal ~93 GB/s / ~142 GB/s in BOTH
+#     configurations across four interleaved reps. The spread is scheduling,
+#     not the flag. A single cold first rep at 91 GB/s initially looked like
+#     a 57% regression; it did not survive repetition.
+#
+# So it is not required for RoCEv2 and not load-bearing on the HIP IPC path
+# it appears to name. `unset` rather than =0 because ROCr's parse of "0" is
+# unverified while absence is not. Same doctrine as the NCCL_CUMEM_ENABLE
+# removal (config/cluster.env): this stack does not carry an unexplained
+# allocator/IPC knob it cannot justify.
+#
+# NOT TESTED: TP_SIZE=8. Every measurement above is TP=1 with a single
+# exporting process. If multi-GPU IPC regresses, re-test this before
+# blaming anything else.
+unset HSA_ENABLE_IPC_MODE_LEGACY
+
 # NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE IS DELIBERATELY NOT EXPORTED HERE.
 #
 # It used to be, set to 1, on the reasoning that the DSC KV namespace reports
