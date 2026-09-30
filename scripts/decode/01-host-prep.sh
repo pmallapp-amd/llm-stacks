@@ -136,8 +136,12 @@ fi
 # advisory in Phase 1). Also reports the ionic_* -> PCI-device mapping so an
 # operator can pin DECODE_UCX_NET_DEVICES to the CORRECT physical port on
 # THIS host — F3: the device index is not guaranteed to line up the same
-# way on SMC2 as it does on SMC1 (e.g. ionic_2 can be a different physical
-# port on each). Only ionic_0/ionic_1 are confirmed to line up.
+# way on SMC2 as it does on SMC1 (e.g. ionic_2 is benic4p1 here but
+# benic5p1 on SMC1). CORRECTED 2026-09-24: the older claim that "only
+# ionic_0/ionic_1 line up" was never true — re-measurement found ionic_7
+# (benic2p1) is the only index naming the same physical port on both
+# hosts. See config/cluster.env's UCX_NET_DEVICES block for the full
+# mapping.
 step "DSC3-2Q400 NICs [1dd8:5200], RDMA devices, and ionic_* -> PCI mapping"
 lspci -d 1dd8:5200 -nn 2>/dev/null | while IFS= read -r line; do log "  ${line}"; done
 if command -v ibv_devinfo >/dev/null 2>&1; then

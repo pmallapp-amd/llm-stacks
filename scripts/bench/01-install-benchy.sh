@@ -72,6 +72,15 @@ fi
 # run` invocation is guaranteed to hit an already-warm local HF cache.
 # ─────────────────────────────────────────────────────────────────────────────
 step "Pre-downloading tokenizer for ${MODEL} (HF_HOME=${HF_HOME})"
+# MODEL must be EXPORTED, not merely set: the heredoc below is a separate
+# python process reading os.environ["MODEL"]. cluster.env sets MODEL without
+# exporting it, so this died with `KeyError: 'MODEL'` (measured 2026-09-21)
+# — and because that kill lands under `set -e` BEFORE the CLI verification
+# below, the install reported failure while pip had in fact succeeded, and
+# the tokenizer this step exists to pre-cache was left uncached. The next
+# timed sweep would then have paid for a cold HF fetch inside its own
+# measurement, which is precisely what this step exists to prevent.
+export MODEL
 export HF_HOME
 if [ -n "${HF_TOKEN}" ]; then
     export HF_TOKEN
