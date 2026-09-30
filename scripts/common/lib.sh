@@ -792,6 +792,65 @@ _setup_nixl_kv_env_spdk() {
 # on it. Ambiguity is fatal rather than resolved by picking one: two devices
 # answering to the same NQN means something is genuinely wrong (a duplicate
 # connect, a stale session) and guessing would hide it.
+# assert_kv_char_device <path> — die unless <path> really is a KV namespace.
+#
+# A KV namespace has NO block device: the kernel refuses to build one for a
+# non-NVM command set and creates only the generic char node, whereas an
+# ordinary NVM namespace (e.g. this host's local boot drive) has both. So
+# /dev/ngXnY with a MATCHING /dev/nvmeXnY is a data disk, not a KV namespace —
+# see plugins/xnvme-kv/xnvme_kv_backend.cpp's discover_kv_device() comment,
+# which runs the identical test inside the plugin's own autodiscovery.
+#
+# Running it again here, on the EXPLICIT path an operator gave us (or that NQN
+# resolution just picked), catches the case that matters most: someone pasted
+# the wrong device node by hand, or NQN resolution's own block-device filter
+# somehow got bypassed. It is cheap and it prevents writing KV opcodes at
+# somebody's filesystem — concretely, on smc1/smc2 this is the check that
+# stops XNVME_DEV=/dev/ng0n1 (the Micron OS BOOT drive, which has
+# nvme0n1p1/nvme0n1p2 block partitions) from ever reaching the KV backend;
+# only /dev/ng1n1 (the Pensando DSC, PDSNVME-00) has no matching block device
+# and passes.
+#
+# Extracted from setup_nixl_kv_env() so container.sh can apply the SAME test
+# before bind-mounting a device into the container. Its own guard was a bare
+# `[ -c ]`, which an ordinary NVM namespace PASSES — every NVM namespace gets
+# an `ng` node too — so a wrong device was mapped in with no complaint.
+assert_kv_char_device() {
+    local dev="${1:?assert_kv_char_device: no device path given}"
+    local _base _blk
+
+    [ -e "${dev}" ] || die "assert_kv_char_device: ${dev} does not exist on" \
+        " this host. Confirm the KV controller is actually present" \
+        " (nvme list-subsys) before retrying — on this cluster a missing" \
+        " device after a reboot is usually the DSC boot-time race, not a" \
+        " dead card (docs/BRINGUP.md §1.3)."
+    [ -c "${dev}" ] || die "assert_kv_char_device: ${dev} is not a character" \
+        " device. A KV namespace is char-only; this path is something else."
+
+    _base="$(basename -- "${dev}")"
+    if [[ "${_base}" =~ ^ng([0-9]+)n([0-9]+)$ ]]; then
+        _blk="$(dirname -- "${dev}")/nvme${BASH_REMATCH[1]}n${BASH_REMATCH[2]}"
+        if [ -e "${_blk}" ]; then
+            die "assert_kv_char_device: ${dev} has a matching block device" \
+                " (${_blk}). A true KV namespace has NO block device — the" \
+                " kernel cannot build one for a non-NVM command set. This" \
+                " path is an ordinary NVM namespace — a DATA DISK. On" \
+                " smc1/smc2 the usual mistake is /dev/ng0n1, the Micron OS" \
+                " BOOT drive; /dev/ng1n1 is the Pensando DSC KV namespace" \
+                " and has no block twin. Refusing to hand this device to" \
+                " the KV backend — check \`nvme list-subsys\` for the" \
+                " controller whose subsysnqn is '${NVMF_SUBNQN:-<unset>}'" \
+                " before overriding XNVME_DEV."
+        fi
+    else
+        warn "assert_kv_char_device: ${dev} does not match the expected" \
+             " /dev/ngCnN shape — skipping the block-device safety check" \
+             " because the controller/namespace numbers can't be parsed out" \
+             " of it. Confirm by hand that this is really a KV namespace" \
+             " char device, not a data disk."
+    fi
+}
+
 resolve_xnvme_kv_dev() {
     local want="${1:-${NVMF_SUBNQN}}" ng s ctrl nqn blk
     local -a matches=()
@@ -897,29 +956,7 @@ _setup_nixl_kv_env_xnvme() {
     # nvme0n1p1/nvme0n1p2 block partitions) from ever being handed to the KV
     # backend; only /dev/ng1n1 (the Pensando DSC, PDSNVME-00) has no matching
     # block device and passes.
-    local _base
-    _base="$(basename -- "${XNVME_DEV}")"
-    if [[ "${_base}" =~ ^ng([0-9]+)n([0-9]+)$ ]]; then
-        local _blk; _blk="$(dirname -- "${XNVME_DEV}")/nvme${BASH_REMATCH[1]}n${BASH_REMATCH[2]}"
-        if [ -e "${_blk}" ]; then
-            die "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} has a matching" \
-                " block device (${_blk}). A true KV namespace has NO block" \
-                " device — the kernel cannot build one for a non-NVM" \
-                " command set. This path is an ordinary NVM namespace (a" \
-                " data disk — on smc1/smc2 this is almost certainly" \
-                " /dev/ng0n1, the Micron OS BOOT drive, not /dev/ng1n1, the" \
-                " Pensando DSC). Refusing to hand it to the KV backend —" \
-                " double-check /dev/ngXnY against \`nvme list-subsys\` and" \
-                " this host's actual KV controller before overriding" \
-                " XNVME_DEV."
-        fi
-    else
-        warn "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} does not match the" \
-             " expected /dev/ngCnN shape — skipping the block-device safety" \
-             " check because the controller/namespace numbers can't be" \
-             " parsed out of it. Confirm by hand that this is really a KV" \
-             " namespace char device, not a data disk."
-    fi
+    assert_kv_char_device "${XNVME_DEV}"
 
     export NIXL_XNVME_DEV="${XNVME_DEV}"
     export NIXL_XNVME_NSID="${XNVME_NSID}"

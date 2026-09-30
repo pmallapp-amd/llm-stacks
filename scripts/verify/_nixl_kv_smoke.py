@@ -195,9 +195,35 @@ def main():
     ap.add_argument("--pages", type=int, default=4)
     ap.add_argument("--namespace", default=os.environ.get("SMOKE_NS", "smoketest"))
     ap.add_argument("--backend", default=os.environ.get("KV_BACKEND", "XNVME_KV"))
-    ap.add_argument("--dev-uri", default=os.environ.get("NIXL_XNVME_DEV", "/dev/ng1n1"))
+    # NO LITERAL DEFAULT. This used to fall back to "/dev/ng1n1", which is the
+    # KV namespace on THIS lab and an ordinary data SSD on another — writing KV
+    # opcodes at a filesystem is exactly the accident the rest of this repo's
+    # device handling exists to prevent, so a path we cannot resolve is a hard
+    # error rather than a guess.
+    #
+    # Two env names are consulted because two different callers set them:
+    # NIXL_XNVME_DEV is exported by lib.sh's setup_nixl_kv_env(), which only
+    # runs if the caller sourced cluster.env; XNVME_DEV is put into the
+    # container's environment by container.sh. Invoking this script through
+    # `container.sh exec` gives you the second but not the first.
+    ap.add_argument(
+        "--dev-uri",
+        default=os.environ.get("NIXL_XNVME_DEV") or os.environ.get("XNVME_DEV"),
+    )
     ap.add_argument("--expect-miss", action="store_true")
     a = ap.parse_args()
+
+    # Emitted as a RESULT: line so the caller's `grep -E '^RESULT:'` reports a
+    # named failure rather than "<no RESULT line>", which reads like a broken
+    # harness instead of an unresolved device.
+    if not a.dev_uri:
+        sys.exit(
+            "RESULT:NO_DEV_URI: neither NIXL_XNVME_DEV nor XNVME_DEV is set "
+            "and --dev-uri was not given. Refusing to guess a /dev/ngXnY "
+            "path: on some hosts that is the KV namespace and on others it "
+            "is a data disk. Resolve it by NQN (see resolve_xnvme_kv_dev in "
+            "scripts/common/lib.sh) or pass --dev-uri explicitly."
+        )
 
     kv.validate_namespace(a.namespace)
     # A realistic ObjectKey string shape, derived from the nonce. Both

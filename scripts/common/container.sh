@@ -102,9 +102,37 @@ NIXL_PLUGIN_DIR_IN_IMAGE="${NIXL_PLUGIN_DIR_IN_IMAGE:-/opt/nixl/lib/x86_64-linux
 _cname() { echo "kvstack-$1"; }
 
 _role_dev() {
-    # XNVME_DEV is resolved per-node; on both compute nodes in this lab the
-    # DSC KV namespace is /dev/ng1n1 and ng0n1 is the Micron boot drive.
-    echo "${XNVME_DEV:-/dev/ng1n1}"
+    # Resolve the KV namespace the same way lib.sh does, and NEVER fall back
+    # to a literal path.
+    #
+    # This used to be `echo "${XNVME_DEV:-/dev/ng1n1}"`, which encoded one
+    # cluster's layout as a default. That is wrong in the most dangerous
+    # possible way on a host where /dev/ng1n1 is an ordinary SSD: the guard
+    # at the bind-mount site was a bare `[ -c ]`, which such a device PASSES
+    # (every NVM namespace gets an `ng` node too), so the wrong device would
+    # be mapped into the container and handed to the KV backend with no
+    # complaint. assert_kv_char_device() is the real test.
+    #
+    # Order: an explicit XNVME_DEV wins (the operator escape hatch), else ask
+    # the kernel which controller actually claims NVMF_SUBNQN, else die.
+    if [ -n "${XNVME_DEV:-}" ]; then
+        echo "${XNVME_DEV}"
+        return 0
+    fi
+
+    local _auto
+    if _auto="$(resolve_xnvme_kv_dev "${NVMF_SUBNQN}")"; then
+        echo "${_auto}"
+        return 0
+    fi
+
+    die "container.sh: cannot determine this node's KV device. XNVME_DEV is" \
+        " unset and no char device claims NVMF_SUBNQN='${NVMF_SUBNQN}'." \
+        " Refusing to guess a path — mapping the wrong /dev/ngXnY hands a" \
+        " data disk to a KV backend. Check the KV controller is present and" \
+        " bound (nvme list-subsys); on this cluster a device missing after a" \
+        " reboot is usually the DSC boot-time race, not a dead card" \
+        " (docs/BRINGUP.md §1.3)."
 }
 
 cmd_shim() {
@@ -585,9 +613,14 @@ cmd_up() {
         docker rm -f "${cname}" >/dev/null
     fi
 
-    [ -c "${dev}" ] || die "KV device ${dev} is not a char device on this" \
-        " node — refusing to start a container that would silently fall" \
-        " back to the plugin's /dev/ng0n1 default (the BOOT DRIVE)."
+    # Not a bare `[ -c ]`: an ordinary NVM namespace passes that, because
+    # every NVM namespace gets an `ng` char node alongside its block device.
+    # assert_kv_char_device() additionally rejects anything that HAS a
+    # matching /dev/nvmeXnY, which is what actually distinguishes a KV
+    # namespace from a data disk. Refusing here stops a container starting
+    # against a device that would silently fall back to — or simply be —
+    # the boot drive.
+    assert_kv_char_device "${dev}"
 
     # RDMA passthrough. Conditional rather than unconditional: a node with
     # no /dev/infiniband (or a future GPU-less role) must still start, and
