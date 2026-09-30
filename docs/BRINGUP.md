@@ -1,9 +1,10 @@
 # Bring-up and benchmarking runbook
 
 How to get this cluster into a state where a benchmark number means
-something, and then how to run the three benchmark harnesses that exist.
+something, and then how to run the benchmark harnesses that exist.
 
-Last updated 2026-09-30.
+Last updated 2026-09-30. Covers SETUP 4 (the Pensando DSC lab); the
+`setup-3-nvmeof` branch carries the kernel-NVMe-oF lab.
 
 > **Scope change, 2026-09-18.** This document used to be a full
 > from-source bring-up guide (build SPDK, build UCX/NIXL, install vLLM).
@@ -30,15 +31,21 @@ ask a KV-block question of an engine-level harness.
 | Harness | Layer | Answers | Status on this cluster |
 |---|---|---|---|
 | **`lmcache bench l2`** (§3) | L2 adapter → NIXL → device | KV blocks stored/requested, **hit rate**, block size, **store/load MB/s**, per-key latency | ✅ **VERIFIED 2026-09-18** — numbers in §3.7, device-cross-checked |
-| **llama-benchy** (§4) | HTTP / inference engine | TTFT, tokens/s, prefix-cache benefit, concurrency behaviour | ✅ **VERIFIED 2026-09-18** — runs end to end; but see the F5 confound in §4.4 |
+| **llama-benchy** (§4) | HTTP / inference engine | TTFT, tokens/s, prefix-cache benefit, concurrency behaviour | ⚠️ **VERIFIED 2026-09-18, BLOCKED TODAY** — harness runs end to end, but the stack will not start (§1.4, §7 item 19); see also the F5 confound in §4.4 |
+| **the three KV paths** (§4A) | all three at once | which path actually moved KV — P→D, L1→L2→device, cold read-back | ⚠️ **MEASURED 2026-09-21, BLOCKED TODAY** — same blocker as §4 |
 | **nixlbench** (§5) | NIXL transport | raw per-backend transfer bandwidth and latency | ❌ **NOT BUILT** — source only, blocked on a missing dependency (§5.2) |
 
-**The ✅/❌ in that last column is a statement about a lab at a moment, not
-a property of the harness.** A harness marked ✅ describes the code path
-working when it was last exercised; it can be unrunnable today because the
-stack it needs will not come up. The `setup-3-nvmeof` branch's copy of this
-document marks §4 **BLOCKED** for exactly that reason on a different lab.
-Before quoting a status, confirm the stack is actually up (§1, §2.4).
+**The ✅/❌ in that last column mixes two different claims — read it
+carefully.** "The harness works" and "the harness can run right now" are
+separate facts, and they disagree today: llama-benchy (§4) and the
+three-path proof (§4A) are both **verified harnesses that are currently
+BLOCKED**, because the stack they need will not come up (§1.4, §7 item
+19). Their recorded numbers stand as history and are not reproducible
+until that clears.
+
+So: a ✅ is a statement about a lab at a moment. Before quoting any status
+here, confirm the stack is actually up (§1, §2.4) rather than trusting the
+mark.
 
 **Decision guide.**
 
@@ -47,6 +54,10 @@ Before quoting a status, confirm the stack is actually up (§1, §2.4).
   vLLM, so no engine-level cache can confound it.
 - "Does the user-visible latency improve, and does the cache help
   end-to-end?" → **§4**, and read §4.4 before believing the answer.
+  **Blocked today** — §4's numbers are history until the stack starts.
+- "Which of the three KV paths actually moved anything?" → **§4A.** A
+  correct completion proves nothing about which path served it, and this
+  is the only section that separates them. **Blocked today, same cause.**
 - "How fast is the transport itself, independent of LMCache?" → **§5**, once
   it is built. Until then, do not quote a transport number.
 
@@ -231,7 +242,76 @@ third attempt, ~20 minutes after boot. Expect to retry over minutes.
 Per the hardware owner this race is expected behaviour on this hardware,
 not a defect — treat it as a documented procedure, not an open bug.
 
-### §1.4 The target is shared — confirm who owns it
+### §1.4 The RDMA fabric — device names are NOT stable across reboots
+
+**This check is new (2026-09-30) and it is the cheapest one in §1.** A
+reboot renamed every RoCE device on both nodes and cost a full session; the
+failure surfaced three layers away, as a vLLM engine-init crash.
+
+```bash
+# [SMC1] and [SMC2]
+for d in /sys/class/infiniband/*; do
+  n=$(basename "$d"); nd=$(ls "$d"/device/net 2>/dev/null | head -1)
+  printf '%-16s %-10s %-14s %s\n' "$n" "$nd" \
+    "$(ip -4 -br addr show "$nd" 2>/dev/null | awk '{print $3}')" \
+    "$(cat "$d"/ports/1/state 2>/dev/null)"
+done
+```
+
+**Expect** 8 devices, every one `4: ACTIVE`. Measured 2026-09-30:
+
+```
+roce_benic1p1  benic1p1  30.2.1.1/24   4: ACTIVE     # smc2; smc1 is 30.1.N.1
+...
+roce_benic8p1  benic8p1  30.2.8.1/24   4: ACTIVE
+```
+
+The current naming is **1:1 and self-describing** —
+`roce_benicNp1 ↔ benicNp1 ↔ 30.<1=smc1|2=smc2>.N.1`. The older `ionic_N`
+names were **not**: their index-to-netdev mapping was arbitrary and
+per-boot (`ionic_4 → benic1p1`, `ionic_7 → benic2p1`), which is why
+`config/cluster.env`'s mapping table had to be re-measured three times.
+
+**Now assert that what is pinned actually exists** — this is the step that
+was missing:
+
+```bash
+# [CONTROL HOST]
+grep -E 'UCX_NET_DEVICES|PD_SIDE_CHANNEL_HOST' creds/active.env
+```
+
+Every pinned device name **must** appear in the per-node listing above, and
+`PD_SIDE_CHANNEL_HOST_DECODE` **must** be the IP belonging to the pinned
+device's netdev. If either is false, stop and fix creds before starting
+anything.
+
+**Failure signature when it is wrong** (measured 2026-09-30, smc2, decode):
+
+```
+UCX  WARN  network device 'ionic_7:1' is not available, please use one or more of:
+           ... 'roce_benic1p1:1'(ib), 'roce_benic2p1:1'(ib), ...
+UCX  ERROR no active messages transport: self/memory - no peer failure handler,
+           rocm_copy - no am bcopy, rocm_ipc - no am bcopy, cma/memory - no am bcopy
+ucx_utils.cpp:537   UCX endpoint create failed: failed to create ep
+nixl_agent.cpp:359  createBackend: backend 'UCX' ... NIXL_ERR_BACKEND
+EngineCore failed to start.
+```
+
+Note what this looks like from above: vLLM reports
+`RuntimeError: Engine core initialization failed` from
+`multi_connector.py:184`, ~95 s after launch. Nothing in that top-level
+message mentions a device name. The UCX `WARN` that names the actual
+problem — **and lists the correct device names** — is ~6 lines earlier in
+`/var/log/kvstack/vllm-decode.log`, inside the container. Always read
+upward from `EngineCore failed to start`.
+
+Two further traps this check does not cover but §7 does: a silent TCP
+fallback that passes RDMA acceptance (§7 item 21), and
+`UCX_IB_ROCE_SUBNET_PREFIX_LEN` needing to be 8 rather than 16 (§7 item
+22) — smc1 is `30.1.N.1/24` and smc2 is `30.2.N.1/24`, i.e. **different
+/24s**, so the RoCE subnet match is not automatic.
+
+### §1.5 The target is shared — confirm who owns it
 
 ```bash
 # [SMC3]
@@ -266,7 +346,7 @@ else, and **there is no delete primitive** (TODO 6.29). Size your runs
 (§3.6) — but see the capacity note there before reusing any "1 GiB"
 figure you may have seen in an older copy of this document.
 
-### §1.5 The container, and the overlays that make it work
+### §1.6 The container, and the overlays that make it work
 
 ```bash
 # [SMC2] (and [SMC1] if you need prefill)
@@ -296,7 +376,7 @@ not land is indistinguishable from a cache that stores and never retrieves:
 does not, nothing in §3 will work and §4's cache numbers will be
 meaningless.
 
-### §1.6 One-shot sanity summary
+### §1.7 One-shot sanity summary
 
 ```bash
 # [SMC2] — everything §1 checks, in one paste
@@ -306,7 +386,19 @@ source "${REPO}/scripts/common/lib.sh"
 KV_DEV="$(resolve_xnvme_kv_dev "${NVMF_SUBNQN}")" && ls -l "${KV_DEV}" \
   && nvme ns-descs "${KV_DEV}" | grep -E 'csi'
 ss -tlnp | awk -v P=":${LMCACHE_MP_HTTP_PORT:-8080}$" '$4 ~ P'   # §1.0 — yours?
+# §1.4 — RDMA device names; every pinned name must appear here
+for d in /sys/class/infiniband/*; do
+  n=$(basename "$d"); nd=$(ls "$d"/device/net 2>/dev/null | head -1)
+  printf '%-16s %-10s %-14s %s\n' "$n" "$nd" \
+    "$(ip -4 -br addr show "$nd" 2>/dev/null | awk '{print $3}')" \
+    "$(cat "$d"/ports/1/state 2>/dev/null)"
+done
 cd "${REPO}" && ./scripts/common/container.sh adapter-check decode
+```
+
+```bash
+# [CONTROL HOST] — the assertion §1.4 exists to make
+grep -E 'UCX_NET_DEVICES|PD_SIDE_CHANNEL_HOST|KV_TRANSPORT' creds/active.env
 ```
 
 ---
@@ -419,7 +511,7 @@ negative control A, both of which must pass.
 
 **Why `--no-drain` at all.** The original reason ("we dare not drain a
 medium shared with another party") no longer holds: steps 0/7 drain the
-*target's* `nvmf_tgt`, which §1.4 establishes our data never reaches. The
+*target's* `nvmf_tgt`, which §1.5 establishes our data never reaches. The
 open work is re-targeting the drain step — better, asserting emptiness by
 probing rather than restarting anything — not deciding whether touching
 the target is safe (TODO 6.41c).
@@ -658,7 +750,24 @@ the commit-key index is worth ~25x on a repeat.
 
 ---
 
-## §4 Benchmark B — llama-benchy (engine level) ✅
+## §4 Benchmark B — llama-benchy (engine level) ❌ BLOCKED TODAY
+
+**The harness itself is VERIFIED** (2026-09-18: it runs end to end, and
+§4.3–§4.5 are real measurements). **It is not runnable today** because the
+stack it needs (§2) does not come up: the RDMA device-pin issue (§1.4) and
+the `ipc_wrapper.py:85` KV-cache registration OOM (§7 item 19) stop decode
+before a single request lands. The numbers below stand as history; they are
+not currently reproducible.
+
+Distinguish the two — a blocked harness and a broken harness need opposite
+responses. Nothing below is known to be wrong; it simply cannot be re-run
+until the stack starts.
+
+> **Note for whoever clears this:** `docs/HANDOFF.md` on this branch
+> predates the `ipc_wrapper.py:85` blocker and does not mention it — §7
+> item 19 here is its only record on this branch. Update HANDOFF when the
+> root cause is established (it is NOT, as of this writing; seven candidate
+> causes are eliminated and none confirmed).
 
 Measures what a client sees: TTFT, tokens/s, and prefix-cache benefit, over
 HTTP. **Requires the full stack from §2.**
@@ -794,6 +903,168 @@ results are explicitly **not reportable**.
 
 ---
 
+## §4A The three KV data paths, proven end to end ❌ BLOCKED TODAY
+
+**Not runnable today**, same reason as §4: the RDMA device-pin issue
+(§1.4) and the `ipc_wrapper.py:85` OOM (§7 item 19) stop the stack before
+any of these three paths can be exercised. The 2026-09-21 numbers below
+stand as history but are not currently reproducible. Path 2 and Path 3
+additionally depended on a namespace that has since been wiped — the
+Pensando DSC/DPU KV store is volatile (TODO 6.41) — so even with the
+stack up, a fresh run starts from empty, not from what is recorded here.
+
+There are **three** distinct KV paths in this stack, and each needs its own
+proof — a correct completion proves **nothing** about which of them, if
+any, actually moved KV (HANDOFF §5). This section reproduces all three,
+measured together on 2026-09-21.
+
+### §4A.1 Path 1 — KV computed on prefill, moved directly to decode (P->D)
+
+```bash
+# [SMC2] — must run ON decode, see §2.4
+cd "${REPO}"
+./scripts/common/container.sh exec decode ./scripts/verify/50-verify-pd-direct.sh
+```
+
+**Expect 9/9.** Measured 2026-09-21, literal output worth quoting:
+
+```
+external prefix cache hit rate: 98.1% -> 99.0% (baseline -> polled)
+corroborating: decode 'Avg prompt throughput' = 0.0 tokens/s
+VERDICT (request 3): served by NixlConnector DIRECT transfer
+all 9 checks passed
+```
+
+The acceptance signal is a **PAIR**, and quoting only the first half of it
+invites a reasonable reader to conclude the stack is dead:
+
+| gauge | on decode | means |
+|---|---|---|
+| `Avg prompt throughput` | **0.0 tokens/s** | decode computed **no prefill** — the KV arrived over the P->D leg instead |
+| `Avg generation throughput` | **non-zero** | decode is **emitting tokens** normally |
+
+`Avg prompt throughput` and `Avg generation throughput` are two different
+vLLM gauges. A 0.0 on the **prompt** gauge is the thing being proven; it is
+**not** "no tokens were produced" — that would be a 0.0 on the
+**generation** gauge, which is a failure, not a pass.
+
+Confirm generation independently rather than trusting the gauge, because a
+metric whose success value is zero cannot distinguish "working" from
+"dead" on its own — HANDOFF §7.6's lesson, from the RoCE netdev counters
+that read near-zero for real traffic: an instrument reading zero is not
+evidence of absence until you have shown it can read non-zero:
+
+```bash
+# [SMC2] — generation counters must RISE across a run
+curl -s http://127.0.0.1:8200/metrics | grep -E '^vllm:(prompt|generation)_tokens_total'
+```
+
+**Measured 2026-09-21** across the two §4 benchmark runs, from the
+`metrics-decode-{pre,post}.txt` captured in each run directory: decode's
+`vllm:generation_tokens_total` rose by **+617** and **+1,641** — tokens
+were unambiguously generated while the prompt gauge read 0.0. Rung 60's
+TOKEN IDENTITY check additionally confirms they are the **same** tokens a
+recompute produces, not merely some tokens.
+
+> **The zero is a real zero, not a dead gauge** — rung 50's own negative
+> control withholds the handoff and decode's `Avg prompt throughput` jumps
+> to **124.7 tokens/s** (HANDOFF §2). That is the positive control which
+> makes the 0.0 admissible as evidence.
+>
+> **Do not** try to make this argument from `vllm:prompt_tokens_total`.
+> Measured 2026-09-21, it rises by an **identical** amount on *both* nodes
+> (+2,160 and +36,978) — it counts a request's prompt at both ends and
+> cannot distinguish KV that was **computed** from KV that was
+> **transferred**. Only the throughput gauge separates them.
+
+### §4A.2 Path 2 — KV written down through L1 and L2 onto the KV device
+
+**Precondition, and it comes first on purpose:** the tracked L1 default
+(**4 GiB**, from `LMCACHE_MAX_LOCAL_CPU_SIZE=4` in creds) **NEVER EVICTS**
+under any load this cluster can generate, so L2 is never written and this
+path is never exercised. You must force it with `LMCACHE_MP_L1_SIZE_GB=1`.
+And the daemon is **idempotent** — `start-lmcache-daemon.sh` silently
+no-ops (exit 0) if a daemon is already up, so a changed L1 size is silently
+ignored unless you stop it first.
+
+Also: `NIXL_KV_METRICS_PATH` is **not exported by any script**. Without it
+there are **no** plugin/device-level counters at all — only the L2 adapter
+counters at `:8080/status`. Set it on the daemon's environment before
+starting.
+
+```bash
+# [SMC1] and [SMC2] — L1 forced small so L2 is actually exercised
+cd "${REPO}"
+./scripts/common/container.sh exec prefill \
+  "LMCACHE_MP_L1_SIZE_GB=1 \
+   NIXL_KV_METRICS_PATH=/tmp/kvmetrics-prefill.json \
+   NIXL_KV_METRICS_INTERVAL_SEC=5 \
+   ./scripts/common/start-lmcache-daemon.sh"
+```
+
+**Expect** `L1 size: 1 GiB  eviction policy: LRU  chunk size: 256` and a
+namespace line `nixl_kv namespace='d9dbd20693b2' (ok)` — **the namespace
+must be identical on both nodes** or no cross-node hit is possible.
+
+Then drive real load through the proxy with a unique prompt per request (a
+per-run nonce, so no request can reuse another's prefix), and read every
+level. Measured 2026-09-21 with 14 requests of ~8,849 prompt tokens each
+(14/14 OK in 166.4 s):
+
+| Level | Surface | Reading |
+|---|---|---|
+| vLLM prefill | `:8100/metrics` | `prompt_tokens_total = 126,240` |
+| LMCache L1 | `:8080/status` | 20 objects, 720 MiB / 1024 MiB = **70.3%**, LRU @ 0.8 watermark |
+| LMCache L2 | `:8080/status` | `l2_commit_writes = 36`, `stored_object_count = 36` |
+| NIXL XNVME_KV plugin | `NIXL_KV_METRICS_PATH` JSON | `store_ops = 331,812`, `store_bytes = 1,359,101,952`, `completions_err = 0`, `submit_fail = 0`, `stalls = 0` |
+
+**The arithmetic must reconcile exactly, and that is the actual proof** —
+not the fact that requests returned 200:
+
+```
+36 groups x 9,217 ops/group (9,216 pages of 4096 B + 1 commit object) = 331,812 = store_ops
+331,812 x 4096                                                        = 1,359,101,952 = store_bytes = 1.266 GiB
+```
+
+> 1.266 GiB written with **zero errors** onto a freshly-wiped namespace
+> independently re-confirms TODO 6.39's retraction: there never was a
+> 1 GiB limit on this namespace.
+
+Also record: mean device latency **2,540 µs**, and `submit_retry =
+156,832,920` against 331,812 completed ops = **~473 retries per op** — the
+reactor busy-spins on `-EBUSY` backpressure, the same signature as TODO
+6.35/6.37. That, not the device, is where the time goes.
+
+### §4A.3 Path 3 — a COLD reader gets KV back off the device
+
+Two independent pieces of evidence, and both are worth having.
+
+(a) On the **live serving path**, during the §4 benchmark sweep, decode's
+own adapter reported: `l2_device_hits = 8`, `l2_index_hits = 0`,
+`l2_probe_errors = 0`, `l2_load_aborts = 0`, with decode's **L1 holding 0
+objects** — so those 8 hits could only have come from the device, for
+content only prefill ever wrote.
+
+(b) The rigorous version, which kills the writer outright:
+
+```bash
+# [CONTROL HOST]
+./scripts/verify/60-verify-l2-crossnode.sh --no-drain
+```
+
+**Expect 9/11** (see §2.4). Measured 2026-09-21, step 5:
+
+```
+OK  l2_device_hits > 0 (served a key this daemon NEVER stored) (=4)
+OK  l2_index_hits == 0 (not served from its own in-process index) (=0)
+OK  l2_probe_errors == 0 (=0)
+OK  l2_load_aborts == 0 (=0)
+OK  TOKEN IDENTITY vs recompute baseline
+OK  unseen nonce did NOT produce a device hit (device_hits 4 -> 4)
+```
+
+---
+
 ## §5 Benchmark C — nixlbench (transport level) ❌ NOT BUILT
 
 ### §5.1 What it would answer
@@ -882,6 +1153,16 @@ below exists only *inside* the container; read them through
 **are** visible from both, because that path *is* mounted. This is the
 same fact §7 item 6 hits from the llama-benchy side, and it is what makes
 rung 50 unable to render a verdict from the control host (§2.4).
+
+**And the host path is not empty — it will mislead you.**
+`/var/log/kvstack/` exists on the host too and holds build/download logs,
+so `tail`ing it gives you a real file with plausible content that is not
+the log you wanted. Go through the container every time:
+
+```bash
+docker exec kvstack-decode tail -100 /var/log/kvstack/vllm-decode.log
+docker exec kvstack-decode tail -50  /var/log/kvstack/lmcache-mp-daemon.log
+```
 
 | File | Node | grep for |
 |---|---|---|
@@ -1161,6 +1442,173 @@ structurally can never hold two overlapping OBJ registrations.
 
 **Lesson:** compare **code paths**, not just outcomes, before trusting a
 lower rung to cover a higher one.
+
+### 15. `01-install-benchy.sh` dies with `KeyError: 'MODEL'`
+
+```
+File "<stdin>", line 4, in <module>
+KeyError: 'MODEL'
+```
+
+**Cause:** the tokenizer pre-download heredoc is a separate python process
+reading `os.environ["MODEL"]`; `cluster.env` sets `MODEL` without exporting
+it. `HF_HOME`/`HF_TOKEN` were exported right above it, `MODEL` was not.
+Because the kill lands under `set -e` **before** the CLI verification, the
+install reports FAILURE while pip has actually **SUCCEEDED** — and the
+tokenizer this step exists to pre-cache is left uncached, so the next timed
+sweep pays for a cold HF fetch inside its own measurement.
+
+**Solution:** fixed 2026-09-21 — `export MODEL` added. If you see this on
+an older checkout, the install did work; re-run after the fix to warm the
+tokenizer cache.
+
+### 16. Rung 50 reports `decode side channel reachable (30.2.1.1:5601)` FAILED from the control host
+
+**Cause:** decode's NIXL side channel is bound to a **FABRIC** address
+(`PD_SIDE_CHANNEL_HOST_DECODE=30.2.1.1`) that the control host has no route
+to, and the log-based verdict needs `/var/log/kvstack/vllm-decode.log`,
+which is not bind-mounted (§2.4).
+
+**Solution:** run rung 50 **on the decode node, in the container**. This is
+a **FALSE FAIL** on an otherwise healthy stack, not a real defect.
+
+**The context has moved, and it is worth restating precisely (§1.4).**
+`30.2.1.1` is `benic1p1`, but both roles' `UCX_NET_DEVICES` are pinned to
+a **different** device entirely. That means the side channel and the
+actual UCX data device sit on **different fabric planes**, not merely
+different subnets — TODO 1.9's original "harmless today" qualifier on
+this asymmetry is now stale and should not be read as still current;
+resolve which plane each is meant to be on before trusting either address
+under a topology change.
+
+### 17. `--prefix-benefit` reports a speedup below 1.0 on a healthy tier
+
+**Cause:** `compare_runs.py --prefix-benefit` pairs inference@depth=0
+against inference@depth>0 — two different workloads, not a like-for-like
+cache comparison (§4.4, §4A.2).
+
+**Solution:** do not trust the ratio; compare the context-load row against
+the inference row at the **same depth** instead. See TODO 1.13.
+
+### 18. The first llama-benchy run in a fresh container downloads a text corpus
+
+```
+Downloading book from https://www.gutenberg.org/files/1661/1661-0.txt...
+Saved text to cache: /root/.cache/llama-benchy/…
+```
+
+**Cause:** llama-benchy sources its prompt corpus from Project Gutenberg
+and caches it under `/root/.cache/llama-benchy`. Only
+`/root/.cache/huggingface` is bind-mounted (as `HF_HOME`) — that directory
+is **not**, so the corpus is re-downloaded after every `container.sh
+down/up`, and the run needs egress to gutenberg.org.
+
+**Solution:** it happens during llama-benchy's startup, before the timed
+runs, so it does not land inside a measured window — but it **will** fail a
+run on a host with no external egress. Re-run `01-install-benchy.sh` after
+any container recreation, and expect the corpus fetch on the first sweep
+afterwards.
+
+### 19. `ipc_wrapper.py:85` KV-cache registration OOM — root cause NOT established
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 MiB.
+GPU 0 has a total capacity of 191.98 GiB of which 28.37 GiB is free.
+```
+
+**Cause:** the LMCache MP daemon fails `REGISTER_KV_CACHE` with the above
+`torch.OutOfMemoryError` on a **2 MiB** allocation against **28.37 GiB
+free**, on IPC import 1 of 36. vLLM decode's `EngineCore` then times out
+at 300 s waiting for the daemon and its worker segfaults during HSA
+teardown, inside PyTorch's **vendored** `libhsa-runtime64.so`. Root cause
+is **NOT established** — seven candidate causes have been eliminated
+(kernel OOM, physical HBM capacity, GPU virtual address space, an env-var
+discriminator, a `dma_buf` IPC leak, container/host ROCm version skew,
+and cross-process IPC handle transport as a sufficient cause on its
+own), and none is confirmed.
+
+**2026-09-29 refinement — this is not what it looks like.** The
+allocator is already dead **before** the IPC import: a bare
+`torch.empty(2<<20, device='cuda:0')` in the same container, with no
+LMCache, no NIXL, no IPC involved at all, fails **identically** while
+vLLM decode is resident. So this is **not** an IPC failure and **not**
+an LMCache failure — it is something vLLM's `EngineCore` does that
+leaves the GPU unable to hand out any allocation to any other process,
+and every earlier "IPC" framing of this defect, including this entry's
+own title, is aimed at the wrong layer.
+
+**Solution:** none. `gpu_memory_utilization` 0.85 → 0.60 was tried and
+changed nothing — this is not a headroom problem. See
+TROUBLESHOOTING.md's `ipc_wrapper.py:85` entry for the full elimination
+record, and TODO 6.47.
+
+### 20. Zombie PID silently blocks a daemon restart
+
+**Cause:** the role container's PID 1 is `sleep infinity`, which never
+reaps. A dead LMCache MP daemon or a crashed vLLM worker therefore
+lingers as a **zombie**, and `start-lmcache-daemon.sh`'s liveness check
+uses `kill -0`, which succeeds against a defunct pid — so it reports
+`already running (pid N) — not restarting` for a daemon that is
+actually dead, and silently refuses to start a working one in its place.
+**NOT FIXED.**
+
+**Solution:** `container.sh down <role>` then `up <role>`. Recreating the
+container is the only reliable way to clear the zombie (this is the same
+underlying fact §7 item 8 depends on for a genuinely cold reader).
+
+### 21. RDMA mode connects anyway over TCP
+
+**Cause:** a silent TCP fallback can pass RDMA acceptance even with
+`KV_TRANSPORT=rdma` set. By design `setup_ucx_env` excludes `tcp` from
+`UCX_TLS` in RDMA mode (HANDOFF invariant 6), but anything that bypasses
+`setup_ucx_env` — a hand-launched vLLM process, or `UCX_TLS` exported
+earlier in the environment and left to override what this function
+sets — reintroduces it invisibly. This is now **live-relevant**, not
+theoretical: `creds/setup-4.env` sets `KV_TRANSPORT="rdma"` for this
+cluster.
+
+**Solution:** confirm nothing pre-sets `UCX_TLS` before `setup_ucx_env`
+runs, and confirm which leg you are actually observing — the storage leg
+is NVMe-oF/TCP unconditionally by design, and seeing TCP there is
+correct, not a fallback. See TROUBLESHOOTING.md's "RDMA mode connects
+anyway over TCP" entry for the full diagnostic.
+
+### 22. `UCX_IB_ROCE_SUBNET_PREFIX_LEN` must be 8, not 16
+
+**Cause:** prefill and decode sit in different `/24`s — smc1 is
+`30.1.N.1/24`, smc2 is `30.2.N.1/24` — so UCX's RoCE local-subnet
+reachability check needs to compare at `/8` to see them as the same
+fabric. At the old `/16` setting UCX reports `Destination is
+unreachable` on every transport and silently discards the RoCE lane,
+falling back to shm/ROCm-only transports that cannot do active
+messages. **A verbs-level check cannot detect this**: `ib_send_bw` over
+the identical devices at the identical GID index reads a healthy
+**25858 MiB/s** regardless of this setting, because `ib_send_bw` never
+consults it — this is a UCX policy filter, not a fabric fault.
+
+**Solution:** `UCX_IB_ROCE_SUBNET_PREFIX_LEN` must be `8`. See
+`config/cluster.env`'s comment on this variable for the isolated,
+single-variable measurement.
+
+### 23. `NIXL_ERR_BACKEND` / `EngineCore failed to start` from a stale RDMA device pin
+
+**Cause:** a reboot renamed every RoCE device on both nodes (§1.4), and
+creds still pinned the old names. **Measured 2026-09-30:** after the
+2026-09-29 reboot, devices came back as `roce_benicNp1` while creds still
+pinned `ionic_7:1`. UCX matches no device, falls back to a transport that
+cannot do active messages, and `NixlConnector` dies at construction with
+`NIXL_ERR_BACKEND`; vLLM surfaces this as `EngineCore failed to start`
+from `multi_connector.py`. See §1.4 for the check that catches this and
+the full failure signature.
+
+**The diagnostic lesson is worth keeping on its own:** the top-level
+Python traceback (`RuntimeError: Engine core initialization failed`)
+never names a device. The UCX `WARN` that does — and that lists the
+correct device names to use instead — sits ~6 lines **above**
+`EngineCore failed to start` in the container's `vllm-decode.log`.
+Always read upward from that line, not just at it.
+
+---
 
 ---
 
