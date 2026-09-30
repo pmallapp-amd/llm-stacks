@@ -157,13 +157,26 @@ party's target to reclaim it — agree ownership first.**
 
 As of 2026-09-18 the live `nvmf_tgt` serves `nqn.2016-06.io.spdk:cnode1`,
 **not** our `nqn.2024-01.io.nixl:kv0` — and `/dev/ng1n1` works on both
-compute nodes anyway, because each node's own Pensando DSC is itself an
-NVMe-oF initiator that re-exports the target's namespace as a local PCIe
-function. There is no local, independent, unshareable device here.
+compute nodes anyway.
 
-**Consequence for benchmarking:** you are sharing a 1 GiB namespace with
-someone else, and **there is no delete primitive** (TODO 6.29). Size your
-runs (§3.6).
+**This section used to explain that away with a re-export model — that each
+node's DSC is itself an NVMe-oF initiator transparently re-exporting the
+target's namespace. That model is RETRACTED** (HANDOFF §2, TODO 6.36).
+`/dev/ng1n1` is `transport=pcie` at `0000:36:00.0`, subsystem
+`nqn.2019-08.com.pensando:...`, `mn=PDSNVME` — a **local** Pensando
+function, with no NVMe-oF connection from the host at all. The target has
+served **zero I/O**, and its listener is TCP-unreachable from compute.
+
+What still stands: the medium **is** genuinely shared between the two
+compute nodes — rungs 30/35 store on one and read back byte-exact on the
+other, with negative controls. **What backs it is an open question for the
+hardware owner.** Do not re-derive an answer from the matching `eui64`; it
+is equally consistent with a fixed identifier in Pensando firmware.
+
+**Consequence for benchmarking:** the namespace is shared with someone
+else, and **there is no delete primitive** (TODO 6.29). Size your runs
+(§3.6) — but see the capacity note there before reusing any "1 GiB"
+figure you may have seen in an older copy of this document.
 
 ### §1.5 The container, and the overlays that make it work
 
@@ -421,9 +434,18 @@ like success.
 
 ### §3.6 Capacity — size runs before you launch them
 
-The namespace is **1 GiB with no delete primitive** (TODO 6.29). Space is
-never reclaimed, and pre-fix corrupt objects from earlier sessions are
-still resident. Budget before running:
+**The "1 GiB namespace" figure this section used to budget against was
+never real** (HANDOFF §2, TODO 6.39). It came from reading NVM-command-set
+LBA fields (`nsze × 512`) on a `csi 0x1` namespace that **has no LBAs**.
+~1.16 GiB was written through it in one session with zero errors, so treat
+**~1.16 GiB as a measured lower bound, not a limit** — the DSC's real
+ceiling is unmeasured. The SPDK target for its part advertises
+`num_blocks=UINT64_MAX` (16 EiB) and is bounded only by its own RAM.
+
+What has not changed, and is the actual reason to budget: **there is no
+delete primitive** (TODO 6.29). Space is never reclaimed, and pre-fix
+corrupt objects from earlier sessions are still resident. Budget before
+running:
 
 ```
 device ops per run = (data_size_kb/4 + 1) * num_keys * (rounds + warmup_rounds)
@@ -854,11 +876,15 @@ optimisation target, not a solved problem.
 
 ### 12. The namespace filled up / stale objects
 
-1 GiB, **no delete primitive**, shared with another party, and it still
-holds pre-fix corrupt objects. `50-reset-namespace.sh` currently **refuses
-to run** because the live `nvmf_tgt` was not started by this repo's scripts;
+**No delete primitive**, shared with another party, and it still holds
+pre-fix corrupt objects. `50-reset-namespace.sh` currently **refuses to
+run** because the live `nvmf_tgt` was not started by this repo's scripts;
 replacing it risks the DSC/DPU peering, and DSC recovery is
 non-deterministic and slow.
+
+**Do not size against "1 GiB"** — that limit was never real (§3.6,
+TODO 6.39). If you are running out of room, the cause is the absent delete
+primitive, not a capacity ceiling you have hit.
 
 **Solution:** size runs (§3.6) and use a distinct `namespace` per run so
 old objects can never be mistaken for new hits. Do not attempt a drain
