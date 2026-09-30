@@ -98,8 +98,15 @@ wait_for_port() {
     local host="$1" port="$2" timeout="${3:-120}"
     local deadline=$(( $(date +%s) + timeout ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
+        # The probe runs in a SUBSHELL, so fd 3 is opened and discarded
+        # there — this shell never held it and has nothing to close. The
+        # `exec 3>&- 2>/dev/null` that used to sit here was therefore not
+        # just redundant: a redirection on `exec` is permanent, so it
+        # rebound THIS shell's fd 2 to /dev/null from the first successful
+        # port probe onward, silently discarding every later diagnostic in
+        # whatever script called wait_for_port. See the same bug, and how
+        # it presented, at require_rdma_access() below (2026-09-29).
         if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
-            exec 3>&- 2>/dev/null || true
             return 0
         fi
         sleep 1
@@ -238,19 +245,34 @@ srcip_to() {
 #      reintroduce the TCP fallback pinning "ib" exists to prevent.
 #      Recorded as BLOCKER 7, 2026-09-11.
 #
-# UCX_IB_ROCE_LOCAL_SUBNET=y + UCX_IB_ROCE_SUBNET_PREFIX_LEN=16 are
-# MANDATORY, not tuning: every DSC3 fabric link is a /31 point-to-point, so
-# prefill and decode sit in DIFFERENT IP subnets, and UCX's RoCE
-# reachability check derives its compare length from the netmask by
-# default — rejecting a perfectly routable peer with "unreachable IB
-# device address" unless the check is told to compare at /16 instead.
+# UCX_IB_ROCE_LOCAL_SUBNET=y + UCX_IB_ROCE_SUBNET_PREFIX_LEN are MANDATORY,
+# not tuning: prefill and decode sit in DIFFERENT IP subnets, and UCX's RoCE
+# reachability check rejects a perfectly routable peer with "unreachable IB
+# device address" unless told how wide to compare.
+#
+# CORRECTED 2026-09-24: the width is /8, not /16, and the reason given here
+# for /16 ("every DSC3 fabric link is a /31 point-to-point") was false —
+# the links are /24. smc1 is 30.1.0.0/16 and smc2 is 30.2.0.0/16, so a /16
+# compare still calls the peer non-local and discards the RoCE lane.
+# Measured single-variable, everything else identical: PREFIX_LEN=16 gives
+# "rc_verbs/ionic_2:1 - Destination is unreachable"; PREFIX_LEN=8 gives
+# 25040 MB/s. Raw ib_send_bw over the same devices is healthy either way
+# (25858 MiB/sec) because perftest does not consult this knob — so a verbs-
+# level check cannot detect this failure. Authoritative copy of this
+# rationale, with the full evidence, is in config/cluster.env; keep the two
+# in lockstep.
 #
 # UCX_NET_DEVICES is looked up PER ROLE (PREFILL_UCX_NET_DEVICES /
 # DECODE_UCX_NET_DEVICES), not assumed symmetric: the device index does not
-# map to the same fabric plane on both hosts (e.g. ionic_2 can be a
-# different physical port on SMC1 than on SMC2) — only ionic_0/ionic_1 are
-# confirmed to line up. See scripts/{prefill,decode}/01-host-prep.sh for
-# the per-host device/port report.
+# map to the same fabric plane on both hosts. RE-MEASURED 2026-09-24 — the
+# only index naming the same physical port on both is ionic_7 (benic2p1 on
+# each); ionic_2, which setup-4 pins, is benic5p1 on SMC1 and benic4p1 on
+# SMC2. The older claim that "only ionic_0/ionic_1 are confirmed to line up"
+# was never true and is withdrawn. Cross-plane still works because the
+# fabric is routed, not point-to-point. Full mapping and evidence in
+# config/cluster.env's UCX_NET_DEVICES block; see
+# scripts/{prefill,decode}/01-host-prep.sh for the per-host device report
+# (PCI only — it does not report the netdev this was measured from).
 setup_ucx_env() {
     local role="${1:-}"
     local ucx_net_dev tcp_net_dev
@@ -276,7 +298,7 @@ setup_ucx_env() {
             # that calls this more than once) so a stale RDMA-mode export
             # from an earlier call can't leak into a TCP-mode child process.
             export -n UCX_IB_GID_INDEX UCX_IB_ROCE_LOCAL_SUBNET \
-                      UCX_IB_ROCE_SUBNET_PREFIX_LEN NCCL_CUMEM_ENABLE 2>/dev/null || true
+                      UCX_IB_ROCE_SUBNET_PREFIX_LEN 2>/dev/null || true
             # NOT optional, and NOT safe to leave to UCX's autodetection.
             # This used to fall through to `unset UCX_NET_DEVICES` and log
             # "<auto>". Measured 2026-09-15: "<auto>" makes UCX advertise
@@ -306,13 +328,25 @@ setup_ucx_env() {
             export UCX_IB_GID_INDEX
             export UCX_IB_ROCE_LOCAL_SUBNET
             export UCX_IB_ROCE_SUBNET_PREFIX_LEN
-            export NCCL_CUMEM_ENABLE
+            # Deliberately NOT exporting NCCL_CUMEM_ENABLE here. This is a
+            # ROCm cluster: the collective library is RCCL, not NCCL, and
+            # NCCL_CUMEM_ENABLE is an NVIDIA knob for the CUDA VMM (cuMem*)
+            # allocator. It also cannot be load-bearing at TP_SIZE=1, where
+            # there are no collectives to configure at all. The HIP-IPC KV
+            # export path it was added to protect is already guarded, ROCm-
+            # natively, by PYTORCH_HIP_ALLOC_CONF=expandable_segments:False
+            # (container.sh; 20-build-vllm-lmcache.sh's env.sh).
+            # Measured 2026-09-23: with it set, the LMCache MP daemon fails
+            # to map vLLM's KV caches over HIP IPC and dies in
+            # cuda/ipc_wrapper.py to_tensor() with OutOfMemoryError on a
+            # 2 MiB allocation against ~28 GiB free, taking decode's engine
+            # init down with ConnectionError after 300 s.
             # No TCP in UCX_TLS on purpose: see function comment above.
             log "UCX: RDMA mode (UCX_TLS=${UCX_TLS} UCX_NET_DEVICES=${UCX_NET_DEVICES}" \
                 " UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX}" \
                 " UCX_IB_ROCE_LOCAL_SUBNET=${UCX_IB_ROCE_LOCAL_SUBNET}" \
                 " UCX_IB_ROCE_SUBNET_PREFIX_LEN=${UCX_IB_ROCE_SUBNET_PREFIX_LEN}" \
-                " NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE})"
+                " PYTORCH_HIP_ALLOC_CONF=${PYTORCH_HIP_ALLOC_CONF:-<unset>})"
             ;;
         *) die "invalid KV_TRANSPORT='${KV_TRANSPORT}' (expected tcp|rdma)" ;;
     esac
@@ -536,10 +570,21 @@ require_rdma_access() {
         " t~90s if this preflight hadn't caught it first (measured" \
         " 2026-09-11)."
 
+    # NOTE, and do not "tidy" this back: a redirection written on `exec`
+    # itself is PERMANENT for the shell, because `exec` with no command is
+    # defined to alter the shell's own fd table. `exec 3>&- 2>/dev/null`
+    # therefore does not merely silence the close — it silently rebinds
+    # fd 2 to /dev/null for the WHOLE REMAINDER of start-vllm.sh.
+    # Measured 2026-09-29 on smc2: with KV_TRANSPORT=rdma, decode died at
+    # exit 1 with ZERO output, because every die/err after this point, and
+    # vLLM's entire stderr, was being written to /dev/null. The preflight
+    # banner was the last thing anyone ever saw. Closing an fd that is
+    # known-open cannot fail, so the suppression bought nothing and cost
+    # every downstream diagnostic in the script.
     local _opened=0 _n
     for _n in "${_nodes[@]}"; do
         if { exec 3<>"${_n}"; } 2>/dev/null; then
-            exec 3>&- 2>/dev/null || true
+            exec 3>&-
             _opened=1
             break
         fi
@@ -566,26 +611,45 @@ require_rdma_access() {
         " write, or the limits file is missing/wrong. Start a fresh" \
         " session and retry."
 
-    require_cmd ibv_devinfo
-    local _devinfo
-    _devinfo="$(ibv_devinfo 2>/dev/null || true)"
-    if printf '%s\n' "${_devinfo}" | grep -q 'state:.*PORT_ACTIVE'; then
-        ok "ibv_devinfo reports at least one port PORT_ACTIVE"
+    # Port-state check. PREFER ibv_devinfo, but DO NOT require it: it is
+    # installed on the HOST and NOT inside the role container (docs/TODO.md
+    # 3.2's operational note). This function runs on both sides of that
+    # boundary — start-vllm.sh calls it from INSIDE the container — so a hard
+    # `require_cmd ibv_devinfo` here blocks KV_TRANSPORT=rdma outright even on
+    # a perfectly healthy fabric, and does it as a near-silent die at the
+    # preflight banner. sysfs carries the same facts and is present in both
+    # contexts, so it is the fallback. Measured 2026-09-23.
+    local _devinfo="" _probe="" _active=0 _dev_name="${net_dev%%:*}"
+    if command -v ibv_devinfo >/dev/null 2>&1; then
+        _probe="ibv_devinfo"
+        _devinfo="$(ibv_devinfo 2>/dev/null || true)"
+        printf '%s\n' "${_devinfo}" | grep -q 'state:.*PORT_ACTIVE' && _active=1
     else
-        die "no RDMA port reports PORT_ACTIVE in ibv_devinfo output —" \
-            " KV_TRANSPORT=rdma cannot proceed without an active fabric" \
-            " link. Full ibv_devinfo output:"$'\n'"${_devinfo}"
+        _probe="sysfs /sys/class/infiniband (ibv_devinfo not installed here)"
+        shopt -s nullglob
+        local _s
+        for _s in /sys/class/infiniband/*/ports/*/state; do
+            _devinfo+="${_s} = $(cat "${_s}" 2>/dev/null)"$'\n'
+            # IB states: DOWN(1) INIT(2) ARMED(3) ACTIVE(4) ACTIVE_DEFER(5).
+            # Anchor so ACTIVE_DEFER is not counted as ACTIVE.
+            grep -q ': ACTIVE$' "${_s}" 2>/dev/null && _active=1
+        done
+        shopt -u nullglob
     fi
+    [ "${_active}" -eq 1 ] || die "no RDMA port reports an ACTIVE state" \
+        " (probed via ${_probe}) — KV_TRANSPORT=rdma cannot proceed without" \
+        " an active fabric link. Full port-state output:"$'\n'"${_devinfo}"
+    ok "at least one RDMA port ACTIVE (probed via ${_probe})"
     if [ -n "${net_dev}" ]; then
-        local _dev_name="${net_dev%%:*}"
         if printf '%s\n' "${_devinfo}" | grep -q "${_dev_name}"; then
-            ok "configured UCX_NET_DEVICES device '${_dev_name}' present in ibv_devinfo"
+            ok "configured UCX_NET_DEVICES device '${_dev_name}' present (via ${_probe})"
         else
             warn "configured UCX_NET_DEVICES device '${_dev_name}' (from" \
-                 " '${net_dev}') not seen in ibv_devinfo output — double" \
+                 " '${net_dev}') not seen in ${_probe} output — double" \
                  " check PREFILL_UCX_NET_DEVICES/DECODE_UCX_NET_DEVICES" \
                  " against THIS host's actual device name (F3: the device" \
-                 " index is not guaranteed symmetric across hosts)."
+                 " index is not symmetric across hosts — re-measured" \
+                 " 2026-09-24, only ionic_7 corresponds on both)."
         fi
     fi
 
@@ -720,6 +784,170 @@ resolve_xnvme_kv_dev() {
     esac
 }
 
+# assert_kv_char_device <path> — die unless <path> can be a KV namespace.
+#
+# A KV namespace has NO block device: the kernel refuses to build one for a
+# non-NVM command set and creates only the generic char node, whereas an
+# ordinary NVM namespace (e.g. this host's local boot drive) has both. So
+# /dev/ngXnY with a MATCHING /dev/nvmeXnY is a data disk, not a KV namespace —
+# see plugins/xnvme-kv/xnvme_kv_backend.cpp's discover_kv_device() comment,
+# which runs the identical test inside the plugin's own autodiscovery.
+#
+# Running it again here, on the EXPLICIT path an operator gave us (or that NQN
+# resolution just picked), catches the case that matters most: someone pasted
+# the wrong device node by hand, or NQN resolution's own block-device filter
+# somehow got bypassed. This is cheap and prevents writing KV opcodes at
+# somebody's filesystem.
+#
+# WHY THIS IS A FUNCTION rather than inline in setup_nixl_kv_env: container.sh
+# maps a device into the container along a path that never calls
+# setup_nixl_kv_env, and its own guard used to be a bare `[ -c ]` — which an
+# ordinary NVM namespace PASSES, because every NVM namespace gets an `ng` node
+# too. On a host whose /dev/ng1n1 is a plain SSD (setup 3: a Micron 7450), that
+# bare check is the difference between mapping the KV namespace and handing a
+# filesystem to a KV backend. Both call sites need the real test.
+assert_kv_char_device() {
+    local dev="${1:?assert_kv_char_device: no device path given}"
+    local _base _blk
+
+    [ -e "${dev}" ] || die "assert_kv_char_device: ${dev} does not exist on" \
+        " this host. Check the kernel nvme-of initiator actually connected" \
+        " (nvme list-subsys) before retrying — see" \
+        " scripts/common/nvme-connect-kv.sh."
+    [ -c "${dev}" ] || die "assert_kv_char_device: ${dev} is not a character" \
+        " device. A KV namespace is char-only; this path is something else."
+
+    _base="$(basename -- "${dev}")"
+    if [[ "${_base}" =~ ^ng([0-9]+)n([0-9]+)$ ]]; then
+        _blk="$(dirname -- "${dev}")/nvme${BASH_REMATCH[1]}n${BASH_REMATCH[2]}"
+        if [ -e "${_blk}" ]; then
+            die "assert_kv_char_device: ${dev} has a matching block device" \
+                " (${_blk}). A true KV namespace has NO block device — the" \
+                " kernel cannot build one for a non-NVM command set. This" \
+                " path is an ordinary NVM namespace (a data disk — a local" \
+                " boot or data SSD, not the KV controller). Refusing to hand" \
+                " it to the KV backend — check \`nvme list-subsys\` for the" \
+                " controller whose subsysnqn is '${NVMF_SUBNQN:-<unset>}'" \
+                " before overriding XNVME_DEV."
+        fi
+    else
+        warn "assert_kv_char_device: ${dev} does not match the expected" \
+             " /dev/ngCnN shape — skipping the block-device safety check" \
+             " because the controller/namespace numbers can't be parsed out" \
+             " of it. Confirm by hand that this is really a KV namespace" \
+             " char device, not a data disk."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ssh to a role node — key auth FIRST, password only as a fallback.
+#
+# WHY THIS EXISTS. scripts/verify/35-* and 60-* each grew their own ssh helper
+# that passed `-o PubkeyAuthentication=no` UNCONDITIONALLY and read
+# ${PREFILL_PASS}/${DECODE_PASS}. That does not "prefer" passwords — it
+# DISABLES key auth outright, so on any lab that uses keys (and has no password
+# to offer) both rungs fail at their first ssh, before running a single check.
+# The failure surfaces as "no RESULT line", which reads like a broken test
+# rather than a broken login.
+#
+# deploy.sh got this right (it adds those options only inside its password
+# branch, after key auth has actually been tried and failed). These helpers are
+# that same logic, put somewhere the verify rungs can share it, so there is one
+# auth policy in the repo instead of three.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# kv_ssh_base_opts — echo the common ssh options, one per line.
+#
+# Host-key checking is deliberately off: these are reimaged lab nodes whose
+# keys change under us, and a hard host-key failure mid-ladder is noise, not
+# security. SSH_IDENTITY_FILE is honoured when set, because a key whose name
+# is not one of ssh's defaults (id_rsa/id_ed25519/...) is NOT tried unless it
+# is named explicitly — the exact case that makes "key auth works when I do it
+# by hand" and "the script says key auth failed" both true at once.
+kv_ssh_base_opts() {
+    printf '%s\n' -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+    if [ -n "${SSH_IDENTITY_FILE:-}" ]; then
+        printf '%s\n' -i "${SSH_IDENTITY_FILE}" -o IdentitiesOnly=yes
+    fi
+}
+
+# kv_ssh <prefill|decode|target> <cmd...> — run a command on that role's node.
+#
+# Probes key auth once per role and caches the verdict in KV_SSH_AUTH_MODE.
+# Dies naming the host if neither key nor password auth is usable — an
+# unreachable node must not surface as a failed assertion.
+#
+# The cache is per-SHELL, so a caller that wraps this in command substitution
+# (`out="$(kv_ssh decode ...)"` — which is most of rungs 35 and 60) re-probes
+# on every call and pays one extra ssh handshake for it. That is deliberate:
+# the alternative is to run the caller's real command under key auth and retry
+# on ssh's exit 255, which would RE-EXECUTE a command that had already run if
+# it happened to exit 255 itself. Rung 60 restarts services, so a spurious
+# double execution is far worse than an extra round trip.
+declare -A KV_SSH_AUTH_MODE=()
+
+kv_ssh() {
+    local role="${1:?kv_ssh: no role given}"; shift
+    local host user pass
+    case "${role}" in
+        prefill) host="${PREFILL_HOST}"; user="${PREFILL_USER:-${SSH_USER:-root}}"; pass="${PREFILL_PASS:-}" ;;
+        decode)  host="${DECODE_HOST}";  user="${DECODE_USER:-${SSH_USER:-root}}";  pass="${DECODE_PASS:-}"  ;;
+        target)  host="${TARGET_HOST}";  user="${TARGET_USER:-${SSH_USER:-root}}";  pass="${TARGET_PASS:-}"  ;;
+        *) die "kv_ssh: unknown role '${role}' (expected prefill|decode|target)" ;;
+    esac
+
+    local -a base=()
+    mapfile -t base < <(kv_ssh_base_opts)
+
+    if [ -z "${KV_SSH_AUTH_MODE[${role}]:-}" ]; then
+        if ssh "${base[@]}" -o BatchMode=yes "${user}@${host}" true 2>/dev/null; then
+            KV_SSH_AUTH_MODE["${role}"]="key"
+        elif [ -n "${pass}" ] && command -v sshpass >/dev/null 2>&1 &&
+             SSHPASS="${pass}" sshpass -e ssh "${base[@]}" \
+                 -o PubkeyAuthentication=no \
+                 -o PreferredAuthentications=keyboard-interactive,password \
+                 "${user}@${host}" true 2>/dev/null; then
+            KV_SSH_AUTH_MODE["${role}"]="password"
+        else
+            die "kv_ssh: cannot reach ${role} (${user}@${host}). Key auth" \
+                " failed$([ -n "${pass}" ] && echo ' and so did password auth' || echo " and no ${role^^}_PASS is set")." \
+                " If this lab uses a key whose filename is not an ssh" \
+                " default, set SSH_IDENTITY_FILE in creds/active.env — ssh" \
+                " will not try such a key unless it is named."
+        fi
+    fi
+
+    if [ "${KV_SSH_AUTH_MODE[${role}]}" = "key" ]; then
+        ssh "${base[@]}" -o BatchMode=yes "${user}@${host}" "$@"
+    else
+        SSHPASS="${pass}" sshpass -e ssh "${base[@]}" \
+            -o PubkeyAuthentication=no \
+            -o PreferredAuthentications=keyboard-interactive,password \
+            "${user}@${host}" "$@"
+    fi
+}
+
+# kv_ctrl_field <kv-char-device> <sysfs-field> — echo /sys/class/nvme/nvmeN/<field>
+#
+# Answers "who opens the NVMe-oF session for this KV namespace", which is the
+# one fact that differs between a locally-presented KV function (transport=pcie
+# — the card dials the target itself, the host is not an initiator) and a
+# kernel nvme-of initiator (transport=tcp/rdma — this host dials it). Callers
+# branch on that rather than on a per-setup assumption or an operator-set flag,
+# because sysfs cannot be got wrong the way either of those can.
+#
+# Returns non-zero and echoes nothing when the field is unreadable.
+kv_ctrl_field() {
+    local dev="${1:?kv_ctrl_field: no device path given}"
+    local field="${2:?kv_ctrl_field: no field given}"
+    local s ctrl
+
+    s="$(basename -- "${dev}")"; s="${s#ng}"; ctrl="${s%%n*}"
+    [[ "${ctrl}" =~ ^[0-9]+$ ]] || return 1
+    cat "/sys/class/nvme/nvme${ctrl}/${field}" 2>/dev/null || return 1
+}
+
 # XNVME_KV branch — exports exactly the NIXL_XNVME_* vars this plugin reads
 # (plugins/xnvme-kv/xnvme_kv_backend.cpp), plus the metrics-interval var it
 # shares the spelling of with SPDK (NIXL_KV_METRICS_INTERVAL_SEC — see that
@@ -774,55 +1002,17 @@ _setup_nixl_kv_env_xnvme() {
             " the target is actually connected (nvme list-subsys), or set" \
             " XNVME_DEV=/dev/ngXnY explicitly — see config/cluster.env's" \
             " XNVME_DEV comment for the ng0n1 (boot drive) vs ng1n1" \
-            " (Pensando DSC) hazard on this cluster."
-    fi
-    if [ ! -e "${XNVME_DEV}" ]; then
-        die "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} does not exist on" \
-            " this host. Check the kernel nvme-of initiator actually" \
-            " connected (nvme list-subsys) before retrying — a stale or" \
-            " mistyped path here must not silently become an autodiscovery"\
-            " guess either."
+            " (Pensando DSC) hazard on this cluster." \
+            " If this host reaches the KV namespace over the kernel nvme-of" \
+            " initiator rather than a local PCIe function, the session is" \
+            " simply not connected — run" \
+            " scripts/common/nvme-connect-kv.sh on this node."
     fi
 
-    # A KV namespace has NO block device: the kernel refuses to build one
-    # for a non-NVM command set and creates only the generic char node,
-    # whereas an ordinary NVM namespace (e.g. this host's local boot drive)
-    # has both. So /dev/ngXnY with a MATCHING /dev/nvmeXnY is a data disk,
-    # not a KV namespace — see plugins/xnvme-kv/xnvme_kv_backend.cpp's
-    # discover_kv_device() comment, which runs the identical test inside the
-    # plugin's own autodiscovery. Running it again here, on the EXPLICIT
-    # path an operator gave us (or that NQN resolution just picked), catches
-    # the case that matters most: someone pasted the wrong device node by
-    # hand, or NQN resolution's own block-device filter somehow got bypassed.
-    # This is cheap and prevents writing KV opcodes at somebody's filesystem
-    # — concretely, on smc1/smc2, this is the check that stops
-    # XNVME_DEV=/dev/ng0n1 (the Micron OS BOOT drive, which has
-    # nvme0n1p1/nvme0n1p2 block partitions) from ever being handed to the KV
-    # backend; only /dev/ng1n1 (the Pensando DSC, PDSNVME-00) has no matching
-    # block device and passes.
-    local _base
-    _base="$(basename -- "${XNVME_DEV}")"
-    if [[ "${_base}" =~ ^ng([0-9]+)n([0-9]+)$ ]]; then
-        local _blk; _blk="$(dirname -- "${XNVME_DEV}")/nvme${BASH_REMATCH[1]}n${BASH_REMATCH[2]}"
-        if [ -e "${_blk}" ]; then
-            die "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} has a matching" \
-                " block device (${_blk}). A true KV namespace has NO block" \
-                " device — the kernel cannot build one for a non-NVM" \
-                " command set. This path is an ordinary NVM namespace (a" \
-                " data disk — on smc1/smc2 this is almost certainly" \
-                " /dev/ng0n1, the Micron OS BOOT drive, not /dev/ng1n1, the" \
-                " Pensando DSC). Refusing to hand it to the KV backend —" \
-                " double-check /dev/ngXnY against \`nvme list-subsys\` and" \
-                " this host's actual KV controller before overriding" \
-                " XNVME_DEV."
-        fi
-    else
-        warn "setup_nixl_kv_env: XNVME_DEV=${XNVME_DEV} does not match the" \
-             " expected /dev/ngCnN shape — skipping the block-device safety" \
-             " check because the controller/namespace numbers can't be" \
-             " parsed out of it. Confirm by hand that this is really a KV" \
-             " namespace char device, not a data disk."
-    fi
+    # Existence, char-ness and the block-device safety check all live in
+    # assert_kv_char_device, so container.sh's own device guard runs the
+    # identical test rather than a weaker one.
+    assert_kv_char_device "${XNVME_DEV}"
 
     export NIXL_XNVME_DEV="${XNVME_DEV}"
     export NIXL_XNVME_NSID="${XNVME_NSID}"

@@ -75,16 +75,11 @@ PASS=0; FAIL=0
 
 _ssh() {
     local role="$1"; shift
-    local host user pass
-    case "${role}" in
-        prefill) host="${PREFILL_HOST}"; user="${PREFILL_USER:-root}"; pass="${PREFILL_PASS}" ;;
-        decode)  host="${DECODE_HOST}";  user="${DECODE_USER:-root}";  pass="${DECODE_PASS}" ;;
-    esac
-    SSHPASS="${pass}" sshpass -e ssh -o ConnectTimeout=10 \
-        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR -o PubkeyAuthentication=no \
-        -o PreferredAuthentications=keyboard-interactive,password \
-        "${user}@${host}" "$@"
+    # kv_ssh (lib.sh) tries KEY auth first and only falls back to sshpass.
+    # This used to pass -o PubkeyAuthentication=no unconditionally, which
+    # disabled key auth outright — on a key-only lab this rung could never
+    # run at all, and said so only as a missing RESULT line.
+    kv_ssh "${role}" "$@"
 }
 _in() { local role="$1"; shift; _ssh "${role}" "cd ${NODE_ROOT} && ./scripts/common/container.sh exec ${role} \"$*\""; }
 
@@ -98,7 +93,7 @@ check() {
 # HTTP status. The adapter's report_status() is the only place these exist;
 # the plugin's own m_* metrics do NOT cover lookups at all.
 l2stat() {
-    _in "$1" "curl -s --max-time 5 http://127.0.0.1:8080/status" 2>/dev/null \
+    _in "$1" "curl -s --max-time 5 http://127.0.0.1:${LMCACHE_MP_HTTP_PORT}/status" 2>/dev/null \
       | python3 -c "
 import json,sys
 try: d=json.load(sys.stdin)
@@ -258,9 +253,9 @@ role_down() {
     # exec: there may be no container left to exec into, and --network
     # host means the daemon's :8080 is already the HOST's :8080, so a
     # plain curl from the control host is a real reachability test.
-    if _ssh "${role}" "curl -s --max-time 5 http://127.0.0.1:8080/status" \
+    if _ssh "${role}" "curl -s --max-time 5 http://127.0.0.1:${LMCACHE_MP_HTTP_PORT}/status" \
         >/dev/null 2>&1; then
-        die "${role}: LMCache daemon on :8080 STILL answers after" \
+        die "${role}: LMCache daemon on :${LMCACHE_MP_HTTP_PORT} STILL answers after" \
             " container.sh down ${role} — the cold-reader premise of this" \
             " rung is not established; nothing measured past this point" \
             " would be attributable. Investigate before re-running."
@@ -298,10 +293,10 @@ role_up() {
     # The engine answering /health is NOT the same as the daemon being
     # reachable; start-vllm.sh gates on the daemon, but re-assert it here so
     # a half-up stack fails as itself rather than as a cache miss.
-    _in "${role}" "curl -s --max-time 5 http://127.0.0.1:8080/status" >/dev/null 2>&1 \
+    _in "${role}" "curl -s --max-time 5 http://127.0.0.1:${LMCACHE_MP_HTTP_PORT}/status" >/dev/null 2>&1 \
         || die "${role}: vLLM is healthy but the LMCache daemon's HTTP status" \
                " is unreachable — the L2 tier is not attached."
-    ok "${role} up (vLLM :${port} + daemon :8080), ${waited}s — start log: ${log}"
+    ok "${role} up (vLLM :${port} + daemon :${LMCACHE_MP_HTTP_PORT}), ${waited}s — start log: ${log}"
 }
 
 step "bringing both roles up cold on nixl_kv"
@@ -344,7 +339,7 @@ if _ssh prefill "curl -s --max-time 3 http://127.0.0.1:${PREFILL_PORT}/health" \
         " is not excluded and any hit below would be unattributable."
 fi
 ok "writer down and confirmed unreachable (container removed; port" \
-   " ${PREFILL_PORT} and daemon :8080 both unreachable)"
+   " ${PREFILL_PORT} and daemon :${LMCACHE_MP_HTTP_PORT} both unreachable)"
 
 # ── Step 4: restart the reader (empties prefix cache + L1 + index) ────────
 step "4. restarting reader's vLLM + daemon (excludes prefix cache and L1)"

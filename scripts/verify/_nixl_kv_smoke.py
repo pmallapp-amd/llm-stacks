@@ -191,13 +191,72 @@ def do_read(agent, backend, ns, key_string, nonce, pages, expect_miss=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["write", "read", "probe"])
-    ap.add_argument("--nonce", required=True)
+    ap.add_argument("--nonce", required=False, default=None)
     ap.add_argument("--pages", type=int, default=4)
     ap.add_argument("--namespace", default=os.environ.get("SMOKE_NS", "smoketest"))
     ap.add_argument("--backend", default=os.environ.get("KV_BACKEND", "XNVME_KV"))
-    ap.add_argument("--dev-uri", default=os.environ.get("NIXL_XNVME_DEV", "/dev/ng1n1"))
+    # NO LITERAL DEFAULT. This used to fall back to "/dev/ng1n1", which is the
+    # KV namespace on ONE lab and an ordinary data SSD on another — on setup 3
+    # it is a Micron 7450 carrying a filesystem. Writing KV opcodes at that is
+    # exactly the accident the rest of this repo's device handling exists to
+    # prevent, so a path we cannot resolve is a hard error, not a guess.
+    #
+    # Two env names are consulted because two different callers set them:
+    # NIXL_XNVME_DEV is exported by lib.sh's setup_nixl_kv_env(), which only
+    # runs if the caller sourced cluster.env; XNVME_DEV is put into the
+    # container's environment by container.sh. Invoking this script through
+    # `container.sh exec` gives you the second but not the first.
+    ap.add_argument(
+        "--dev-uri",
+        default=os.environ.get("NIXL_XNVME_DEV") or os.environ.get("XNVME_DEV"),
+    )
     ap.add_argument("--expect-miss", action="store_true")
+    # Escape hatch from the grammar, probe-only. --nonce derives a name
+    # THIS run computes; --literal-name probes a name THIS run was TOLD
+    # about -- e.g. a commit name copied out of docs/TODO.md 6.34, to ask
+    # "did that object survive a device/DPU restart?" The grammar has no
+    # opinion on a name it did not derive, so there is nothing to bypass
+    # here except the requirement that (write, read) never see a name
+    # they didn't compute themselves.
+    ap.add_argument("--literal-name", default=None)
     a = ap.parse_args()
+
+    # Emitted as a RESULT: line so the caller's `grep -E '^RESULT:'` reports a
+    # named failure rather than "<no RESULT line>", which reads like a broken
+    # harness instead of an unresolved device.
+    if not a.dev_uri:
+        sys.exit(
+            "RESULT:NO_DEV_URI: neither NIXL_XNVME_DEV nor XNVME_DEV is set "
+            "and --dev-uri was not given. Refusing to guess a /dev/ngXnY "
+            "path: on some hosts that is the KV namespace and on others it "
+            "is a data disk. Resolve it by NQN (see resolve_xnvme_kv_dev in "
+            "scripts/common/lib.sh) or pass --dev-uri explicitly."
+        )
+
+    if a.literal_name is not None and a.mode != "probe":
+        sys.exit("RESULT:LITERAL_NAME_ONLY_VALID_FOR_PROBE")
+
+    if a.mode == "probe":
+        # Exactly one source of truth for the name being probed. Letting
+        # both through would silently prefer one over the other; letting
+        # neither through would probe a name nobody asked for.
+        if (a.nonce is None) == (a.literal_name is None):
+            sys.exit("RESULT:PROBE_REQUIRES_EXACTLY_ONE_OF_NONCE_OR_LITERAL_NAME")
+    elif a.nonce is None:
+        sys.exit(f"RESULT:NONCE_REQUIRED_FOR_{a.mode.upper()}")
+
+    if a.mode == "probe" and a.literal_name is not None:
+        # No validate_namespace(), no key_string, no page_name()/
+        # commit_name(): all of that is grammar machinery for deriving a
+        # name, and a literal name was never derived -- running it
+        # through the grammar's preconditions would just reject a
+        # perfectly good historical name for not looking like one this
+        # run would have produced.
+        agent = make_agent(a.backend, a.dev_uri)
+        print(f"INFO: literal probe name = {a.literal_name}")
+        hit = probe(agent, a.backend, a.literal_name)
+        print(f"RESULT:{'HIT' if hit else 'MISS'}")
+        return (1 if hit else 0) if a.expect_miss else (0 if hit else 1)
 
     kv.validate_namespace(a.namespace)
     # A realistic ObjectKey string shape, derived from the nonce. Both

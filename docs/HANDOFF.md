@@ -1,44 +1,271 @@
 # Handoff
 
 State of the P/D-disaggregated KV cache project, for whoever picks this up
-next (including future me). Last updated 2026-09-18 (late session).
+next (including future me). Last updated 2026-09-30.
 
 Read this before [BRINGUP.md](BRINGUP.md). It tells you what is real, what is
 assumed, and what is still wrong.
 
+> **THIS FILE IS ABOUT SETUP 4 (the Pensando DSC lab) UNLESS A SECTION SAYS
+> OTHERWISE.** A second lab — **setup 3** — now runs the same stack over the
+> **Linux kernel NVMe-oF driver** instead of a local DSC function, and it
+> works end to end. Its record is [§0 below](#0-setup-3--the-kernel-nvme-of-lab-2026-09-30);
+> everything from §1 onward describes setup 4 and its DSC-specific history.
+> Do not carry setup 4's device facts (`/dev/ng1n1`, the PCI rebind boot-race,
+> the 32768 firmware ceiling's *rationale*) onto setup 3 — they do not apply.
+
+---
+
+## 0. Setup 3 — the kernel NVMe-oF lab (2026-09-30)
+
+**Status: the full stack is UP and the storage tier is PROVEN, on a KV path
+that setup 4 never achieved.** P/D disaggregated, LMCache in MP mode, KV
+served over kernel nvme-tcp from an SPDK target.
+
+Work lives on branch **`setup-3-nvmeof`**; `main` is untouched. Config is
+`creds/setup-3.env`, driven explicitly (it is deliberately NOT wired to
+`creds/active.env`, which still points at setup-4 — `creds/` is gitignored and
+therefore SHARED across branches, so repointing it would change setup 4 too):
+
+```
+export CREDS_FILE="$PWD/creds/setup-3.env"
+```
+
+### 0.1 The topology, and why it is the interesting part
+
+Setup 4 reached its KV namespace through a **local Pensando DSC PCIe
+function**: the card was the NVMe-oF initiator, the host was not, and the KV
+data never actually reached the intended target (§2, TODO 6.36).
+
+**Setup 3 has no Pensando DSC NVMe function at all** — its DSC cards expose
+only Ethernet/IPC/management PCI functions, no class-0108 NVMe. The namespace
+is **remote**, and the **stock Linux kernel nvme-tcp driver** is what reaches
+it:
+
+```
+plugin -> /dev/ng3n1 (csi=1 char device, transport=tcp)
+       -> kernel nvme_tcp
+       -> 10.235.200.144:4420
+       -> SPDK v26.05 nvmf_tgt -> bdev KvMalloc0
+```
+
+| Role | Host | Mgmt IP |
+|---|---|---|
+| prefill | `smc300x-ccs-aus-gpuf290` | 10.235.200.48 |
+| decode | `smc300x-ccs-aus-gpuf27e` | 10.235.200.175 |
+| target | `smc300x-ccs-aus-gpua54e` | 10.235.200.144 |
+
+All three: 8× MI300X, 192 CPU, 3 TB RAM, Ubuntu 22.04.5 / 6.8.0-136, **up 6
+weeks** — none of setup 4's reboot churn. Mgmt NIC `ens50f0` is **25 GbE**
+(setup 4's P→D leg was 1 GbE). The target's `nvmf_tgt` was built from
+`/home/suakella/spdk-clean` with **this repo's own KV patches**
+(`bdev/kvmalloc`, `nvmf KV namespace`) and is ours.
+
+### 0.2 Results — measured 2026-09-30
+
+| Rung | Result |
+|---|---|
+| 20 plugin | **6/6 both nodes.** `max_value_size=32768`, `dev_uri=/dev/ng3n1` |
+| 30 roundtrip | **PASS cross-node** (write f290 → read f27e, 196608 B / 6 parts), negative control `RESULT:QUERY_MISS` |
+| 35 nixl_kv naming | **8/8**, both directions, all three negative controls + `COMMIT_INVALID` |
+| 40 disagg e2e | **9/9**, TTFT 15.27x — but its hit-token metric is `NA`, so it proves the pipeline, NOT caching |
+| 50 P→D direct | **9/9**. External prefix cache hit rate **0.0% → 100.0%**, decode `Avg prompt throughput` 0.0 |
+| 60 L2 cross-node | **9/11** (the documented `--no-drain` target). Step 5 green: `l2_device_hits=4`, `l2_index_hits=0`, `l2_probe_errors=0`, `l2_load_aborts=0`, **TOKEN IDENTITY** matched |
+
+**The device's real KV geometry, read off the wire** — note it is the exact
+INVERSE of setup 4's DSC:
+
+```
+[XNVME_KV] device KV format 0: value_max=67108864 key_max=16 novg=4096
+           — configured max_value_size=32768
+```
+
+SPDK's `bdev_kvmalloc` advertises **64 MiB**, so 32768 sits far *under* the
+ceiling and the plugin's "configured > advertised" warning correctly stays
+silent. On setup 4 that warning fired on every start because the DSC
+understated 4096 against a real 32768. **`KV_MAX_VALUE_SIZE_XNVME=32768` is
+kept here only for comparability with setup 4's numbers** — the firmware
+rationale behind that value does not apply.
+
+Both daemons independently derive namespace **`d9dbd20693b2`** — the same
+fingerprint as setup 4, which is correct, since the geometry inputs (model,
+TP, chunk size, dtype, max_value_size, align) are unchanged.
+
+### 0.3 THE ROOT CAUSE THAT MATTERS: `CAP_SYS_ADMIN`
+
+**If you read one thing about this lab, read this.** It cost the whole
+storage tier and presented as a perfectly healthy cache with a 100% miss rate.
+
+The kernel gates NVMe passthrough **by opcode** in `nvme_cmd_allowed()`
+(`drivers/nvme/host/ioctl.c`): without `CAP_SYS_ADMIN` only
+flush/write/read/dsm/write_zeroes/zone_append are permitted. The KV command
+set **overlaps** those opcodes, and that overlap is what makes it so
+confusing:
+
+| KV op | opcode | aliases | result |
+|---|---|---|---|
+| `KV_STORE` | `0x01` | `nvme_cmd_write` | **allowed** |
+| `KV_RETRIEVE` | `0x02` | `nvme_cmd_read` | **allowed** |
+| `KV_EXIST` | `0x14` | — | **DENIED, -EACCES** |
+| `KV_DELETE` | `0x10` | — | **DENIED, -EACCES** |
+
+So writes succeed and only **discovery** fails. Worse, `queryMem()`
+deliberately degrades any error to "absent" (a false miss costs a recompute; a
+false hit would corrupt) — so there is no error anywhere. The tier stores
+happily and reports every lookup as a miss, which is indistinguishable from a
+cold cache. Observed:
+
+```
+op=store  ... ok=1 sct=0 sc=0            ← writes fine
+op=exist  ... rc=-13 sct=0 sc=13 (reported as MISS)
+```
+
+`rc=-13` is **-EACCES from the ioctl**, not a device status; the `sc=13` is
+incidental. Docker's default capability set omits `CAP_SYS_ADMIN`, so
+`container.sh` now adds it explicitly. **Do not diagnose a miss-only KV tier
+as a naming or namespace bug before checking this.**
+
+### 0.4 Shared-host traps — both cost a full cycle
+
+These hosts carry an **unrelated `aic-*` stack** (up 2 weeks) which was left
+running. It uses an **SPDK userspace initiator** (`AIC_SPDK_KV_TRID`), not the
+kernel char device, so our `nvme disconnect` does not disturb it — verified by
+`lsof`/`fuser` on `/dev/ng3n1` (nothing) and by its container mapping only
+`/dev/kfd`/`/dev/dri`. But it *does* own ports:
+
+1. **Port 8080 — the LMCache daemon's HTTP frontend.** Their daemon binds it
+   on both nodes, and our containers run `--network host`. The failure is
+   vicious: our daemon starts, binds ZMQ 6557 **fine**, then shuts down
+   completely when the HTTP bind fails — *after* `start-vllm.sh`'s daemon gate
+   has already passed. What you see is a vLLM that came up healthy with no
+   daemon behind it. Now `LMCACHE_MP_HTTP_PORT=8081`, and `cluster.env`
+   declares the variable so rung 60 reads it instead of hardcoding 8080 —
+   **which would have scraped the other stack's counters and reported them as
+   ours.**
+2. **Ports 5600/5601 — the NIXL side channels.** Their stack runs the same
+   software with the same defaults and the same role split, so it holds
+   exactly the ports ours wanted. Now 5610/5611.
+
+**Check ports with an anchored match.** `ss -tlnp | grep -w ":8080"` gave
+false "free" readings for every one of these and sent this bring-up down a
+blind alley. Use:
+`ss -tlnp | awk -v P=":8080$" '$4 ~ P'`.
+
+### 0.5 Other things that will bite
+
+- **`/home/suakella` is NFS**, mounted on *both* compute nodes — one shared
+  directory, ~20 GiB free. A home-directory deploy gives prefill and decode a
+  single working tree. `DEPLOY_DEST=/opt/kv-cache` (node-local) instead.
+- **`docker load` recomputes the image config**, so top-level image IDs
+  legitimately differ across hosts after a `save|load`. Compare **content**:
+  `RootFS.Layers` (DiffIDs) and `Config` — both matched here (40 layers).
+- **Pipe host-to-host, not through your workstation.** `ssh A 'docker save' |
+  ssh B 'docker load'` from a control host routes all 44 GB through your link:
+  measured **5 MiB/s**, versus **122 MiB/s** running the pipe on A itself.
+- **A zombie pidfile reads as "already running".** The daemon's start check
+  accepted a `Zs`/defunct pid and skipped the restart, so `start-vllm.sh` then
+  failed on an unreachable ZMQ port. `stop-lmcache-daemon.sh` clears it.
+- **`ping` is not installed in the container**, so rung 10's ping checks fail
+  there while the host pings fine — same class as the documented `ibv_devinfo`
+  absence. Its TCP checks are the meaningful ones.
+
+### 0.6 What is NOT proven here
+
+- **RDMA.** `KV_TRANSPORT=tcp` throughout. Setup 3's fabric looks far
+  healthier than setup 4's ever was (all `ionic` ports ACTIVE, `benic7p1` =
+  `ionic_0` on *both* hosts, `192.168.N.X/31`), and the pins are recorded in
+  creds — but no RDMA byte has been carried. Next workstream.
+- **Rung 60 step 7's drain control** — VOID by construction under
+  `--no-drain`, exactly as on setup 4. Soundness rests on the per-run nonce
+  plus negative control A, both of which passed.
+- **`l2_commit_writes=0` at rung 60 step 2**, while step 5's cold reader got
+  4 device hits with token identity. The data demonstrably reached the device,
+  so this is a counter-name/sampling-window question, not a data-path failure.
+  Unresolved.
+- **N=1 everywhere**, as on setup 4: one prefill, one decode.
+
+---
+
+> **The rest of this file is SETUP 4.**
+>
 > **Resuming? Go straight to [§3](#3-how-to-resume).** It carries the
 > cluster state as handed over, the checks to run before touching anything,
 > and what to do in what order. §§1–2 are background; §7 is the corrections
 > record — read it when you need the *why*, not to get started.
 >
-> ## 🔴 STOP — read this before planning anything
+> ## Current state — 2026-09-25 (supersedes the 2026-09-22 block
+> immediately below, for the RDMA/fabric chain specifically — that
+> block is kept intact underneath for how the fabric got here)
 >
-> **Both compute nodes' KV devices are DOWN.** `/dev/ng1n1` is absent on
-> **smc1 and smc2 both**, as of the end of the 2026-09-18 late session.
-> The hosts are fine (7 h uptime, no reboot) and the cards are alive —
-> config space reads `10051dd8` on both — but the host-side rebind
-> (§3.4) was attempted on each and failed identically at ~128 s with
-> `Device not ready; aborting initialisation, CSTS=0x0`. The DPU-side
-> application is not serving.
+> Decode host rebooted 2026-09-25 05:50:43 UTC (`amdgpu` hand-loaded
+> 06:09:32 — TODO 0.4's per-boot condition, unchanged). **The
+> auxiliary-bus RDMA blocker recorded in the 2026-09-22 block below
+> (TODO 6.45) is CLEARED**: all 8 `ionic_N` IB devices register and
+> port 1 is ACTIVE (state 4) on **both** nodes;
+> `/sys/bus/auxiliary/devices/` now carries `ionic.rdma.0`–`.7`
+> (TODO 6.46). The RoCE netdev mapping drifted again on this boot —
+> `ionic_N` → `benic(N+1)p1`, not `ionic_N` → `benicNp1` as recorded
+> below — the same-plane pin (`ionic_7:1`) still holds; re-verify the
+> mapping every boot (TODO 2.8).
 >
-> **Per TODO 6.22, only a DPU-side restart clears this, and host-side
-> resets make it worse.** Do not sit in a rebind loop. This needs the
-> hardware owner. **Nothing in the storage tier will start until it is
-> fixed** — `start-vllm.sh` hard-gates on `/dev/ng1n1` and will refuse
-> rather than silently serve from local cache.
+> **The blocker MOVED again — off the fabric entirely, onto the
+> decode-side LMCache path.** The LMCache MP daemon OOMs registering
+> the KV cache: a genuine ROCm/HIP allocator failure at
+> `lmcache/v1/platform/cuda/ipc_wrapper.py:85` (confirmed via the raw
+> ROCm runtime trace, not a mistranslated HIP error name — despite the
+> CUDA-named identifiers, this is a pure ROCm/HIP stack, no NVIDIA
+> anywhere), followed by a downstream vLLM `EngineCore` segfault during
+> HSA teardown in PyTorch's vendored `libhsa-runtime64.so`. **Root
+> cause is NOT established** — seven candidate causes are eliminated
+> (kernel OOM, HBM capacity, GPU VA exhaustion,
+> `HSA_ENABLE_IPC_MODE_LEGACY`, a ROCm `dma_buf` IPC leak, container/
+> host ROCm version skew, and cross-process IPC transport as a
+> sufficient cause), none confirmed. Full elimination record and the
+> named next experiment: `docs/TROUBLESHOOTING.md`'s `ipc_wrapper.py:85`
+> entry, and TODO 6.46/6.47.
 >
-> Worth raising with the owner at the same time: **this is the second
-> session to end with the DSC needing recovery, and both followed
-> sustained write load** (this one, ~1.16 GiB in a session plus a raw
-> xnvme probe). Sustained writes against this card are not free.
+> **RoCEv2 itself: still NOT demonstrated.** No RDMA bytes carried, no
+> throughput figure — decode never reached a healthy serving state
+> under the new blocker. Prefill reports `p2p_state="unregistered"`,
+> `p2p_peer_count=0`, and has otherwise been healthy throughout
+> (`/v1/models` → 200, container up 4h at measurement time).
 >
 > ---
 >
-> **Everything below this line was true while the devices were up, and
-> should survive their recovery.**
+> ## Current state — 2026-09-22
 >
-> **Three results from the 2026-09-18 late session, two of them negative
-> and both of those load-bearing:**
+> The principal applied a new 400G config and rebooted (`smc1` up
+> 11:54:12, `smc2` up 11:54:07). The fabric-link blocker that closed
+> out the last update is GONE — all 8 links are up. **The blocker
+> MOVED**: zero RDMA devices register on either node. A power cycle
+> was in progress when this session ended — the state below is
+> **pre-power-cycle** and must be re-measured.
+>
+> | | state |
+> |---|---|
+> | KV device | ✅ `/dev/ng1n1` present on both nodes, **survived this reboot with no manual PCI rebind** (observed once — 6.26's boot-race procedure still stands when it IS absent). Discover the address by PCI class, never hardcode it (§3.4, TODO 6.26/6.44). |
+> | RDMA capability | ✅ SRQ still on record (`max_srq` 0 → 512, TODO 3.9) but 🟡 **pending re-confirmation** — that result was measured on the PREVIOUS boot; no device exists now to re-query it. Do not assume it survived the config change. |
+> | RoCE fabric | ✅ **All 8 `benicNp1` links UP on both nodes** (`carrier` = `11111111`/node) at **400000 Mb/s** — was `800000` before the config change, the suspected and now effectively confirmed cause of the prior link failure. But 🔴 **zero RDMA devices exist**: `/sys/class/infiniband/` is empty, `ibv_devinfo` returns `No IB devices found`. The blocker MOVED from the links to the auxiliary-bus binding (§3.1, §3.3, TODO 6.45). |
+> | GPUs | ✅ 8 per node after `modprobe amdgpu` — required every boot (TODO 0.4). |
+> | Fabric addressing | ✅ **Now persists across a reboot** — 8 `benicNp1` addresses and 16 `30.x` routes present on both nodes with no hand re-application (§3.4). Earlier the same day it came back with nothing and had to be re-applied by hand; that is no longer the case. |
+> | Power cycle | 🔴 **In progress when this session ended.** Everything above is pre-power-cycle. Re-measure from scratch before trusting any of it. |
+>
+> **RoCEv2 has NOT been demonstrated.** No RDMA traffic has been
+> carried and no throughput figure exists. The sole gate is no longer
+> the fabric links — it is the missing `pds_core.rdma.N` auxiliary
+> device that `ionic_rdma` needs to bind to (§3.3, TODO 6.45). The
+> prize, still unclaimed: the fabric did **769 Gb/s** (`ib_write_bw`,
+> TODO 3.9) against the **1 Gb/s** management NIC that carries every
+> KV byte today (TODO 6.43) — roughly **769x** — measured on an
+> earlier boot, not yet re-confirmed on this config.
+>
+> **Go to [§3.3](#33-what-to-do-in-order) — item 1 is re-measuring
+> after the power cycle.**
+>
+> ---
+>
+> **Three results from the 2026-09-18 late session — still on the
+> record, but read result 1 with its correction:**
 >
 > 1. **P→D over RDMA RoCEv2 is NOT achievable on this stack.** Not a
 >    tuning problem. Two layers were wrong: `container.sh` never mapped
@@ -51,6 +278,29 @@ assumed, and what is still wrong.
 >    (`sge:6 inl:64 ... Invalid argument`), unaffected by SGE/inline
 >    tuning. TODO 3.9's proposed fix — "name RC explicitly" — **has no
 >    target**. This is a driver/provider matter for AMD. §7.17, TODO 3.9.
+>
+>    **CORRECTED 2026-09-22:** the observation (zero `rc_verbs`
+>    pairs) was accurate, but the conclusion was too broad. The cause
+>    was one missing capability, SRQ, not a general absence of RDMA
+>    support: the RC datapath itself was later measured at 769 Gb/s
+>    cross-node, and the 2026-09-22 update supplied SRQ. "NOT
+>    achievable" does not stand unqualified — see TODO 3.9 and 6.44.
+>
+>    **Root-caused 2026-09-21:** the cause is one named capability, not
+>    a general RDMA absence — the ionic provider reports `max_srq = 0`,
+>    which UCX's `rc_verbs` transport requires and is filtered out
+>    before it is ever configured. RC itself measures **769.34 Gb/s**
+>    bidirectional cross-node (`ib_write_bw`). The statement above
+>    still holds today, but the ask to AMD is now a single line. TODO
+>    3.9, TODO 6.43.
+>
+>    **UNBLOCKED (capability) 2026-09-22:** after a driver/software
+>    update (`rdma-core` now `61.0-1`), `max_srq` reads **512** on all
+>    16 devices (was 0) and UCX's own trace confirms it passes the SRQ
+>    gate now, failing only on port state. **The named capability
+>    blocker above is gone.** RoCEv2 is now gated **solely** on the
+>    fabric links, which are down (§3.1, TODO 3.9, TODO 6.44) —
+>    RoCEv2 itself remains undemonstrated.
 > 2. **The KV data does NOT reach smc3.** `/dev/ng1n1` is
 >    `transport=pcie` at `0000:36:00.0`, subsystem
 >    `nqn.2019-08.com.pensando:...`, `mn=PDSNVME` — a **local Pensando DSC
@@ -526,22 +776,35 @@ If you read nothing else in this document, read this section.
 
 ### 3.1 Cluster state as handed over
 
-Measured, not assumed, at the end of the **2026-09-18 late** session —
-re-measure before trusting any of it (§3.5):
+**Superseding measurement, 2026-09-22, after the principal applied a
+new 400G config and rebooted** (`smc1` up 11:54:12, `smc2` up
+11:54:07) — this supersedes every earlier 2026-09-22 row below and in
+§0's blockquote. **The session ended mid-power-cycle: the principal
+was power-cycling both nodes when this session ended, the
+post-power-cycle state is UNKNOWN, and every row here must be
+re-measured before trusting it (§3.5).**
 
 | Node | State |
 |---|---|
-| `smc1` prefill | **🔴 `/dev/ng1n1` ABSENT.** Host up 7 h, no reboot, GPUs fine. Card alive (`setpci -s 36:00.0 00.L` → `10051dd8`) but no nvme driver bound; rebind fails at ~128 s with `CSTS=0x0`. vLLM + daemon were running before the device dropped and are now broken. |
-| `smc2` decode | **🔴 `/dev/ng1n1` ABSENT.** Identical signature. It was healthy earlier in the same session and degraded without a reboot. |
-| `smc3` target | Shared, and **not ours** — the running `nvmf_tgt` serves `nqn.2016-06.io.spdk:cnode1` / `dev1_ns1`; our `nqn.2024-01.io.nixl:kv0` is absent. It has served **zero I/O** and is **not** where our KV data goes (§2, TODO 6.36). Do not restart it (§3.2.2). |
+| `smc1` prefill | Up (11:54:12) on the pre-power-cycle boot. `/dev/ng1n1` **PRESENT, survived this reboot with no manual PCI rebind** (observed once — TODO 6.26/6.44). `modprobe amdgpu` restored all 8 `gfx942` agents. **Fabric: all 8 `benicNp1` UP, `carrier=11111111`, `benic1p1 speed` reads `400000`** (was `800000` before the config change). **RDMA: `/sys/class/infiniband/` EMPTY, `ibv_devinfo`: `No IB devices found` — 0/8 devices, 0/8 `PORT_ACTIVE`.** `pds_core` has all 8 PCI devices bound; `ionic_rdma` is loaded (refcount 5) but has nothing to bind to (TODO 6.45). |
+| `smc2` decode | Up (11:54:07). Identical to `smc1`: `/dev/ng1n1` present with no rebind, 8 GPUs loaded, all 8 fabric links up at 400000 Mb/s, zero RDMA devices. |
+| `smc3` target | Unchanged this session — shared, and **not ours**: the running `nvmf_tgt` serves `nqn.2016-06.io.spdk:cnode1` / `dev1_ns1`; our `nqn.2024-01.io.nixl:kv0` is absent. It has served **zero I/O** and is **not** where our KV data goes (§2, TODO 6.36). Do not restart it (§3.2.2). |
 
-**The blocker is the DSC, and it is not fixable from the host** — see the
-STOP block at the top. Everything else in this section is moot until
-`/dev/ng1n1` returns on at least one node.
+**The blocker is no longer the DSC, and it is no longer the fabric
+links either.** The 400G config brought all 8 links up (400000 Mb/s,
+was 800000) and made fabric addressing/routing persist across a
+reboot — both genuine improvements (§3.4, TODO 6.45). **What is gated
+now is the auxiliary bus**: `/sys/bus/auxiliary/devices/` holds only
+`pds_core.fwctl.0`–`.7` — no `pds_core.rdma.N` for `ionic_rdma.rdma`
+to bind to, so zero IB devices register. This is most plausibly a
+DSC/DPU-side consequence of the new config, but that attribution is
+**UNPROVEN**. The SRQ result that unblocked TODO 3.9 (`max_srq` 0 →
+512) was measured on the PREVIOUS boot and could not be re-confirmed
+here — no device exists to query it — and must be re-verified the
+moment RDMA devices come back.
 
 Nothing of this project's is left running deliberately at the end of a
-session — containers carry no `--restart` policy. Note that the devices
-dropping is *not* an orderly teardown: prefill and decode were mid-session.
+session — containers carry no `--restart` policy.
 
 ### 3.2 Check these things before touching anything
 
@@ -574,6 +837,14 @@ whatever you were actually testing rather than as itself.
 
 ### 3.3 What to do, in order
 
+**Before Step 0, do the per-boot ritual (§3.4).** These nodes reboot
+constantly (TODO 6.20). `modprobe amdgpu` still does not survive a
+reboot, and the KV-device PCI rebind address must still be DISCOVERED,
+not hardcoded (TODO 6.26/6.44) even though it survived without a
+rebind this time. The fabric interface addresses and routes now
+**persist** across a reboot — verify, do not blindly re-apply
+(§3.4). Measured 2026-09-22, after the 400G config.
+
 **Step 0 — bring up the one stack, on both nodes.** There is no
 "compute-first, storage-tier later" sequence — the MP daemon and its
 `nixl_kv` L2 adapter are what "starting this stack" means now
@@ -590,60 +861,87 @@ scripts/proxy/start-proxy.sh               # fronting both
 Send one long (≥1000-token) prompt with a per-run nonce through the proxy
 and confirm **decode's `Avg prompt throughput` is 0.0 with `External
 prefix cache hit rate` rising toward 100%**, while prefill's throughput is
-non-zero. That is the §2 P→D result — it proves the P→D handoff, **not**
+non-zero. **`Avg prompt throughput` is not the generation gauge** — check
+`Avg generation throughput` (or `vllm:generation_tokens_total` rising) is
+NON-zero in the same window, or the 0.0 you are quoting is equally
+consistent with a stack that generated nothing at all. Measured
+2026-09-21: decode's `vllm:generation_tokens_total` rose +617 and +1,641
+across the two benchmark runs while the prompt gauge read 0.0 (TODO 6.42,
+BRINGUP §4A.1). That is the §2 P→D result — it proves the P→D handoff, **not**
 the storage tier: a healthy daemon and a working `--l2-adapter` spec are
 required for vLLM to start at all now, but starting is not the same as
 the tier serving a hit.
 
-**Step 1 — TODO 6.34 is fixed and verified; pick up the drain decision,
-then 6.15/1.13.** The blocker rung `60` step 5 diagnosed is cleared:
-`register_obj_names()` now allocates `devId` from a daemon-global
-monotonic counter and the page dlist is deregistered before the commit
-registration is created, so the page and commit OBJ registrations can no
-longer alias. Rung `60` step 5 **PASSES** on the fix — a genuinely cold
-decode node served content only prefill had computed
-(`l2_device_hits=4`, token identity matched) — and both consequences of
-the old bug (missing commit object, page-0 corruption) are independently
-confirmed gone by direct device inspection. Do **not** re-run rung `60`'s
-step 5 expecting new information from it — this is closed.
-
 **What's next, in order:**
 
-0. **🔴 GET THE DSCs BACK. Nothing below is actionable until this is
-   done, and it is not a host-side fix.** Both `/dev/ng1n1` devices are
-   gone; rebind fails at ~128 s with `CSTS=0x0` on both nodes. Raise with
-   the hardware owner, asking for a **DPU-side restart** (TODO 6.22 — host
-   resets make it worse). Raise the pattern at the same time: two sessions
-   have now ended this way, both after sustained write load. Until this
-   clears, useful work is limited to offline things — the 44 adapter unit
-   tests (`python3 overlays/lmcache/test_nixl_kv_naming.py`), doc work, and
-   reviewing the open questions below.
-1. **Answer: what actually backs the shared namespace?** 6.36/6.40 proved
-   it is *not* smc3 — three independent mechanisms (zero bdev I/O, 7,986
-   of 8,192 hugepages free, flat `nvmf_tgt` RSS) plus a twelve-order-of-
-   magnitude capacity disagreement (`UINT64_MAX` blocks vs
-   `NSZE=2,097,152`). But rungs 30/35 prove smc1 and smc2 genuinely share
-   a medium. **Ask the hardware owner** — do not infer it again from
-   `eui64`, which is equally consistent with a fixed firmware identifier.
-2. **Decide the delete/teardown story.** `libxnvme` exports
-   `xnvme_kvs_delete` and `xnvme_kvs_list`; the plugin implements
-   **neither** (every `delete` token in `xnvme_kv_backend.cpp` is the C++
-   operator). So "no delete primitive" is a statement about *our plugin*,
-   not established hardware fact. A list-and-filter teardown is the only
-   thing that could reclaim orphans (dead nonces, pre-fix corrupt
-   objects), which outnumber live objects. **Device support is
-   unverified** — probe it on a *healthy* device, with a store/exist
-   control in the same run so a wedged device cannot be misread as an
-   unsupported opcode.
-3. **TODO 6.15** — cross-instance reuse measurement — and **TODO 1.13**
-   (engine-level benchmark rework). Note 1.13 is now narrowed: KV-block
-   accounting is already answered by `lmcache bench l2` (§8), so do not
-   rebuild block-level measurement on llama-benchy.
-4. **Namespace drain remains undecided**, but it is *much* less urgent
-   than previously recorded: the 1 GiB pressure that motivated it was
-   retracted (6.39), and `50-reset-namespace.sh`'s refusal is now handled
-   by `51-reset-smc3-storage.sh` (inspect-only by default). Note that
-   resetting smc3 reclaims **nothing**, since our data never goes there.
+1. **🟢 THE BIG ONE — the fabric links are UP. Find out whether RDMA
+   devices are back after the power cycle, then re-verify the SRQ
+   result.** The 400G config fixed the links (all 8 UP at 400000 Mb/s,
+   was 800000) and made fabric addressing persist — but it also
+   surfaced a NEW break: zero RDMA devices registered (6.45). The
+   session ended mid-power-cycle, so start from a clean re-measure, in
+   this exact order:
+   1. `ls /sys/class/infiniband/` → `ibv_devinfo | grep -c PORT_ACTIVE`
+      (expect 8/8 now the links are up) → re-confirm `max_srq` is
+      still 512 (it was measured on the PREVIOUS boot, not this one,
+      and cannot be assumed to have survived the config change) →
+      **`ucx_info -d -t rc_verbs` pair count — that single number is
+      the whole question.** `ucx_info` lives only inside the container,
+      at `/opt/rocnixl-ucx/bin/ucx_info`.
+   2. **If `/sys/class/infiniband/` is STILL empty:** the issue is the
+      auxiliary-bus gap, not the fabric. Check
+      `/sys/bus/auxiliary/devices/` for a `pds_core.rdma.*` entry. If
+      only `pds_core.fwctl.*` are present, `ionic_rdma` has nothing to
+      bind to and this needs the hardware owner / DSC-side RoCE
+      personality — it is not host-fixable by module reloading alone,
+      though `modprobe -r ionic_rdma && modprobe ionic_rdma` is a
+      cheap thing to try first.
+   3. **If `rc_verbs` DOES enumerate:** go straight for the numbers —
+      `ib_write_bw` cross-node for the fabric baseline, then set
+      `KV_TRANSPORT=rdma`, restart both roles, and prove RDMA is
+      carrying KV with the per-interface byte-counter method (6.43),
+      not throughput inference.
+   - **The prize, still unclaimed:** the fabric did 769 Gb/s
+     (`ib_write_bw`, 3.9) against the 1 Gb/s management link that
+     carries every KV byte today — roughly 769x (6.43) — measured on
+     an earlier boot, not this config.
+   - Per-boot reminder either way: `modprobe amdgpu`; `/dev/ng1n1` may
+     or may not need the PCI rebind this time (§3.4).
+2. **If the fabric stays down, the storage tier is fully actionable —
+   the KV device is back.** `/dev/ng1n1` is present on both nodes.
+   **Expect the namespace to be EMPTY:** the DSC restarted, and 6.41
+   established this store is VOLATILE, so anything written before today
+   is gone. That is not a fault; it also means capacity pressure is reset.
+   Pick up **TODO 6.15** (cross-instance reuse measurement — now `[~]`,
+   a 7.35–7.53x figure exists but is N=1 on one shape) and **TODO 1.13**
+   (the benchmark rework, whose defect is now demonstrated with numbers:
+   `--prefix-benefit` scores a healthy tier at 0.822x because it pairs
+   depth=0 against depth=4096).
+3. **Two pieces of unfinished work from the 2026-09-21/22 sessions**, both
+   small and both about making results trustworthy rather than producing
+   new ones:
+   - **A data-collection template does not exist.** The per-level metric
+     tables in 6.42/6.43 were hand-assembled three times; they should be
+     produced by a script into a fixed schema so runs are comparable.
+     Proposed: `scripts/bench/collect-metrics.sh` (capture/report) plus a
+     doc defining each dataset. NOT STARTED.
+   - **`run.env` does not record `LMCACHE_MP_L1_SIZE_GB`** (`lib-bench.sh`
+     writes only `LMCACHE_MAX_LOCAL_CPU_SIZE`). Every 2026-09-21/22 number
+     was taken with L1 forced to 1 GiB and that fact is NOT in any run
+     directory — which breaks BENCHMARKING §9's own rule that a number
+     without its `run.env` is not a result.
+4. **Open questions, unchanged and still needing the hardware owner:**
+   what actually backs the shared namespace (6.36/6.40 proved it is NOT
+   smc3 — do not re-derive it from `eui64`), and the delete/teardown story
+   (`libxnvme` exports `xnvme_kvs_delete`/`xnvme_kvs_list`; the plugin
+   implements neither, and device support is unverified — probe it on a
+   HEALTHY device with a store/exist control in the same run).
+5. **Closed — do not spend time re-deriving these.** TODO 6.34 is fixed
+   and verified end to end; do NOT re-run rung `60` step 5 expecting new
+   information. The three KV data paths (P→D direct, engine→L2→device,
+   device→cold reader) are each independently proven with counters that
+   reconcile exactly (6.42, 6.43). 3.2 and 4.3 were closed in the
+   2026-09-21 status audit.
 
 **Ordering, and why it matters, for the record:** the ladder ran bottom-up
 this session and stopped correctly at the first red, before the fix
@@ -658,39 +956,46 @@ covered the naming SCHEME only, not the adapter's own commit-write
 MECHANISM** — the gap is now closed by offline regression tests, not by
 `35` itself (see §2's rung-35 entry).
 
-**Separately, and not blocking any of the above — RDMA acceptance.** This
-is a transport upgrade for the P→D path, independent work from the
-storage tier. The routing gap between the two nodes' fabric subnets is
-closed and RC queue pairs move real cross-node traffic (§7.6), but **UD
-queue-pair creation fails on this driver/firmware**, which breaks
-`rdma_cm` and the GSI/MAD QP — `UCX_TLS=ib` pulls in UD transports, so the
-transport spec needs narrowing to RC explicitly without weakening
-invariant 6's exclusion of `tcp`. This is the sole remaining RDMA-stack
-blocker (TODO 3.9) — see §7.5–§7.6 for the history.
+**Separately — RDMA acceptance is no longer a side-quest, it is item 1
+above, the highest-value thing on the board.** **Root-caused
+2026-09-21:** the gate was UCX's `rc_verbs` requiring SRQ, the ionic
+provider reporting `max_srq = 0` — a single named capability, not a
+transport-spec tuning question. **Lifted 2026-09-22** (item 1). `ud_verbs`
+QP creation still fails independently and is unrelated. See §7.5, §7.17
+for the history; do not duplicate item 1's plan here.
 
 ### 3.4 The per-boot ritual — none of this survives a reboot
 
 1. **`modprobe amdgpu`** on both compute nodes (§3.2.3). `01-host-prep.sh`
    does this automatically.
 2. **Confirm `/dev/ng1n1` exists before starting anything on that node.**
-   The DSC NVMe controller has a boot-time race: the kernel probes it
-   (PCIe `0000:36:00.0`) roughly 3 seconds after PCIe enumeration —
-   before the DPU-side application is ready — and gets
+   The DSC NVMe controller has a boot-time race: the kernel probes its
+   PCI function roughly 3 seconds after PCIe enumeration — before the
+   DPU-side application is ready — and gets
    `Device not ready; aborting initialisation, CSTS=0x0`. The driver
    detaches and **nothing re-probes it**. Distinguish this from a dead
    card: the DSC's *other* PCI functions (`pds_core`, `ionic`) bind and
-   work fine on the same boot, config-space reads succeed
-   (`setpci -s 36:00.0 00.L` → `10051dd8`), and the PCIe link itself is
-   healthy — a `CSTS=0x0` alongside all of that means the DPU-side
-   NVMe/KV application simply is not serving yet, not that the card, slot,
-   or link is bad. Recovery, **validated repeatedly, on both nodes, with
-   no reboot**, once the DPU side is confirmed up:
+   work fine on the same boot, config-space reads succeed, and the PCIe
+   link itself is healthy — a `CSTS=0x0` alongside all of that means the
+   DPU-side NVMe/KV application simply is not serving yet, not that the
+   card, slot, or link is bad.
+
+   **Do not hardcode the PCI address — discover it by class.** Measured
+   2026-09-22: the NVMe function moved from `0000:36:00.0` to
+   `0000:37:00.0` on both nodes underneath a driver/software update
+   (`36:00.0` is now the DSC Management Controller, `setpci -s 36:00.0
+   00.L` → `10041dd8`, not the `10051dd8` this file previously
+   documented at that address — TODO 6.26/6.44). Recovery, **validated
+   repeatedly, on both nodes, with no reboot**, once the DPU side is
+   confirmed up:
    ```
-   echo -n "0000:36:00.0" > /sys/bus/pci/drivers/nvme/bind
+   PCI=$(lspci -nn -d 1dd8: | awk '/\[0108\]/{print $1}')   # 0108 = NVMe class
+   echo -n "0000:${PCI}" > /sys/bus/pci/drivers/nvme/bind
    ```
-   Takes roughly 2 minutes to resolve either way; if the DPU side is not
-   yet ready it fails with the identical `CSTS=0x0` signature, and you
-   simply retry once it is. Success looks like
+   Rebind latency tracks DPU-side readiness, not a fixed host-side cost
+   — measured anywhere from 0.08–0.09 s (2026-09-21, 2026-09-22) up to
+   ~2 minutes or, once, 20+ minutes (2026-09-18); if it fails with the
+   identical `CSTS=0x0` signature, retry. Success looks like
    `nvme nvme1: 63/0/0 default/read/poll queues` followed by
    `block device for nsid 1 not supported (csi 1)` — **the second line is
    EXPECTED, not an error**: `csi 1` is the KV command set, which has no
@@ -711,6 +1016,17 @@ blocker (TODO 3.9) — see §7.5–§7.6 for the history.
    idempotent, and the role start scripts call it automatically, but it
    does not survive a reboot and `start-vllm.sh`'s gate will `die`, not
    silently proceed, if it is not up.
+6. **The RoCE fabric interface addressing — VERIFY, do not re-apply
+   blind.** Measured 2026-09-22, after the 400G config: addressing and
+   routing now **persist** across a reboot — 8 `benicNp1` addresses
+   and 16 `30.x` routes present on both nodes with no hand
+   re-application (was NOT the case earlier the same day, before the
+   config change, when it came back with nothing). Verify with
+   `ip addr`/`ip route` first; only fall back to re-applying the
+   documented scheme (`smc1` `30.1.N.1/24`, `smc2` `30.2.N.1/24`) if it
+   is actually missing. Re-applying addressing does not by itself bring
+   the link up, and does not create the RDMA device either — that gap
+   is now a separate, auxiliary-bus problem (TODO 3.1, 6.44, 6.45).
 
 ### 3.5 The hardware is shared, and it changes under you
 

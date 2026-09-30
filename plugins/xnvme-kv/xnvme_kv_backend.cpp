@@ -514,18 +514,29 @@ void nixlXnvmeKvEngine::reactor_loop(QueueWorker *qw) {
         //
         // Reports and fails. Does NOT attempt any device recovery — see the
         // declaration of stall_timeout_ns_ for why that would be actively
-        // harmful on the real DSC.
+        // harmful on a locally-presented DPU KV function, and why on a kernel
+        // nvme-of initiator the kernel is already doing the recovery for us.
         bool outstanding = !local.empty() || qw->in_flight > 0;
         if (stall_timeout_ns_ && outstanding && !qw->stall_reported &&
             xnvme_now_ns() - qw->last_progress_ns > stall_timeout_ns_) {
             XNVME_PLUGIN_ERR
                 << "queue made no forward progress for "
-                << (stall_timeout_ns_ / 1000000000ULL) << "s: "
-                << local.size() << " op(s) queued, " << qw->in_flight
+                << (stall_timeout_ns_ / 1000000000ULL) << "s on " << dev_uri_
+                << ": " << local.size() << " op(s) queued, " << qw->in_flight
                 << " in flight. The device has stopped completing I/O; this is "
                    "NOT the transient queue-full condition. No device reset is "
-                   "attempted: on the Pensando DSC only an out-of-band DPU-side "
-                   "restart recovers this, and host-side resets make it worse.";
+                   "attempted, because the right recovery depends on what backs "
+                   "this device and the plugin cannot safely guess. "
+                   "If it is a LOCALLY PRESENTED KV function (a DPU/SmartNIC, "
+                   "sysfs transport=pcie): only an out-of-band card-side restart "
+                   "recovers this, and host-side resets make it worse. "
+                   "If it is reached by the KERNEL nvme-of INITIATOR (sysfs "
+                   "transport=tcp/rdma): check `nvme list-subsys` and dmesg "
+                   "first — a controller in `connecting`/`resetting` is a "
+                   "RECONNECT IN PROGRESS, not a wedge, and will clear on its "
+                   "own. In that case raise NIXL_XNVME_STALL_TIMEOUT_SEC above "
+                   "the session's ctrl_loss_tmo rather than treating this as a "
+                   "device fault.";
             qw->stall_reported = true;
             qw->m_stalls.fetch_add(1, std::memory_order_relaxed);
 

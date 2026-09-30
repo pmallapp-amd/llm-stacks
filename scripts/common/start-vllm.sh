@@ -135,29 +135,85 @@ ok "LMCache MP daemon reachable"
 #     ${NVMF_TRADDR}:${NVMF_TRSVCID} itself through the SPDK initiator, so a
 #     TCP connect from this host is exactly the right liveness probe.
 #
-#   XNVME_KV — the host is NOT an initiator at all. The Pensando DSC is.
-#     The host's only contact with the KV store is the local PCIe char
-#     device the DSC presents (${XNVME_DEV}, csi=0x1); the DSC opens and
-#     maintains the NVMe-oF/TCP session to the target from its OWN address
-#     on the storage fabric, which the host has no route to. Measured on
-#     this lab: the target's SPDK listens on 1.1.0.2:4420 and its
-#     established peers are the two DSCs (1.1.0.1, 1.1.0.3) — never a host
-#     address. A TCP probe from here therefore tests a path that is not
-#     supposed to exist, and fails on a perfectly healthy deployment.
-#     The device node is the correct host-visible proxy for "the KV tier
-#     has somewhere to go"; the DSC-to-target session is the DSC's
-#     responsibility and is not observable from this side.
+#   XNVME_KV — depends on WHO owns the NVMe-oF session, and that is NOT a
+#     per-lab constant. Both shapes exist and are in use:
+#
+#       transport=pcie — a locally-presented KV function (e.g. a Pensando
+#         DSC). The host is NOT an initiator. Its only contact with the KV
+#         store is the local PCIe char device (${XNVME_DEV}, csi=0x1); the
+#         card opens and maintains the NVMe-oF session to the target from
+#         its OWN address on the storage fabric, which the host has no
+#         route to. Measured on setup 4: the target's SPDK listened on
+#         1.1.0.2:4420 and its established peers were the two DSCs
+#         (1.1.0.1, 1.1.0.3) — never a host address. A TCP probe from here
+#         tests a path that is not supposed to exist and fails on a
+#         perfectly healthy deployment. The device node is the only correct
+#         host-visible proxy for "the KV tier has somewhere to go".
+#
+#       transport=tcp|rdma — the kernel nvme-of initiator on THIS host owns
+#         the session (setup 3). The device node alone is now a WEAK gate:
+#         a controller can sit in `connecting`/`resetting` with the char
+#         node still present, and a dead target leaves a stale node behind
+#         entirely. That is exactly the "looks healthy, stores go nowhere"
+#         state this block exists to prevent, so here we additionally
+#         require the controller to be ours, live, and the target to answer.
+#
+#     The discriminator is read from sysfs rather than configured, because
+#     an operator-set flag can be wrong and sysfs cannot.
 case "${KV_BACKEND}" in
     XNVME_KV)
-        info "checking DSC-presented KV device: ${XNVME_DEV}"
-        [ -c "${XNVME_DEV}" ] || die "KV device ${XNVME_DEV} is not a char" \
-            " device on this node. Refusing to start: a silent fallback to" \
-            " local-only caching is the worst failure mode here (see this" \
-            " script's comment above). Note this backend does NOT dial the" \
-            " target from this host — the DSC does — so a missing device" \
-            " node here means the DSC is not presenting its KV namespace," \
-            " not that the target is down."
-        ok "KV device ${XNVME_DEV} present"
+        info "checking KV device: ${XNVME_DEV}"
+        assert_kv_char_device "${XNVME_DEV}"
+
+        _kv_transport="$(kv_ctrl_field "${XNVME_DEV}" transport || echo unknown)"
+        case "${_kv_transport}" in
+            pcie)
+                ok "KV device ${XNVME_DEV} present (transport=pcie —" \
+                   " locally presented; this host is not an NVMe-oF" \
+                   " initiator, so the target is not probed from here)"
+                ;;
+            tcp|rdma)
+                info "KV device is a kernel nvme-of initiator" \
+                     " (transport=${_kv_transport}) — verifying the session" \
+                     " and the target, not just the device node"
+
+                _kv_nqn="$(kv_ctrl_field "${XNVME_DEV}" subsysnqn || echo '')"
+                [ "${_kv_nqn}" = "${NVMF_SUBNQN}" ] || die "KV device" \
+                    " ${XNVME_DEV} belongs to subsystem '${_kv_nqn:-<unreadable>}'," \
+                    " not the configured NVMF_SUBNQN='${NVMF_SUBNQN}'." \
+                    " Refusing to start against a namespace that is not the" \
+                    " one this stack is configured for — its contents and" \
+                    " geometry are unknown to us."
+
+                _kv_state="$(kv_ctrl_field "${XNVME_DEV}" state || echo '')"
+                [ "${_kv_state}" = "live" ] || die "KV device ${XNVME_DEV}" \
+                    " controller state is '${_kv_state:-<unreadable>}', not" \
+                    " 'live'. The char device can persist through" \
+                    " connecting/resetting/deleting, so its mere presence" \
+                    " proves nothing. Refusing to start: a silent fallback" \
+                    " to local-only caching is the worst failure mode here." \
+                    " Check \`nvme list-subsys\` and dmesg; reconnect with" \
+                    " scripts/common/nvme-connect-kv.sh if the session is gone."
+
+                if ! wait_for_port "${NVMF_TRADDR}" "${NVMF_TRSVCID}" 30; then
+                    die "NVMe-oF target ${NVMF_TRADDR}:${NVMF_TRSVCID} is" \
+                        " not reachable after 30s, although this host's" \
+                        " controller still reads 'live'. That combination" \
+                        " means the session is about to fail or the target" \
+                        " died without resetting us. Refusing to start:" \
+                        " every KV store would be lost on the next reset."
+                fi
+                ok "KV session live to ${NVMF_TRADDR}:${NVMF_TRSVCID}" \
+                   " (${XNVME_DEV}, subnqn ${NVMF_SUBNQN})"
+                ;;
+            *)
+                warn "KV device ${XNVME_DEV} reports transport=" \
+                     "'${_kv_transport}', which is neither pcie nor a known" \
+                     " fabric type. Falling back to the device-node check" \
+                     " only — confirm by hand who owns this NVMe-oF session."
+                ok "KV device ${XNVME_DEV} present"
+                ;;
+        esac
         ;;
     *)
         info "checking NVMe-oF target reachability: ${NVMF_TRADDR}:${NVMF_TRSVCID}"

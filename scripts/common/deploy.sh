@@ -254,7 +254,14 @@ declare -A AUTH_MODE=()
 
 # Deliberately no StrictHostKeyChecking / persistent known_hosts — see
 # SECURITY POSTURE above for why that's the right call for this lab.
-SSH_BASE_OPTS=(-o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+# Built from lib.sh's kv_ssh_base_opts() so this script, and the verify rungs
+# that also ssh to these nodes, share ONE auth policy. In particular it picks
+# up SSH_IDENTITY_FILE: a key whose filename is not one of ssh's defaults is
+# never tried unless named, which otherwise shows up as "key auth failed" here
+# while the same login works by hand. Flows into rsync -e as well, via
+# describe_ssh below.
+SSH_BASE_OPTS=()
+mapfile -t SSH_BASE_OPTS < <(kv_ssh_base_opts)
 
 # probe_auth <label> — tries key auth, falls back to password auth via
 # sshpass, dies (naming the host) if neither is usable. Idempotent: a

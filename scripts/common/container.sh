@@ -46,10 +46,40 @@
 #       Without this flag the plugin fails at xnvme_queue_init with the
 #       misleading "FAILED: io_uring cmd, not supported by kernel!" — which
 #       reads as a kernel/device limitation and is not one.
+#   --cap-add SYS_ADMIN
+#       REQUIRED for KV_BACKEND=XNVME_KV, and the single least obvious flag
+#       here. The kernel gates NVMe passthrough by opcode in
+#       nvme_cmd_allowed() (drivers/nvme/host/ioctl.c): without CAP_SYS_ADMIN
+#       only flush/write/read/dsm/write_zeroes/zone_append are permitted.
+#
+#       The KV command set OVERLAPS those opcodes, and that overlap is
+#       exactly what makes this bug so confusing:
+#           KV_STORE    = 0x01 == nvme_cmd_write  -> ALLOWED
+#           KV_RETRIEVE = 0x02 == nvme_cmd_read   -> ALLOWED
+#           KV_EXIST    = 0x14                    -> DENIED, -EACCES
+#           KV_DELETE   = 0x10                    -> DENIED, -EACCES
+#
+#       So writes work perfectly and only DISCOVERY fails. Worse, queryMem()
+#       deliberately degrades any error to "absent" (a false miss costs a
+#       recompute; a false hit would corrupt), so the symptom is not an error
+#       at all — it is a tier that stores happily and reports 100% misses,
+#       which is indistinguishable from a cold cache.
+#
+#       Measured on setup 3, 2026-09-30, inside this container:
+#           op=exist key=... rc=-13 sct=0 sc=13 (reported as MISS)
+#       rc=-13 is -EACCES from the ioctl, NOT a device status; the sc=13 is
+#       incidental. With CAP_SYS_ADMIN the same probe returns sc=0x87
+#       (KEY_DOES_NOT_EXIST) for a genuine miss, or success for a hit.
+#
+#       Docker's default capability set omits CAP_SYS_ADMIN. It is broad, and
+#       it is granted here only because NVMe passthrough of non-safelisted
+#       opcodes has no narrower capability — the alternative is --privileged,
+#       which is strictly worse.
 #   --device ${XNVME_DEV}
-#       The DSC-presented NVMe KV char device (csi=0x1). Without it the
-#       plugin falls back to its compiled-in /dev/ng0n1 default, which on
-#       these nodes is the Micron BOOT DRIVE, not a KV namespace.
+#       The KV namespace char device (csi=0x1) — either a locally-presented
+#       PCIe function or, on a kernel nvme-of initiator, the remote namespace.
+#       Resolved by NQN via resolve_xnvme_kv_dev(); never defaulted to a
+#       literal path, because /dev/ng1n1 is a plain data SSD on some labs.
 #   --device /dev/kfd --device /dev/dri, --group-add
 #       ROCm. vLLM sees no GPU otherwise.
 #   --device /dev/infiniband + --ulimit memlock=-1 + --cap-add IPC_LOCK
@@ -102,9 +132,36 @@ NIXL_PLUGIN_DIR_IN_IMAGE="${NIXL_PLUGIN_DIR_IN_IMAGE:-/opt/nixl/lib/x86_64-linux
 _cname() { echo "kvstack-$1"; }
 
 _role_dev() {
-    # XNVME_DEV is resolved per-node; on both compute nodes in this lab the
-    # DSC KV namespace is /dev/ng1n1 and ng0n1 is the Micron boot drive.
-    echo "${XNVME_DEV:-/dev/ng1n1}"
+    # Resolve the KV namespace the same way lib.sh does, and NEVER fall back
+    # to a literal path.
+    #
+    # This used to be `echo "${XNVME_DEV:-/dev/ng1n1}"`, which encoded one
+    # cluster's layout as a default. That is wrong in the most dangerous
+    # possible way on a host where /dev/ng1n1 is an ordinary SSD: the old
+    # guard below was a bare `[ -c ]`, which such a device PASSES (every NVM
+    # namespace gets an `ng` node too), so the wrong device was mapped into
+    # the container and handed to the KV backend with no complaint.
+    #
+    # Order: an explicit XNVME_DEV wins (the operator escape hatch), else ask
+    # the kernel which controller actually claims NVMF_SUBNQN, else die.
+    if [ -n "${XNVME_DEV:-}" ]; then
+        echo "${XNVME_DEV}"
+        return 0
+    fi
+
+    local _auto
+    if _auto="$(resolve_xnvme_kv_dev "${NVMF_SUBNQN}")"; then
+        echo "${_auto}"
+        return 0
+    fi
+
+    die "container.sh: cannot determine this node's KV device. XNVME_DEV is" \
+        " unset and no char device claims NVMF_SUBNQN='${NVMF_SUBNQN}'." \
+        " Refusing to guess a path — mapping the wrong /dev/ngXnY hands a" \
+        " data disk to a KV backend. If this host reaches the KV namespace" \
+        " over the kernel nvme-of initiator, connect it first:" \
+        " scripts/common/nvme-connect-kv.sh. If it is presented locally by" \
+        " a PCIe function, check that function is bound (nvme list-subsys)."
 }
 
 cmd_shim() {
@@ -132,6 +189,38 @@ export NIXL_PLUGIN_DIR="${NIXL_PLUGIN_DIR:-/opt/nixl/lib/x86_64-linux-gnu/plugin
 # breaks HIP IPC export of vLLM's KV tensors when NIXL hands out a raw
 # device pointer for VRAM_SEG registration.
 export PYTORCH_HIP_ALLOC_CONF="expandable_segments:False"
+
+# REMOVED 2026-09-24: HSA_ENABLE_IPC_MODE_LEGACY. The rocm-aic image bakes
+# HSA_ENABLE_IPC_MODE_LEGACY=1 into its ENV layer (the same layer as
+# NIXL_PLUGIN_DIR/PYTHONPATH/LD_LIBRARY_PATH), so every process started by
+# `docker exec` inherits it — both vLLM and the LMCache MP daemon were
+# measured carrying it. Nothing in this repo asked for it and no vendor note
+# explains it. ROCr does read it (the symbol is present in
+# /opt/rocm/lib/libhsa-runtime64.so), so it is not inert by accident.
+#
+# Measured 2026-09-24 on smc1/smc2, set vs unset, everything else identical:
+#   - RoCEv2 cross-node with GPU buffers (ucx_perftest -t tag_bw -m rocm,
+#     UCX_TLS=ib,rocm,self,sm, ionic_2:1, GID index 1): 14791 MB/s set vs
+#     15124 MB/s unset. Not required for RoCEv2.
+#   - HIP IPC import at vLLM scale: 36 slabs / 145 GiB through the exact
+#     _share_cuda_ -> _new_shared_cuda -> torch.empty(()) -> set_() sequence
+#     of LMCache 0.5.3 ipc_wrapper.py:81-88. Both configurations import all
+#     36 handles and exit 0.
+#   - UCX rocm_ipc intra-node: bimodal ~93 GB/s / ~142 GB/s in BOTH
+#     configurations across four interleaved reps. The spread is scheduling,
+#     not the flag. A single cold first rep at 91 GB/s initially looked like
+#     a 57% regression; it did not survive repetition.
+#
+# So it is not required for RoCEv2 and not load-bearing on the HIP IPC path
+# it appears to name. `unset` rather than =0 because ROCr's parse of "0" is
+# unverified while absence is not. Same doctrine as the NCCL_CUMEM_ENABLE
+# removal (config/cluster.env): this stack does not carry an unexplained
+# allocator/IPC knob it cannot justify.
+#
+# NOT TESTED: TP_SIZE=8. Every measurement above is TP=1 with a single
+# exporting process. If multi-GPU IPC regresses, re-test this before
+# blaming anything else.
+unset HSA_ENABLE_IPC_MODE_LEGACY
 
 # NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE IS DELIBERATELY NOT EXPORTED HERE.
 #
@@ -585,9 +674,12 @@ cmd_up() {
         docker rm -f "${cname}" >/dev/null
     fi
 
-    [ -c "${dev}" ] || die "KV device ${dev} is not a char device on this" \
-        " node — refusing to start a container that would silently fall" \
-        " back to the plugin's /dev/ng0n1 default (the BOOT DRIVE)."
+    # Run the SAME test lib.sh's setup_nixl_kv_env runs, not a weaker one. A
+    # bare `[ -c ]` (what used to be here) is satisfied by any ordinary NVM
+    # namespace, because those get an `ng` char node alongside their block
+    # node — so it cannot tell a KV namespace from a data disk, which is
+    # precisely the distinction that matters before we `--device` it in.
+    assert_kv_char_device "${dev}"
 
     # RDMA passthrough. Conditional rather than unconditional: a node with
     # no /dev/infiniband (or a future GPU-less role) must still start, and
@@ -615,6 +707,7 @@ cmd_up() {
         --network host --ipc host --shm-size "${SHM_SIZE}" \
         --security-opt seccomp=unconfined \
         --cap-add SYS_PTRACE \
+        --cap-add SYS_ADMIN \
         --device /dev/kfd --device /dev/dri --device "${dev}" \
         "${rdma_args[@]}" \
         --group-add video --group-add render \
