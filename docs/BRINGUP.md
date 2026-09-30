@@ -3,7 +3,7 @@
 How to get this cluster into a state where a benchmark number means
 something, and then how to run the three benchmark harnesses that exist.
 
-Last updated 2026-09-18.
+Last updated 2026-09-30.
 
 > **Scope change, 2026-09-18.** This document used to be a full
 > from-source bring-up guide (build SPDK, build UCX/NIXL, install vLLM).
@@ -33,6 +33,13 @@ ask a KV-block question of an engine-level harness.
 | **llama-benchy** (§4) | HTTP / inference engine | TTFT, tokens/s, prefix-cache benefit, concurrency behaviour | ✅ **VERIFIED 2026-09-18** — runs end to end; but see the F5 confound in §4.4 |
 | **nixlbench** (§5) | NIXL transport | raw per-backend transfer bandwidth and latency | ❌ **NOT BUILT** — source only, blocked on a missing dependency (§5.2) |
 
+**The ✅/❌ in that last column is a statement about a lab at a moment, not
+a property of the harness.** A harness marked ✅ describes the code path
+working when it was last exercised; it can be unrunnable today because the
+stack it needs will not come up. The `setup-3-nvmeof` branch's copy of this
+document marks §4 **BLOCKED** for exactly that reason on a different lab.
+Before quoting a status, confirm the stack is actually up (§1, §2.4).
+
 **Decision guide.**
 
 - "How many KV blocks were stored, how many were asked for, what fraction
@@ -60,7 +67,7 @@ Throughout, `[SMC1]` = prefill, `[SMC2]` = decode, `[SMC3]` = KV target.
 Addresses come from `creds/active.env` (§6 of HANDOFF); nothing here
 hardcodes them.
 
-### §1.0 Conventions — three things this document will NOT hardcode
+### Conventions — three things this document will NOT hardcode
 
 This repo now drives **more than one lab**, and the values below differ
 between them. Earlier revisions of this document hardcoded all three, which
@@ -84,6 +91,42 @@ DSTATUS="http://127.0.0.1:${LMCACHE_MP_HTTP_PORT:-8080}/status"
   `start-lmcache-daemon.sh` honours `LMCACHE_MP_HTTP_PORT` and you must
   scrape the port *you* bound. Curling 8080 anyway will return **another
   stack's counters, and they will look entirely plausible.**
+
+### §1.0 Who else is on this machine — check BEFORE you start anything
+
+These are **shared hosts**. A co-tenant running the same software with the
+same defaults holds exactly the ports and devices you want, and every
+resulting failure surfaces somewhere else entirely.
+
+```bash
+# [SMC1] and [SMC2] — anchored match; see the warning below
+for P in "${LMCACHE_MP_HTTP_PORT:-8080}" "${LMCACHE_MP_PORT:-6557}" \
+         "${NIXL_SIDE_CHANNEL_PORT_PREFILL:-5600}" \
+         "${NIXL_SIDE_CHANNEL_PORT_DECODE:-5601}"; do
+  echo "== :$P"; ss -tlnp | awk -v PAT=":$P$" '$4 ~ PAT'
+done
+
+docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}'   # whose containers?
+sudo rdma resource show qp                                  # whose RDMA QPs?
+```
+
+**Use an anchored match.** `ss -tlnp | grep -w ":8080"` gives false "free"
+readings — `-w` treats `:` as a word boundary, so `:18080` and `:8080` both
+match, and a genuinely occupied port can read as available. That sent one
+bring-up down a blind alley. The `awk -v PAT=":$P$"` form above is the
+reliable one.
+
+**Three specific collisions already hit, each costing a full cycle:**
+
+| Port | Failure as observed |
+|---|---|
+| daemon HTTP (8080) | Our daemon binds ZMQ 6557 **fine**, then dies on the HTTP bind — **after** `start-vllm.sh`'s daemon gate has already passed. What you see is a vLLM that came up healthy with **no daemon behind it** and an L2 tier that silently does nothing. |
+| NIXL side channels (5600/5601) | vLLM binds these late in startup, so a collision surfaces as a peer that can never complete a handshake — not as a clean bind error. |
+| RDMA devices | A co-tenant's QPs appear under `comm VLLM::EngineCor` on the very device this repo's creds pin. **Check the owning pid's cgroup before concluding they are yours.** |
+
+Container-level co-tenancy matters too: `--network host` means there is no
+namespace to hide behind, and a neighbour's stack may hold the device or
+the GPU you assumed was free.
 
 ### §1.1 Node uptime — are the machines even stable right now
 
@@ -831,6 +874,117 @@ Two traps about these counters specifically:
   "nuse grows" is asserting nothing. Use `l2_commit_writes`, or the
   plugin's `completions_ok`.
 
+### §6.1 Logs — where they are, and why you cannot see them from the host
+
+**`LOG_DIR` (default `/var/log/kvstack`) is NOT bind-mounted.** Every log
+below exists only *inside* the container; read them through
+`container.sh exec <role>`, not from the host. Results under `STACK_ROOT`
+**are** visible from both, because that path *is* mounted. This is the
+same fact §7 item 6 hits from the llama-benchy side, and it is what makes
+rung 50 unable to render a verdict from the control host (§2.4).
+
+| File | Node | grep for |
+|---|---|---|
+| `vllm-prefill.log` | prefill | `${KV_BACKEND}`, `NIXL_ERR`, `unsupported backend`, `Traceback` |
+| `vllm-decode.log` | decode | `External prefix cache hit rate`, `need to load:`, `hit tokens`, `Avg prompt throughput`, `NIXL_ERR` |
+| `lmcache-mp-daemon.log` | **both** — one per node, the daemon is per-host | `L2 (role=`, `--l2-adapter`, `ZMQ`, `Traceback` |
+| `kv-target.log` | target | `SGL length`, `ENOMEM`, `NIXL_ERR` |
+| `disagg-proxy.log` | proxy host | `X-Request-Id` — the only way to correlate one client request across prefill and decode |
+
+### §6.2 Warnings that are EXPECTED — do not "fix" these
+
+Each of these has been mistaken for a fault at least once.
+
+| Signature | Verdict |
+|---|---|
+| `device advertises value_max=4096 but configured max_value_size=32768` | **Correct** on DSC firmware, which understates its ceiling 8x (§7 item 10). But **silent** on a lab whose target advertises more than you configured — if it fires *there*, the target really was created smaller than this repo assumes. Investigate, do not silence. |
+| `block device for nsid 1 not supported (csi 1)` | **Success.** `csi 1` has no block semantics (§1.3). |
+| `ping` / `ibv_devinfo` "not found" inside the container | Tooling absent from the image, not a fabric fault. The TCP checks beside them are the meaningful ones. |
+
+### §6.3 Errors whose message names the wrong thing
+
+| Signature | Actually means |
+|---|---|
+| `unknown adapter type 'nixl_kv'` | The module failed to **import**; the lazy loader swallowed the ImportError. `python3 -c "from nixl._api import nixl_agent"` (§7 item 4). |
+| `rc=-13` on a KV op | **`-EACCES` from the ioctl**, not a device status — the container lacks `CAP_SYS_ADMIN`, and the kernel gates NVMe passthrough by opcode. `KV_STORE`/`KV_RETRIEVE` alias write/read and are **allowed**, while `KV_EXIST`/`KV_DELETE` are **denied** — so writes succeed and only *discovery* fails, and a healthy-looking cache reports a 100% miss rate. Any `sc=` beside it is incidental. |
+| `success_keys=0/N` in under a millisecond | Every transfer raised and was swallowed. **Read durations, not success counts** (§3.2, §7 item 5). |
+| A lookup that "hits" on everything | `query_memory()` returns PRESENT as `{}` — **falsy**. `if resp[i]:` scores every hit as a miss (§7 item 13). |
+| `1 of 8 checks failed — decode side channel reachable` | You ran rung 50 from the wrong host. **False fail** (§2.4). |
+
+### §6.4 Versions — capture these, or the result is not reproducible
+
+BENCHMARKING.md §9's rule ("`run.env` or it is not a result") needs inputs.
+These are the versions that have actually changed an outcome in this
+project, so capture them **with** the numbers, not afterwards:
+
+```bash
+# [container] — the serving stack
+container.sh exec decode 'python3 -c "import vllm, lmcache; \
+  print(vllm.__version__, lmcache.__version__)"'
+container.sh exec decode '/opt/rocnixl-ucx/bin/ucx_info -v'
+container.sh exec decode 'dpkg -l | awk "/ rdma-core /{print \$3}"'
+
+# [host] — the fabric, and the gate that decides whether RDMA exists at all
+dpkg -l | awk '/ rdma-core /{print $3}'
+ibv_devinfo -d ionic_0 -v | awk '/max_srq:/{print $2}'
+ethtool -i "${PREFILL_PD_IF:-ens50f0}" | grep -E 'driver|firmware-version'
+uname -r; lsmod | grep -c amdgpu
+```
+
+**`rdma-core` differs between host and container, and the HOST copy is the
+one that matters for RDMA availability.** It sets whether the ionic
+provider reports `max_srq > 0`, which UCX's `rc_verbs` transport requires
+and filters on *before* configuring anything. `max_srq = 0` means UCX
+offers `ud_verbs` only, and `KV_TRANSPORT=rdma` will fail rather than fall
+back (by design — see `setup_ucx_env()`). Record both.
+
+**Image identity: compare CONTENT, not the image ID.** `docker load`
+recomputes the config, so IDs legitimately differ across hosts after a
+`save | load` and comparing them is misleading:
+
+```bash
+docker image inspect -f '{{range .RootFS.Layers}}{{println .}}{{end}}' \
+  "${KVSTACK_IMAGE}" | md5sum
+docker image inspect -f '{{json .Config.Env}}{{json .Config.Entrypoint}}' \
+  "${KVSTACK_IMAGE}" | md5sum
+```
+
+### §6.5 Which transport are you ACTUALLY on
+
+A benchmark that names a transport it did not use is worse than no
+benchmark. `KV_TRANSPORT` is what you *asked* for; these are what you
+*got*:
+
+```bash
+# what UCX was told
+sudo cat /proc/$(pgrep -f VLLM::EngineCore | head -1)/environ \
+  | tr '\0' '\n' | grep '^UCX_'
+
+# whether OUR process holds any RDMA QPs — check the cgroup, not the comm
+sudo rdma resource show qp
+```
+
+`UCX_TLS=tcp,rocm,self,sm` is **TCP**: `rocm` is the ROCm *memory domain*
+(`rocm_copy`/`rocm_ipc`), not a network transport, and `self`/`sm` are
+intra-host only, so neither can carry a cross-host P→D leg.
+
+The decisive check is bytes, not config. Snapshot both planes, run rung 50,
+snapshot again — the KV leg should be unmistakable, and the plane you did
+*not* use should be flat:
+
+```bash
+cat /sys/class/net/${PREFILL_PD_IF:-ens50f0}/statistics/{rx,tx}_bytes
+for i in /sys/class/net/benic*p1; do cat $i/statistics/{rx,tx}_bytes; done
+```
+
+Note the RoCE **netdev** counters are the ones to read: ionic exposes only
+error counters under `hw_counters/`, and no `port_xmit_data`, so an RDMA
+byte count read from `/sys/class/infiniband/*/ports/1/counters/` is
+structurally zero and proves nothing. Receiver-side counters also **lag by
+~5 s** — settling for 3 s once produced a false "traffic did not cross"
+verdict (TROUBLESHOOTING, "Confirming RoCE traffic actually crossed the
+wire").
+
 ---
 
 ## §7 Problems encountered, and what to do about them
@@ -1039,4 +1193,7 @@ reliably stop the MP daemon (§7 item 8); `container.sh down` does.
 - [docs/design/nixl-kv-l2-adapter.md](design/nixl-kv-l2-adapter.md) — the
   adapter's naming scheme, protocol, and counters.
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — failure signatures not
-  specific to benchmarking.
+  specific to benchmarking, plus a diagnostic-commands appendix (`rpc.py`
+  inspection, socket state, NIXL plugin introspection, GPU and fabric
+  state). §6.1–§6.5 here cover what you need *during* a bring-up; go there
+  when the signature is not in §7.
