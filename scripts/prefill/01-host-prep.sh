@@ -183,8 +183,12 @@ else
     else
         _uverbs_opened=0
         for _uv in "${_uverbs_nodes[@]}"; do
+            # `exec 3>&-` bare, NOT `exec 3>&- 2>/dev/null`: a redirection
+            # on `exec` is permanent, so the suppressed form rebinds this
+            # script's fd 2 to /dev/null for everything that follows. Same
+            # bug as require_rdma_access() in lib.sh (2026-09-29).
             if { exec 3<>"${_uv}"; } 2>/dev/null; then
-                exec 3>&- 2>/dev/null || true
+                exec 3>&-
                 _uverbs_opened=1
                 break
             fi

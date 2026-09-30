@@ -98,8 +98,15 @@ wait_for_port() {
     local host="$1" port="$2" timeout="${3:-120}"
     local deadline=$(( $(date +%s) + timeout ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
+        # The probe runs in a SUBSHELL, so fd 3 is opened and discarded
+        # there — this shell never held it and has nothing to close. The
+        # `exec 3>&- 2>/dev/null` that used to sit here was therefore not
+        # just redundant: a redirection on `exec` is permanent, so it
+        # rebound THIS shell's fd 2 to /dev/null from the first successful
+        # port probe onward, silently discarding every later diagnostic in
+        # whatever script called wait_for_port. See the same bug, and how
+        # it presented, at require_rdma_access() below (2026-09-29).
         if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
-            exec 3>&- 2>/dev/null || true
             return 0
         fi
         sleep 1
@@ -536,10 +543,21 @@ require_rdma_access() {
         " t~90s if this preflight hadn't caught it first (measured" \
         " 2026-09-11)."
 
+    # NOTE, and do not "tidy" this back: a redirection written on `exec`
+    # itself is PERMANENT for the shell, because `exec` with no command is
+    # defined to alter the shell's own fd table. `exec 3>&- 2>/dev/null`
+    # therefore does not merely silence the close — it silently rebinds
+    # fd 2 to /dev/null for the WHOLE REMAINDER of start-vllm.sh.
+    # Measured 2026-09-29 on smc2: with KV_TRANSPORT=rdma, decode died at
+    # exit 1 with ZERO output, because every die/err after this point, and
+    # vLLM's entire stderr, was being written to /dev/null. The preflight
+    # banner was the last thing anyone ever saw. Closing an fd that is
+    # known-open cannot fail, so the suppression bought nothing and cost
+    # every downstream diagnostic in the script.
     local _opened=0 _n
     for _n in "${_nodes[@]}"; do
         if { exec 3<>"${_n}"; } 2>/dev/null; then
-            exec 3>&- 2>/dev/null || true
+            exec 3>&-
             _opened=1
             break
         fi
