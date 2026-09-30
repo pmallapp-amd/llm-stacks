@@ -60,6 +60,31 @@ Throughout, `[SMC1]` = prefill, `[SMC2]` = decode, `[SMC3]` = KV target.
 Addresses come from `creds/active.env` (§6 of HANDOFF); nothing here
 hardcodes them.
 
+### §1.0 Conventions — three things this document will NOT hardcode
+
+This repo now drives **more than one lab**, and the values below differ
+between them. Earlier revisions of this document hardcoded all three, which
+made the copy-paste blocks silently wrong — and in one case **dangerous**
+— on any lab but the one they were written against. Set them once per
+shell and the rest of the document works anywhere:
+
+```bash
+REPO=/root/kv-cache                 # wherever deploy.sh put the repo on THIS node
+KV_DEV="${XNVME_DEV:-}"             # the KV namespace char device — see §1.3
+DSTATUS="http://127.0.0.1:${LMCACHE_MP_HTTP_PORT:-8080}/status"
+```
+
+- **`REPO`** — `/root/kv-cache` on the lab this document was written
+  against. Other deployments use a node-local path such as
+  `/opt/kv-cache`, specifically to avoid handing prefill and decode a
+  single shared working tree over NFS.
+- **`KV_DEV`** — **never assume an `ngXnY` index.** §1.3.
+- **`DSTATUS`** — the daemon's HTTP frontend. `8080` is only the default.
+  On a shared host another tenant may already own it, in which case
+  `start-lmcache-daemon.sh` honours `LMCACHE_MP_HTTP_PORT` and you must
+  scrape the port *you* bound. Curling 8080 anyway will return **another
+  stack's counters, and they will look entirely plausible.**
+
 ### §1.1 Node uptime — are the machines even stable right now
 
 ```bash
@@ -96,24 +121,44 @@ modprobe amdgpu
 (opt-out `AMDGPU_AUTOLOAD=0`). It does not survive a reboot. Not needed at
 all for §3.
 
-### §1.3 The KV device — `/dev/ng1n1` must exist
+### §1.3 The KV device — resolve it by NQN, never by name
+
+**RESOLVE it, do not name it.** `/dev/ng1n1` is the KV namespace on the
+lab this section was written against, and that is a **fact about one lab,
+not about this repo.** On a kernel-NVMe-oF lab the index is assigned by the
+kernel at connect time and moves between boots, and `/dev/ng1n1` there is
+an ordinary **Micron SSD**. A naive `[ -c /dev/ng1n1 ]` check passes on
+both, because every NVM namespace also gets an `ng` node — so the wrong
+device sails through and the failure surfaces much later, somewhere else.
 
 ```bash
-# [SMC1] and [SMC2]
-ls -l /dev/ng1n1
-nvme ns-descs /dev/ng1n1     # expect csi: 0x1 and eui64 e46cfefeffcdae01
+# [SMC1] and [SMC2] — resolve by NQN, then verify what you resolved
+source "${REPO}/scripts/common/lib.sh"
+KV_DEV="$(resolve_xnvme_kv_dev "${NVMF_SUBNQN}")" && echo "KV_DEV=${KV_DEV}"
+
+ls -l "${KV_DEV}"
+nvme ns-descs "${KV_DEV}"        # expect csi: 0x1
 ```
 
-**Expect** a **char** device (`crw-...`), and **no** `/dev/nvme1n1` beside
-it. That absence is correct: `csi 1` is the KV command set, which has no
-block-device semantics.
+`setup_nixl_kv_env()` does exactly this when `XNVME_DEV` is empty, and
+**dies rather than letting an empty value through** — an empty
+`NIXL_XNVME_DEV` falls back to the plugin's own `/dev` scan, which is how
+a boot drive gets selected.
+
+**Expect** a **char** device (`crw-...`), `csi: 0x1`, and **no matching
+block device** beside it. That absence is the discriminator: `csi 1` is the
+KV command set and has no block-device semantics, so a namespace that
+*does* have a `/dev/nvmeXnY` twin is **not** your KV namespace.
 
 **Never point anything at `/dev/ng0n1`.** That is the OS boot drive
 (`Micron_7450`, 800 GB) on both compute nodes. The vendor's own
 `deploy-xnvme.sh` defaults to it. Invariant 10.
 
-**If `/dev/ng1n1` is missing** — this is the DSC boot-time race (TODO 6.26),
-not a dead card. The kernel probes the controller ~3 s after PCIe
+**If the device is missing** — on DSC-attached labs this is the boot-time
+race (TODO 6.26), not a dead card. On a kernel-NVMe-oF lab it means the
+`nvme connect` is gone instead; check `nvme list-subsys` for your
+`NVMF_SUBNQN` and reconnect. For the DSC race: the kernel probes the
+controller ~3 s after PCIe
 enumeration, before the DPU-side application is ready, gets
 `Device not ready; aborting initialisation, CSTS=0x0`, detaches, and
 nothing re-probes it. Distinguish it from real hardware failure:
@@ -182,7 +227,7 @@ figure you may have seen in an older copy of this document.
 
 ```bash
 # [SMC2] (and [SMC1] if you need prefill)
-cd /root/kv-cache
+cd "${REPO}"
 ./scripts/common/container.sh status decode
 ./scripts/common/container.sh up decode        # idempotent
 ```
@@ -214,8 +259,11 @@ meaningless.
 # [SMC2] — everything §1 checks, in one paste
 uptime
 lsmod | grep -c amdgpu
-ls /dev/ng1n1 && nvme ns-descs /dev/ng1n1 | grep -E 'csi|eui64'
-cd /root/kv-cache && ./scripts/common/container.sh adapter-check decode
+source "${REPO}/scripts/common/lib.sh"
+KV_DEV="$(resolve_xnvme_kv_dev "${NVMF_SUBNQN}")" && ls -l "${KV_DEV}" \
+  && nvme ns-descs "${KV_DEV}" | grep -E 'csi'
+ss -tlnp | awk -v P=":${LMCACHE_MP_HTTP_PORT:-8080}$" '$4 ~ P'   # §1.0 — yours?
+cd "${REPO}" && ./scripts/common/container.sh adapter-check decode
 ```
 
 ---
@@ -234,7 +282,7 @@ once confirmed dead (TODO 6.23). The live surface is a repeatable
 
 ```bash
 # [SMC1] and [SMC2] — idempotent; the role start scripts call it for you
-cd /root/kv-cache
+cd "${REPO}"
 ./scripts/common/container.sh exec decode ./scripts/common/start-lmcache-daemon.sh
 ```
 
@@ -242,7 +290,7 @@ Verify:
 
 ```bash
 ./scripts/common/container.sh exec decode \
-  "curl -s http://127.0.0.1:8080/status | python3 -m json.tool | head -40"
+  "curl -s ${DSTATUS} | python3 -m json.tool | head -40"
 ```
 
 **Expect** `is_healthy: true`, and under
@@ -278,16 +326,60 @@ curl -s http://127.0.0.1:8000/status      # [SMC2] proxy — fleet + stats JSON
 
 ### §2.3 Prove disaggregation actually works before benchmarking it
 
-```bash
-./scripts/verify/50-verify-pd-direct.sh    # expect 9/9
-./scripts/verify/40-verify-disagg.sh       # expect 9/9
-```
-
 The acceptance signal is **decode's `Avg prompt throughput` at 0.0
 tokens/s** with external prefix cache hit rate rising toward 100% — decode
 does zero prefill work. A correct completion at plausible latency proves
 **nothing**: two separate defects in this project produced perfect output
 while transferring zero KV.
+
+Do not run individual verify scripts ad hoc. Use the ladder, **§2.4**,
+which fixes the order and — just as load-bearing — **where each rung must
+be invoked from**.
+
+### §2.4 The verify ladder — what each rung proves, and where to run it
+
+The canonical ordering is HANDOFF §3.3. Each rung is written to rule out
+the layer below it, so running a later rung after an earlier one failed
+just reproduces the same root cause in a harder-to-read form.
+
+| rung | script | run from | proves | expected |
+|---|---|---|---|---|
+| 10 | `10-verify-network.sh` | any node, or control host | reachability, MTU, throughput, fabric health — rules the network out *first* | all legs green |
+| 20 | `20-verify-nixl-plugin.sh` | each node, in container | the NIXL plugin loads and the device answers | 6/6 per node |
+| 30 | `30-verify-kv-roundtrip.sh` | each node, in container | the DEVICE and NAMESPACE carry a cross-node store+retrieve | byte-exact, both directions |
+| 35 | `35-verify-nixl-kv-smoke.sh` | control host | the `nixl_kv` NAMING SCHEME and commit protocol, no LMCache in path | 8/8 |
+| 40 | `40-verify-disagg.sh` | decode node, in container | end-to-end disaggregation through the proxy | 9/9 |
+| 50 | `50-verify-pd-direct.sh` | **decode node, in container** | the P→D direct NIXL leg — decode does zero prefill work | 9/9 |
+| 60 | `60-verify-l2-crossnode.sh --no-drain` | **control host** (drives both nodes over ssh) | a COLD reader serves chunks only the writer computed | 9/11 (see below) |
+
+`scripts/verify/run-all.sh` runs whichever rungs apply to the host it is
+on, in order, stopping at the first hard failure.
+
+**Rung 50 must be run ON the decode node.** Run from the control host it
+reports `1 of 8 checks failed — decode side channel reachable` and refuses
+the authoritative verdict, because decode's NIXL side channel may be bound
+to a **fabric** address the control host has no route to, and because the
+log-based verdict needs `vllm-decode.log`, which is **not bind-mounted**
+(§7 item 6). That is a **FALSE FAIL on a completely healthy stack** — do
+not chase it.
+
+**Rung 60 is the only rung that drives both nodes over ssh, and it STOPS,
+RECREATES and RESTARTS the containers on both.** That destroys anything
+pip-installed inside them — including §4.1's llama-benchy. Run 60 before
+§4, not after.
+
+**Rung 60's expected result is 9 of 11, not 11/11.** The 2 failures are
+step 7's negative control, **VOID BY CONSTRUCTION** whenever `--no-drain`
+is used. Treat **9/11 as GREEN**; investigate only if step 5 fails.
+Soundness for a `--no-drain` run rests instead on the per-run nonce plus
+negative control A, both of which must pass.
+
+**Why `--no-drain` at all.** The original reason ("we dare not drain a
+medium shared with another party") no longer holds: steps 0/7 drain the
+*target's* `nvmf_tgt`, which §1.4 establishes our data never reaches. The
+open work is re-targeting the drain step — better, asserting emptiness by
+probing rather than restarting anything — not deciding whether touching
+the target is safe (TODO 6.41c).
 
 ---
 
@@ -327,7 +419,7 @@ TODO 6.35.
 
 ```bash
 # [SMC2]
-cd /root/kv-cache
+cd "${REPO}"
 ./scripts/common/container.sh exec decode \
   "python3 -c 'from lmcache.v1.distributed.l2_adapters.config import get_registered_l2_adapter_types as g; print(sorted(g()))'"
 ```
@@ -346,9 +438,9 @@ setup problem that would otherwise produce a confidently wrong table.
 
 ```bash
 ./scripts/common/container.sh exec decode "
-cd /root/kv-cache && LMCACHE_DISABLE_BANNER=1 \
+cd "${REPO}" && LMCACHE_DISABLE_BANNER=1 \
 python3 scripts/bench/l2-block-bench.py bench l2 \
-  --l2-adapter '{\"type\":\"nixl_kv\",\"backend\":\"XNVME_KV\",\"backend_params\":{\"dev_uri\":\"/dev/ng1n1\"},\"namespace\":\"smoke\$(date +%s)\"}' \
+  --l2-adapter '{\"type\":\"nixl_kv\",\"backend\":\"XNVME_KV\",\"backend_params\":{\"dev_uri\":\"${KV_DEV}\"},\"namespace\":\"smoke\$(date +%s)\"}' \
   --l1-align-bytes 4096 --data-size-kb 16 --num-keys 4 --in-flight 1 \
   --rounds 1 --warmup-rounds 1 --lookup-max-hit-rate 1.0 --no-skip-verify"
 ```
@@ -379,12 +471,12 @@ One namespace per sweep point, so hit/miss semantics stay clean:
 
 ```bash
 ./scripts/common/container.sh exec decode bash -c '
-cd /root/kv-cache; export LMCACHE_DISABLE_BANNER=1
+cd "${REPO}"; export LMCACHE_DISABLE_BANNER=1
 OUT=/opt/kvstack/bench/kvblock; mkdir -p $OUT
 for KB in 16 64 256; do
   export NIXL_KV_METRICS_PATH=$OUT/plugin-$KB.json NIXL_KV_METRICS_INTERVAL_SEC=1
   python3 scripts/bench/l2-block-bench.py bench l2 \
-    --l2-adapter "{\"type\":\"nixl_kv\",\"backend\":\"XNVME_KV\",\"backend_params\":{\"dev_uri\":\"/dev/ng1n1\"},\"namespace\":\"sweep$KB\"}" \
+    --l2-adapter "{\"type\":\"nixl_kv\",\"backend\":\"XNVME_KV\",\"backend_params\":{\"dev_uri\":\"${KV_DEV}\"},\"namespace\":\"sweep$KB\"}" \
     --l1-align-bytes 4096 --data-size-kb $KB --num-keys 32 --in-flight 1 \
     --rounds 3 --warmup-rounds 1 --lookup-max-hit-rate 1.0 --no-skip-verify \
     --format json --output $OUT/full-$KB.json
@@ -407,11 +499,11 @@ namespace a previous run populated, with both controls:
 
 ```bash
 ./scripts/common/container.sh exec decode bash -c '
-cd /root/kv-cache; export LMCACHE_DISABLE_BANNER=1
+cd "${REPO}"; export LMCACHE_DISABLE_BANNER=1
 for RATE in 1.0 0.0; do
   echo "### requested hit rate $RATE ###"
   python3 scripts/bench/l2-block-bench.py bench l2 \
-    --l2-adapter "{\"type\":\"nixl_kv\",\"backend\":\"XNVME_KV\",\"backend_params\":{\"dev_uri\":\"/dev/ng1n1\"},\"namespace\":\"sweep256\"}" \
+    --l2-adapter "{\"type\":\"nixl_kv\",\"backend\":\"XNVME_KV\",\"backend_params\":{\"dev_uri\":\"${KV_DEV}\"},\"namespace\":\"sweep256\"}" \
     --l1-align-bytes 4096 --data-size-kb 256 --num-keys 32 --in-flight 1 \
     --rounds 3 --warmup-rounds 1 --only lookup --lookup-max-hit-rate $RATE
 done'
@@ -564,7 +656,7 @@ sweep's wall clock first.
 
 ```bash
 ./scripts/common/container.sh exec decode bash -c '
-cd /root/kv-cache
+cd "${REPO}"
 export BENCHY_PP=512 BENCHY_TG=32 BENCHY_DEPTH=0 BENCHY_CONCURRENCY=1 BENCHY_RUNS=2
 ./scripts/bench/10-bench-baseline.sh --target=decode'
 ```
@@ -591,7 +683,7 @@ caching. `--no-cache` does.
 
 ```bash
 ./scripts/common/container.sh exec decode \
-  "cd /root/kv-cache && ./scripts/bench/20-bench-prefix-cache.sh --confirm-connector-hit"
+  "cd "${REPO}" && ./scripts/bench/20-bench-prefix-cache.sh --confirm-connector-hit"
 ```
 
 > **Read this before quoting any speedup from this script.** vLLM's own
@@ -616,7 +708,7 @@ sweep instead of trusting the log grep:
 
 ```bash
 ./scripts/common/container.sh exec decode \
-  "curl -s http://127.0.0.1:8080/status | python3 -c \"
+  "curl -s ${DSTATUS} | python3 -c \"
 import json,sys; print(json.load(sys.stdin)['storage_manager']['l2_adapters'][0])\""
 ```
 
@@ -627,7 +719,7 @@ The number is only meaningful if `l2_device_hits` **rose** while
 
 ```bash
 ./scripts/common/container.sh exec decode \
-  "cd /root/kv-cache && ./scripts/bench/30-bench-concurrency.sh --pp=2048 --tg=128 --depth=4096"
+  "cd "${REPO}" && ./scripts/bench/30-bench-concurrency.sh --pp=2048 --tg=128 --depth=4096"
 ```
 
 Again `=`-form arguments only. Watch for backpressure in the engine logs:
@@ -723,7 +815,7 @@ nixlbench --etcd_endpoints http://<host>:2379 --backend UCX
 
 | Layer | Surface | Carries |
 |---|---|---|
-| L2 adapter | `http://127.0.0.1:8080/status` → `storage_manager.l2_adapters[0]` | `l2_device_hits`, `l2_index_hits`, `l2_probe_misses`, `l2_keys_probed`, `l2_lookup_calls/executions`, `l2_commit_writes`, `l2_load_aborts`, `l2_probe_errors` |
+| L2 adapter | `${DSTATUS}` → `storage_manager.l2_adapters[0]` | `l2_device_hits`, `l2_index_hits`, `l2_probe_misses`, `l2_keys_probed`, `l2_lookup_calls/executions`, `l2_commit_writes`, `l2_load_aborts`, `l2_probe_errors` |
 | NIXL plugin | JSON file at `$NIXL_KV_METRICS_PATH` | `store_ops`, `retrieve_ops`, `store_bytes`, `retrieve_bytes`, `completions_ok/err`, `submit_retry/fail`, `stalls`, `peak_in_flight`, `lat_us_sum`, `lat_us_bucket[8]`, `retrieve_len_checked` |
 | vLLM engine | `/metrics` on 8100 / 8200 | prefix-cache queries/hits, throughput |
 
@@ -846,11 +938,15 @@ container is the only reliable way to get a genuinely cold reader — and
 remember it destroys the container's `/tmp`, so re-stage anything you put
 there.
 
-### 9. `/dev/ng1n1` missing after a reboot
+### 9. The KV device is missing after a reboot
 
-See §1.3. Rebind via `/sys/bus/pci/drivers/nvme/bind`, expect to retry over
-several minutes, and treat `block device for nsid 1 not supported (csi 1)`
-as success rather than failure.
+See §1.3 — and **resolve the device by NQN before concluding it is gone**;
+on a kernel-NVMe-oF lab the index moves across boots, so "`/dev/ng1n1` is
+missing" may only mean it is now `/dev/ng3n1`.
+
+On DSC-attached labs, rebind via `/sys/bus/pci/drivers/nvme/bind`, expect
+to retry over several minutes, and treat `block device for nsid 1 not
+supported (csi 1)` as success rather than failure.
 
 ### 10. Loud startup warning: `device advertises value_max=4096 but configured max_value_size=32768`
 
