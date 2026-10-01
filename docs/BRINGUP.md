@@ -6,6 +6,25 @@ something, and then how to run the benchmark harnesses that exist.
 Last updated 2026-09-30. Covers SETUP 4 (the Pensando DSC lab); the
 `setup-3-nvmeof` branch carries the kernel-NVMe-oF lab.
 
+> **Current state, 2026-09-30 — read before running anything below.**
+> Two blockers stand between this cluster and a served decode request, and
+> §2/§4/§4A are **not runnable today**:
+>
+> 1. **RDMA device names changed under us.** Both nodes rebooted
+>    2026-09-29 and the RoCE devices came back as `roce_benicNp1`, not
+>    `ionic_N`. `creds/setup-4.env` still pins `ionic_7:1`, so UCX matches
+>    no device, falls back to shm/ROCm transports that cannot do active
+>    messages, and `NixlConnector` dies at construction with
+>    `NIXL_ERR_BACKEND`. **New §1.4 catches this in one command** — it is
+>    the check this runbook was missing.
+> 2. **`ipc_wrapper.py:85` KV-cache registration OOM** (§7 item 19,
+>    TROUBLESHOOTING.md, TODO 6.47) — root cause NOT established. Blocker 1
+>    currently masks it: execution dies before `REGISTER_KV_CACHE` is ever
+>    reached.
+>
+> §3 (block-level) is unaffected by both **provided no vLLM is resident on
+> the node** — see §7 item 19.
+
 > **Scope change, 2026-09-18.** This document used to be a full
 > from-source bring-up guide (build SPDK, build UCX/NIXL, install vLLM).
 > That path has not completed successfully in this project and is not what
@@ -171,9 +190,11 @@ restores all 8 GPUs with no reboot and no GRUB edit:
 modprobe amdgpu
 ```
 
-`scripts/common/01-host-prep.sh` does this automatically every run
-(opt-out `AMDGPU_AUTOLOAD=0`). It does not survive a reboot. Not needed at
-all for §3.
+`scripts/prefill/01-host-prep.sh` and `scripts/decode/01-host-prep.sh` do
+this automatically every run (opt-out `AMDGPU_AUTOLOAD=0`) — the autoload
+logic itself lives in `scripts/common/lib.sh`, shared by both role
+scripts; there is no `scripts/common/01-host-prep.sh`. It does not
+survive a reboot. Not needed at all for §3.
 
 ### §1.3 The KV device — resolve it by NQN, never by name
 
@@ -324,27 +345,39 @@ under this project more than once (TODO 6.18). **Do not restart another
 party's target to reclaim it — agree ownership first.**
 
 As of 2026-09-18 the live `nvmf_tgt` serves `nqn.2016-06.io.spdk:cnode1`,
-**not** our `nqn.2024-01.io.nixl:kv0` — and `/dev/ng1n1` works on both
-compute nodes anyway.
+**not** our `nqn.2024-01.io.nixl:kv0`.
 
-**This section used to explain that away with a re-export model — that each
-node's DSC is itself an NVMe-oF initiator transparently re-exporting the
-target's namespace. That model is RETRACTED** (HANDOFF §2, TODO 6.36).
-`/dev/ng1n1` is `transport=pcie` at `0000:36:00.0`, subsystem
-`nqn.2019-08.com.pensando:...`, `mn=PDSNVME` — a **local** Pensando
-function, with no NVMe-oF connection from the host at all. The target has
-served **zero I/O**, and its listener is TCP-unreachable from compute.
+**RETRACTED (TODO 6.36, 6.40): `/dev/ng1n1` does NOT re-export smc3's
+namespace.** The earlier claim — that each node's own Pensando DSC is
+itself an NVMe-oF initiator that re-exports smc3's namespace as a local
+PCIe function — was never supported by any measurement, and is
+contradicted by two independent findings: smc3's target has served
+**zero I/O** for our data (`bdev_get_iostat` reads all-zero across a
+1d05h uptime while we wrote 972 MiB minutes earlier), and its listener
+is TCP-unreachable from either compute node. `/dev/ng1n1` is
+`transport=pcie` at `0000:36:00.0`, `mn=PDSNVME` — a **local** Pensando
+DSC function, with no NVMe-oF connection from the host at all. There is
+no local, independent, unshareable device here, but the mechanism is not
+what this document previously claimed.
 
-What still stands: the medium **is** genuinely shared between the two
-compute nodes — rungs 30/35 store on one and read back byte-exact on the
-other, with negative controls. **What backs it is an open question for the
-hardware owner.** Do not re-derive an answer from the matching `eui64`; it
-is equally consistent with a fixed identifier in Pensando firmware.
+What genuinely is true: the medium really is shared across `smc1` and
+`smc2` — rungs 30/35 store on one node and read back byte-exact on the
+other, with negative controls — by some path that is **not** smc3's
+`nvmf_tgt`. What actually backs it remains open; ask the hardware owner,
+and do not re-derive it from the matching `eui64` (TODO 6.36).
 
-**Consequence for benchmarking:** the namespace is shared with someone
-else, and **there is no delete primitive** (TODO 6.29). Size your runs
-(§3.6) — but see the capacity note there before reusing any "1 GiB"
-figure you may have seen in an older copy of this document.
+**Consequence for benchmarking.** The **"1 GiB" namespace figure is
+RETRACTED** (TODO 6.39): it was NVM-command-set block arithmetic
+(`nsze × 512`) applied to a `csi 0x1` namespace that has no LBAs and no
+block semantics; ~1.16 GiB has since been written through this same
+namespace with zero errors. And **"no delete primitive" was imprecise**:
+`libxnvme` exports `xnvme_kvs_delete`/`xnvme_kvs_list` — **our plugin
+implements neither**, and device-level support for them is unverified
+(HANDOFF §3.3 item 4; commit 235e08c). Re-point any citation of the old
+"1 GiB / no delete" claim from TODO 6.29 to TODO 6.39/6.40/6.41, which is
+where the current understanding of capacity and volatility actually
+lives. Size your runs anyway (§3.6): space is still never reclaimed and
+there is still no usage telemetry.
 
 ### §1.6 The container, and the overlays that make it work
 
@@ -408,6 +441,13 @@ grep -E 'UCX_NET_DEVICES|PD_SIDE_CHANNEL_HOST|KV_TRANSPORT' creds/active.env
 **Skip this entire section if you only need §3.** Block-level benchmarking
 does not use vLLM, the MP daemon, or the proxy.
 
+**Check `KV_TRANSPORT` before starting anything.** `config/cluster.env`
+defaults it to `tcp`; `creds/setup-4.env` overrides it to `rdma` for this
+cluster, so that is the value actually in effect. In RDMA mode
+`start-vllm.sh` calls `require_rdma_access`, which can die on port state,
+memlock limits, or a missing `/dev/infiniband` mapping — confirm §1.4
+passes clean before troubleshooting anything downstream of it.
+
 ### §2.1 The LMCache MP daemon
 
 The backend is configured **on the daemon**, not in vLLM's connector
@@ -447,7 +487,8 @@ correctly miss.
 ./scripts/common/container.sh exec decode  ./scripts/proxy/start-proxy.sh
 ```
 
-These take **~5 minutes per role** at Qwen3-8B/TP=1. `start-vllm.sh`
+These take **130 s per role** at Qwen3-8B/TP=1 (Measured 2026-09-21,
+repeatedly, by rung 60's own instrumented bring-up — see §2.4). `start-vllm.sh`
 hard-gates on the daemon being reachable and will `die` with a pointer back
 to `start-lmcache-daemon.sh` rather than silently serving from local cache.
 
@@ -661,18 +702,17 @@ like success.
 
 ### §3.6 Capacity — size runs before you launch them
 
-**The "1 GiB namespace" figure this section used to budget against was
-never real** (HANDOFF §2, TODO 6.39). It came from reading NVM-command-set
-LBA fields (`nsze × 512`) on a `csi 0x1` namespace that **has no LBAs**.
-~1.16 GiB was written through it in one session with zero errors, so treat
-**~1.16 GiB as a measured lower bound, not a limit** — the DSC's real
-ceiling is unmeasured. The SPDK target for its part advertises
-`num_blocks=UINT64_MAX` (16 EiB) and is bounded only by its own RAM.
-
-What has not changed, and is the actual reason to budget: **there is no
-delete primitive** (TODO 6.29). Space is never reclaimed, and pre-fix
-corrupt objects from earlier sessions are still resident. Budget before
-running:
+The **"1 GiB" figure is RETRACTED** (TODO 6.39): it came from reading
+`nsze × 512` on a `csi 0x1` namespace that has no LBAs and no block
+semantics, not from any real byte budget — ~1.16 GiB has since been
+written through this same namespace with zero errors. What genuinely
+constrains you: there is still no usage telemetry (`NUSE` reads 0 and
+does not track KV writes) and **no delete primitive in this plugin** —
+`libxnvme` exports `xnvme_kvs_delete`/`xnvme_kvs_list`, but the plugin
+implements neither, and device-level support for them is unverified
+(HANDOFF §3.3 item 4; commit 235e08c). Re-point any old citation of this
+claim from TODO 6.29 to 6.39/6.40/6.41. Space is never reclaimed within a
+given uptime window, so budget before running:
 
 ```
 device ops per run = (data_size_kb/4 + 1) * num_keys * (rounds + warmup_rounds)
@@ -680,10 +720,30 @@ bytes on device    = device ops * 4096
 ```
 
 The §3.3 sweep costs ~11,136 pages ≈ **43.5 MiB**. A 1024 KB block size at
-the same shape would cost ~32,896 pages ≈ 128 MiB. Draining is currently
-**blocked** — `50-reset-namespace.sh` refuses to run because the live
-`nvmf_tgt` was not started by this repo's scripts, and replacing it risks
-the DSC/DPU peering (TODO 6.34's operational note).
+the same shape would cost ~32,896 pages ≈ 128 MiB.
+
+**Pre-fix corrupt objects from earlier sessions are gone, not "still
+resident."** The Pensando DSC/DPU KV store is **VOLATILE** (TODO 6.41):
+every historical object re-probed after the 2026-09-21 recovery — from
+both the pre-fix and post-fix generations — came back a MISS, on both
+nodes. Consequence: this tier is a reuse cache **within an uptime
+window**, not persistent storage. Any cold-reader or reuse-rate
+measurement must record node uptime (§1.1) alongside its numbers, or the
+result cannot be compared against a future run.
+
+**Draining is no longer blocked for the reason previously stated here —
+that blocker DISSOLVED (TODO 6.41c), it was not fixed.**
+`50-reset-namespace.sh` still refuses to run when the live `nvmf_tgt` was
+not started by this repo's scripts, but that no longer matters for
+draining *our* data: §1.5 established our writes never reach smc3's
+`nvmf_tgt` at all, so restarting it would not have drained anything of
+ours even before this was understood. Draining our own medium means
+cycling the DSC/DPU (not implemented here), or simply confirming
+emptiness by probing (TODO 6.41's method) rather than restarting
+anything. For the separate, legitimate case of resetting a genuinely
+**foreign** target, `50-reset-namespace.sh` still cannot handle that —
+`scripts/target/51-reset-smc3-storage.sh` is the tool written for it, and
+it refuses to run anywhere but smc3.
 
 ### §3.7 Cross-check against the device — do not skip this
 
@@ -813,7 +873,9 @@ export BENCHY_PP=512 BENCHY_TG=32 BENCHY_DEPTH=0 BENCHY_CONCURRENCY=1 BENCHY_RUN
 ./scripts/bench/10-bench-baseline.sh --target=decode'
 ```
 
-**Note the `=`.** `--target=decode` works; `--target decode` is rejected.
+`10-bench-baseline.sh` accepts **both** `--target=decode` and
+`--target decode`. It is only `30-bench-concurrency.sh` (§4.5) that is
+`=`-only, for `--pp/--tg/--depth` — see §7 item 7.
 
 **Expect** a run directory under `/opt/kvstack/bench/` containing
 `result.json`, `result.md`, `run.env`, `progress.jsonl`, and pre/post
@@ -830,6 +892,21 @@ pp_throughput  mean=32186.266 tok/s
 `--no-cache` is passed deliberately: `--depth 0` only means "no cached
 prefix was staged", it does **not** disable vLLM's own automatic prefix
 caching. `--no-cache` does.
+
+**Measured 2026-09-21** (Qwen3-8B, TP=1, `--target=proxy`, `--no-cache`,
+pp=512, tg=128, depth=0, concurrency=1, 3 runs). Configuration differs from
+the 2026-09-18 numbers above: this run had **L1 forced to 1 GiB** (§4A.2),
+so every chunk is being written through to the KV device during the
+measurement, which the 2026-09-18 numbers were not:
+
+| metric | mean | std |
+|---|---|---|
+| `e2e_ttft` | 698.812 ms | 0.586 |
+| `est_ppt` | 581.512 ms | 0.586 |
+| `pp_throughput` | 880.5 tok/s | 0.887 |
+| `tg_throughput` | 201.5 tok/s | 0.036 |
+
+(generation-latency probe: 117.30 ms)
 
 ### §4.4 Prefix-cache benefit — and why the number is not what it looks like
 
@@ -866,6 +943,28 @@ import json,sys; print(json.load(sys.stdin)['storage_manager']['l2_adapters'][0]
 
 The number is only meaningful if `l2_device_hits` **rose** while
 `l2_index_hits` stayed at 0.
+
+**Measured 2026-09-21** — sweep `BENCHY_DEPTH="0 4096"`, pp=512, tg=128,
+concurrency=1, 3 runs, `--confirm-connector-hit` **PASSED**, same
+L1-forced configuration as §4.3's 2026-09-21 row:
+
+| phase | depth | est_ppt | e2e_ttft | tg tok/s |
+|---|---|---|---|---|
+| inference | 0 | 581.36 +/- 0.36 ms | 698.67 +/- 0.36 ms | 201.3 |
+| **context load** | 4096 | **5,313.85 +/- 37.33 ms** | 5,431.17 +/- 37.33 ms | 182.2 |
+| inference | 4096 | 706.15 +/- 0.17 ms | 823.47 +/- 0.17 ms | 179.6 |
+
+> **`compare_runs.py --prefix-benefit` reports 0.823x for this run** —
+> which reads as "the cache made it SLOWER". That number is an
+> **ARTIFACT** of how the metric is paired: it compares inference@depth=0
+> against inference@depth=4096, i.e. a request with **no context** against
+> a request carrying **4,096 tokens of context**. Those are different
+> workloads, so the ratio cannot express cache benefit, and a healthy tier
+> will score below 1.0. The honest comparison is the context-load row
+> against the inference row at the **same depth** —
+> **5,313.85 / 706.15 = 7.53x**. This is a concrete, measured instance of
+> exactly the defect TODO 1.13 exists to fix; do not quote the 0.823x as a
+> result, and do not read it as the tier hurting.
 
 ### §4.5 Concurrency
 
@@ -1119,8 +1218,10 @@ nixlbench --etcd_endpoints http://<host>:2379 --backend UCX
 
 > **Do not quote a transport number from nixlbench until it has actually
 > been built and run on this cluster.** This section is a recipe, not a
-> result. `ib_write_bw` cross-node (~41,898 MiB/s, ~88% of 400 Gb/s line
-> rate) is the only real fabric throughput figure this project has, and it
+> result. `ib_write_bw`, RC queue pairs, cross-node (**769.34 Gb/s peak
+> bidirectional**, ~96% of 400 Gb/s per direction, TODO 6.43, HANDOFF) is
+> the only real fabric throughput figure this project has — superseding
+> the older ~41,898 MiB/s / ~88% figure this section used to cite — and it
 > measures the RDMA fabric, not the KV path.
 
 ---
@@ -1619,13 +1720,21 @@ Always read upward from that line, not just at it.
 kill "$(cat /run/kvstack/disagg-proxy.pid)"
 
 # [SMC1] / [SMC2]
-./scripts/decode/99-stop.sh          # or prefill/99-stop.sh
+./scripts/decode/99-stop.sh --clean-shm      # or prefill/99-stop.sh
 ./scripts/common/container.sh down decode
 ```
 
 Nothing is left running deliberately at the end of a session — containers
-carry no `--restart` policy. Note that `99-stop.sh` alone does **not**
-reliably stop the MP daemon (§7 item 8); `container.sh down` does.
+carry no `--restart` policy. `99-stop.sh` **does** reliably stop the MP
+daemon: both `scripts/{prefill,decode}/99-stop.sh` explicitly invoke
+`scripts/common/stop-lmcache-daemon.sh` — this document previously said
+otherwise, and that was wrong (the pkill footgun in §7 item 8 is a real
+but separate failure mode).
+
+Pass `--clean-shm`. A stale `/dev/shm/lmcache_*` or `/dev/shm/nixl_*`
+segment left behind by a crash or the §7 item 19 OOM makes the daemon
+fail identically on its next start, and `container.sh down` does not
+clean `/dev/shm` for you.
 
 ---
 
