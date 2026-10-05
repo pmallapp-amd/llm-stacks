@@ -6,24 +6,32 @@ something, and then how to run the benchmark harnesses that exist.
 Last updated 2026-09-30. Covers SETUP 4 (the Pensando DSC lab); the
 `setup-3-nvmeof` branch carries the kernel-NVMe-oF lab.
 
-> **Current state, 2026-09-30 — read before running anything below.**
-> Two blockers stand between this cluster and a served decode request, and
-> §2/§4/§4A are **not runnable today**:
+> **Current state, 2026-10-05 — read before running anything below.**
 >
-> 1. **RDMA device names changed under us.** Both nodes rebooted
->    2026-09-29 and the RoCE devices came back as `roce_benicNp1`, not
->    `ionic_N`. `creds/setup-4.env` still pins `ionic_7:1`, so UCX matches
->    no device, falls back to shm/ROCm transports that cannot do active
->    messages, and `NixlConnector` dies at construction with
->    `NIXL_ERR_BACKEND`. **New §1.4 catches this in one command** — it is
->    the check this runbook was missing.
+> **Blocker 1 (RDMA) is RESOLVED. Leg A works; prefill serves.** One
+> blocker remains and it is the storage leg.
+>
+> 1. ~~**RDMA device names changed under us.**~~ **FIXED 2026-10-05.** The
+>    rename was real but it was a *symptom*, not the cause. The AI NICs
+>    were running the **`hydra`** firmware personality, and a hydra card
+>    **cannot create a UD queue pair** — so UCX could not build a worker
+>    and `NixlConnector` died with `NIXL_ERR_BACKEND` regardless of which
+>    device name was pinned. Two cards per node were flashed to
+>    **`pulsar`** (`1.130.0-a-149`, 400G-patched), which renamed them back
+>    to `ionic_0`/`ionic_1`. Measured proof: UD QP creation **OK** on a
+>    pulsar card, **FAILS** on an untouched hydra card. Prefill now serves
+>    on `:8100` with live QPs on the pulsar rails.
+>    Full procedure, card-BDF↔rail map and the scoping rules are in
+>    [`docs/setups/setup-4.md`](setups/setup-4.md) §2.5/§2.5.1; the gate is
+>    `require_rdma_fw_program()` in `scripts/common/lib.sh`.
 > 2. **`ipc_wrapper.py:85` KV-cache registration OOM** (§7 item 19,
->    TROUBLESHOOTING.md, TODO 6.47) — root cause NOT established. Blocker 1
->    currently masks it: execution dies before `REGISTER_KV_CACHE` is ever
->    reached.
+>    TROUBLESHOOTING.md, TODO 6.47) — root cause still NOT established, and
+>    it is **no longer masked**: with leg A fixed, execution now reaches
+>    `REGISTER_KV_CACHE` and this is what stops decode. **This is the only
+>    thing between the cluster and a served decode request.**
 >
-> §3 (block-level) is unaffected by both **provided no vLLM is resident on
-> the node** — see §7 item 19.
+> §3 (block-level) is unaffected by blocker 2 **provided no vLLM is
+> resident on the node** — see §7 item 19.
 
 > **Scope change, 2026-09-18.** This document used to be a full
 > from-source bring-up guide (build SPDK, build UCX/NIXL, install vLLM).
@@ -1638,10 +1646,66 @@ leaves the GPU unable to hand out any allocation to any other process,
 and every earlier "IPC" framing of this defect, including this entry's
 own title, is aimed at the wrong layer.
 
-**Solution:** none. `gpu_memory_utilization` 0.85 → 0.60 was tried and
-changed nothing — this is not a headroom problem. See
-TROUBLESHOOTING.md's `ipc_wrapper.py:85` entry for the full elimination
-record, and TODO 6.47.
+**2026-10-05 — there are TWO distinct faults landing on this one line.**
+Reduced to three lines, no vLLM, no LMCache, no NIXL, no second process,
+in an ephemeral container on an **idle** GPU:
+
+```python
+a = torch.ones((256,1024), dtype=torch.float16, device="cuda:0")  # OK
+h = a.untyped_storage()._share_cuda_()                            # OK (8 fields)
+torch.UntypedStorage._new_shared_cuda(0, *h[1:])                  # FAILS
+#   torch.AcceleratorError: HIP error: invalid device context (hipErrorInvalidContext)
+```
+
+Note what this does **not** show: plain allocation and the IPC *export*
+both succeed. The allocator is healthy. Only the IPC **import** fails.
+That is a different fault from the 2026-09-29 one above, where a resident
+vLLM leaves *every* allocation failing. Both surface at `ipc_wrapper.py:85`,
+which is why they have been conflated:
+
+| | 2026-09-29 fault | 2026-10-05 fault |
+|---|---|---|
+| vLLM resident? | **yes** (required) | **no** (idle GPU) |
+| plain `torch.empty` | **fails** | succeeds |
+| `_share_cuda_` (export) | — | succeeds |
+| `_new_shared_cuda` (import) | — | **fails**, `hipErrorInvalidContext` |
+
+Reproduced identically across **6 images** (5× `rocm-aic:*` plus stock
+`rocm/pytorch:latest`), **2 torch builds** (`2.13.0+rocm7.2`,
+`2.10.0+rocm7.2.4`), **2 kernel drivers** (smc1 `6.16.13`, smc2 `6.18.4`),
+**both** values of `HSA_ENABLE_IPC_MODE_LEGACY`, and at **TP=1 and TP=2**.
+So it is not node-specific, not driver-version-specific, not TP-related,
+and not fixed by the legacy IPC mode flag.
+
+**`expandable_segments` — tried, does NOT fix the live stack.** In the
+*same-process* snippet above, `expandable_segments:True` makes
+`_new_shared_cuda` pass. That is misleading: importing a handle you just
+exported in the same process does not model the real topology. Across
+**processes** the reproducer segfaults under *every* combination
+(`exp=False/imp=True`, `True/True`, `True/False`). Running the MP daemon
+with `expandable_segments:True` while vLLM kept `False` was implemented,
+deployed and measured — the daemon's process env was verified to carry it —
+and decode still failed with a fresh OOM. **That change was reverted**;
+invariant 3 (`expandable_segments:False`) stands. Do not re-try this
+without new evidence.
+
+**Also corrected 2026-10-05:** TP=2 was briefly suspected (the first
+observed failure was on GPU 1, the second TP worker's device). That is
+wrong — it reproduces at TP=1 on GPU 0, and single-process with no tensor
+parallelism at all. The GPU index simply follows whichever device the
+worker holds.
+
+**Solution:** none on the production build. `gpu_memory_utilization` 0.85
+→ 0.60 was tried and changed nothing — this is not a headroom problem.
+
+**2026-10-01 — a different vLLM build does not reproduce it.**
+`rocm/vllm:latest` (AMD's ROCm-fork build, `0.11.2.dev673+g839868462`),
+run standalone with no LMCache/NIXL at all, did NOT poison the allocator
+at a comparable-or-tighter free-VRAM margin than the documented failure.
+Not yet proof production can move to it — LMCache's compatibility with
+that build is a separate open question. See
+TROUBLESHOOTING.md's `ipc_wrapper.py:85` entry (2026-10-01 box, at the
+top) for the full measurement and its caveats, and TODO 6.47.
 
 ### 20. Zombie PID silently blocks a daemon restart
 

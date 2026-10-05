@@ -511,6 +511,154 @@ grep PYTORCH_HIP_ALLOC_CONF /proc/$(cat /run/kvstack/vllm-prefill.pid)/environ 2
 or INFERRED; treat the "still open" section as the actual state, not the
 elimination list — six candidate causes are ruled out, none is confirmed.
 
+> ### READ THIS FIRST — 2026-10-01: `rocm/vllm:latest` does NOT reproduce this, at a comparable margin
+>
+> Direct test of "would a different vLLM build dodge the allocator
+> poisoning": `rocm/vllm:latest` (locally cached, 30.7 GB,
+> `0.11.2.dev673+g839868462`, `torch.version.hip 7.0.51831-a3e329ad8`) run
+> standalone on `smc2` GPU0, no LMCache/NIXL in the loop at all — just
+> `vllm.LLM(model="Qwen/Qwen3-8B", gpu_memory_utilization=0.85,
+> tensor_parallel_size=1, max_model_len=32768)` held resident, then a
+> second plain `docker exec` process probed `torch.empty()`. MEASURED,
+> single run:
+>
+> | | production (`vllm==0.28.0`, §19 below) | `rocm/vllm:latest` |
+> |---|---|---|
+> | free VRAM when probed | 28.37 GiB | **26.6 GiB** (tighter) |
+> | second-process 2 MiB alloc | **FAILS** (`torch.OutOfMemoryError`) | **OK** |
+> | second-process 1 B / 64 MiB alloc | not separately recorded | **OK** |
+>
+> At an equal-or-tighter free-VRAM margin than the documented failure, a
+> second process could allocate fine. **The allocator-poisoning behavior
+> does not reproduce on this build.**
+>
+> **What this does NOT establish, read carefully before acting on it:**
+> 1. `rocm/vllm:latest`'s version string (`0.11.2.dev673+g839868462`) reads
+>    as AMD's own ROCm-fork build lineage, not simply a later point on the
+>    pip/PyPI `0.28.0` release line — this is evidence that *a different
+>    ROCm-native build* sidesteps the bug, not strict proof that
+>    *upgrading* the pinned version would.
+> 2. **LMCache was not in this test at all** — no MP daemon, no
+>    `REGISTER_KV_CACHE`, no IPC import. Only the vLLM-residency half of
+>    the bug (does *something else* on the GPU get starved) was tested.
+>    Whether any published LMCache version's `KVConnector` wire contract
+>    is compatible with this specific vLLM build is a SEPARATE, OPEN
+>    question — see TODO (LMCache/rocm-vllm compatibility check).
+> 3. One run, one GPU, no repeat yet. Worth a second run before treating
+>    this as solid, given how inconsistently this bug has reproduced
+>    across seemingly-identical setups elsewhere in this record (point 7
+>    below).
+>
+> Reproducer scripts and exact docker invocation: this session's agent
+> transcript, 2026-10-01 — not yet committed to `tmp/`. Recreate with a
+> `holder.py` that calls `vllm.LLM(...)` under an
+> `if __name__ == "__main__":` guard (V1 engine requires `spawn`, which
+> re-imports `__main__` otherwise) and a `second.py` identical to
+> `tmp/holder_ab.sh`'s `_second.py`; mount the HF cache **read-write**
+> (vLLM wants to create `$HF_HOME/modules`, a plain `:ro` mount fails
+> with `OSError: Read-only file system` before ever reaching the GPU
+> question).
+>
+> **LMCache-compatibility follow-up, same session.** Point 2 above
+> flagged "does any LMCache version pair with this vLLM build" as open.
+> Partial answer, MEASURED: the connector has moved — this vLLM build
+> (unlike the pinned `0.28.0`) vendors it in-tree at
+> `vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector`
+> rather than reading it from `lmcache.integration.vllm.*`, but that
+> vendored module still does `from lmcache.integration.vllm.utils import
+> mla_enabled` — so the external `lmcache` package is still required
+> either way. Installing `lmcache==0.5.5` (latest on PyPI; `--no-deps`,
+> then adding only the one missing leaf `sortedcontainers`) let both that
+> import and the connector module import succeed. **This is a shallow
+> result, not a working-stack result:**
+> - `lmcache==0.5.5`/`0.5.4` both declare unconditional (not
+>   extras-gated) dependencies on NVIDIA-only packages —
+>   `cupy-cuda13x`, `cufile-python`, `nvtx`, and `0.5.5` additionally adds
+>   `cuda-python<14,>=13`. This is **not new to 0.5.5** — `0.5.4`, the
+>   version production already runs successfully on this ROCm host, has
+>   the same `cupy-cuda13x`/`cufile-python`/`nvtx` set (confirmed via
+>   PyPI's `requires_dist` for both versions) — so it is evidence these
+>   packages sit unused rather than evidence of a new incompatibility.
+> - The import did log `torch_dev=StubCPUDevice(device_type=cpu)` from
+>   LMCache's own `_device_detect.py:312`, which reads alarmingly like
+>   "LMCache thinks there is no GPU here." **Not trusted as a verdict**
+>   without a repeat test — this was a bare `python3 -c "import ..."`
+>   outside any actual vLLM worker process, with no HIP context
+>   initialized, so a stub/CPU fallback at that point may simply be an
+>   artifact of the test being too shallow to trigger real device
+>   detection, not a sign LMCache is broken on this build. Untested
+>   either way.
+>
+> **What would actually answer the question, not yet done:** construct
+> a real `LMCacheMPConnector` against this vLLM build — start the MP
+> daemon from a real `lmcache==0.5.4` or `0.5.5` install and launch this
+> vLLM with `--kv-transfer-config` pointing at it, the way
+> `scripts/common/start-vllm.sh` does for production — and see whether
+> it reaches `REGISTER_KV_CACHE` at all, let alone whether `ipc_wrapper.py:85`
+> reproduces. Everything above is import-level compatibility, not
+> construction- or runtime-level.
+>
+> **Follow-up, same session, 2026-10-01 — this WAS attempted, with a
+> clear negative result.** Correction first: the production failure is
+> NOT attributable to `LMCacheMPConnector` in isolation — per direct
+> operator knowledge, the real blocker is the P→D leg (`NixlConnector`),
+> which this vLLM-only / no-LMCache test never exercises (see "what this
+> does NOT establish" above). The `LMCacheMPConnector`-only construction
+> test below answers a narrower, still-useful question: can this vLLM
+> build's vendored LMCache integration even wire up to any published
+> LMCache release at all.
+>
+> `0.5.4`/`0.5.5` both fail at **import time** —
+> `vllm.distributed.kv_transfer.kv_connector.v1.lmcache_mp_connector.py`
+> (vendored INSIDE this vLLM build now, not read from the external
+> `lmcache` package the way production's pinned `0.28.0` does) imports
+> `CudaIPCWrapper`/`IPCCacheEngineKey`/`KVCache` from
+> `lmcache.v1.multiprocess.custom_types` — names that LMCache renamed to
+> `DeviceIPCWrapper`/`IPCCacheServerKey` in a device-agnostic refactor
+> (upstream PR #3703, merged 2026-06-22) that landed in `0.5.0` and
+> everything after. MEASURED via GitHub's commits API against
+> `LMCache/LMCache`: `v0.4.7` (tagged 2026-06-13, the last release
+> before that merge) is the newest published version with all three old
+> names intact.
+>
+> Installing `lmcache==0.4.7` and patching out an unrelated, unused
+> sibling import (`vllm_v1_adapter` — the non-MP, in-process connector,
+> eagerly imported by the same `__init__.py` even though
+> `LMCacheMPConnector` never touches it; it needs `lmcache.config.
+> LMCacheEngineMetadata`, which doesn't exist in `0.4.7` at all — a
+> second, independent symbol-vintage mismatch) got the import to
+> succeed. The vLLM engine then started, loaded `Qwen/Qwen3-8B`,
+> allocated its KV pool (145.65 GiB), and **reached
+> `REGISTER_KV_CACHE`** — the exact call site of the original bug.
+>
+> **It did not reproduce the OOM. It hit a different, self-diagnosing
+> failure first:**
+> ```
+> ValueError: Payload count mismatch for request
+> RequestType.REGISTER_KV_CACHE: expected 7 payloads ['int', 'list',
+> 'str', 'int', 'EngineType', 'LayoutHints', 'list'], got 2 payloads
+> ['int', 'list']. This is likely caused by a version mismatch between
+> the lmcache client and lmcache server.
+> ```
+> LMCache's own wire-protocol check caught it. The vendored connector's
+> **symbol names** match `0.4.7` (pre-2026-06-22), but its **wire
+> protocol** (7-field `REGISTER_KV_CACHE` payload, including
+> `EngineType`/`LayoutHints` fields `0.4.7`'s server-side `mq.py` doesn't
+> know about) matches something newer. No published LMCache version
+> satisfies both at once — this vLLM build's vendored integration was
+> written against an **unreleased LMCache commit mid-refactor**, not any
+> tagged release before or after it.
+>
+> **Conclusion for the "would a newer vLLM help" question:** inconclusive
+> on the actual allocator bug (never reached, because this failed one
+> step earlier and for an unrelated reason), but conclusive on
+> feasibility — **no current published LMCache version pairs with this
+> specific `rocm/vllm:latest` build at all**, independent of
+> `NixlConnector`/RDMA/the DSC device. Chasing this further would mean
+> git-bisecting LMCache's `dev` branch history for the exact commit
+> vLLM's vendoring PR was written against — a much larger, less certain
+> undertaking than anything above, and not attempted.
+
 > ### READ THIS FIRST — 2026-09-29: this is NOT an IPC failure, and not an LMCache failure
 >
 > Everything below this box is still accurate as *observation*, but its
