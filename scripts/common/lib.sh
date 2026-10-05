@@ -126,6 +126,42 @@ wait_for_http() {
     return 1
 }
 
+# wait_for_http_bg <url> <timeout_sec> <bg_name> — wait_for_http, but ALSO
+# watches the start_bg process behind it and gives up the instant it dies.
+#
+# Why this exists: vLLM's failure modes (EngineCore init, KV registration,
+# UCX worker creation) all kill the process in 1-6 minutes, but plain
+# wait_for_http has no idea the process is gone and keeps polling a dead port
+# until its timeout — which was 1800s. Every such failure cost a full 30-minute
+# wall-clock stall to learn something the process had already decided minutes
+# earlier. Measured 2026-10-04: decode died at ~6 min and the script sat for
+# the remaining ~24.
+#
+# Returns: 0 healthy, 1 timed out, 2 process exited.
+wait_for_http_bg() {
+    local url="$1" timeout="${2:-600}" name="$3"
+    local deadline=$(( $(date +%s) + timeout ))
+    require_cmd curl
+    local pf pid st
+    pf="$(pidfile_for "${name}")"
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        if curl -fsS -o /dev/null --max-time 5 "${url}" 2>/dev/null; then return 0; fi
+        # Liveness is checked AFTER the health probe on purpose: a process that
+        # turns healthy and exits in the same instant must still count healthy.
+        pid="$(cat "${pf}" 2>/dev/null || true)"
+        [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null || return 2
+        # `kill -0` SUCCEEDS against a zombie — container PID 1 is
+        # `sleep infinity` and never reaps its children (BRINGUP §7 item 20),
+        # so a defunct vLLM would otherwise look alive for the full timeout.
+        # Field 3 of /proc/pid/stat is the state; comm (field 2) can contain
+        # spaces, so strip through the last ')' rather than splitting on space.
+        st="$(sed -e 's/.*) //' -e 's/ .*//' "/proc/${pid}/stat" 2>/dev/null || echo Z)"
+        [ "${st}" != "Z" ] || return 2
+        sleep 2
+    done
+    return 1
+}
+
 # wait_for_file <path> [timeout_sec]
 wait_for_file() {
     local path="$1" timeout="${2:-60}"
@@ -600,6 +636,144 @@ setup_pd_env() {
 # Call this AFTER setup_ucx_env so UCX_NET_DEVICES is already resolved if
 # the caller wants to pass it through for the ibv_devinfo cross-check.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F5 — AI NIC firmware personality gate (Pulsar vs Hydra).
+#
+# The AMD Pensando "vulcano" AI NICs carry a P4 program ("personality") in
+# firmware. MEASURED 2026-10-04 on smc1/smc2: a card running the **hydra**
+# personality cannot create a UD queue pair. UCX needs one for ud_verbs, so
+# the iface open fails:
+#
+#   roce_benic2p1: iface ... failed to create UD QP TX wr:256 sge:6 inl:64
+#                  RX wr:4096 sge:1 failed: Invalid argument
+#   uct_iface_open(ud_verbs/roce_benic2p1:1) failed: Input/output error
+#   Failed to create engine: Failed to create UCX worker: Input/output error
+#
+# Only the **pulsar** personality supports it. This is NOT visible in any of
+# the places you would naturally look: fw_ver, ethtool -i firmware-version,
+# devlink fw.soc_zephyr and asic.id are IDENTICAL on a hydra and a pulsar
+# card (all report 1.130.0-a-135 / asic.id 0x5 here). The only discriminator
+# is `eth_dbgtool -V`'s p4_program field.
+#
+# Without this gate the failure surfaces ~2 minutes later as a vLLM
+# "EngineCore failed to start" / "Engine core initialization failed", naming
+# neither the NIC nor the firmware — the same class of late, misattributed
+# failure the rest of this preflight exists to prevent.
+#
+# Escape hatches: RDMA_FW_CHECK=0 skips entirely; RDMA_REQUIRED_P4_PROGRAM
+# overrides the required personality.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Maps an IB device (roce_benic1p1) to the CARD BDF that nicctl/eth_dbgtool
+# address. These are not the same thing and the difference is load-bearing:
+# the netdev function is 0000:08:00.3, while the card is the ancestor
+# 0000:06:00.0 (08:00.3 -> 07:00.0 "DSC Virtual Downstream Port" -> 06:00.0).
+# Returns the first PCI ancestor that nicctl actually lists as a card, rather
+# than assuming a fixed depth.
+_rdma_card_bdf_for_ibdev() {
+    local ibdev="$1" cards="$2" nd pci d b
+    for d in "/sys/class/infiniband/${ibdev}/device/net/"*; do
+        [ -e "${d}" ] || continue
+        nd="$(basename "${d}")"
+        break
+    done
+    [ -n "${nd:-}" ] || return 1
+    pci="$(readlink -f "/sys/class/net/${nd}/device" 2>/dev/null)" || return 1
+    [ -n "${pci}" ] || return 1
+    d="${pci}"
+    local _hop
+    for _hop in 1 2 3 4 5 6; do
+        d="$(dirname "${d}")"
+        b="$(basename "${d}")"
+        case "${b}" in
+            0000:*)
+                if printf '%s\n' "${cards}" | grep -qx "${b}"; then
+                    printf '%s\n' "${b}"
+                    return 0
+                fi
+                ;;
+            /|.) return 1 ;;
+        esac
+    done
+    return 1
+}
+
+require_rdma_fw_program() {
+    local dev_list="${1:-}"
+    if [ "${KV_TRANSPORT}" != "rdma" ]; then
+        log "require_rdma_fw_program: skipped (KV_TRANSPORT=${KV_TRANSPORT})"
+        return 0
+    fi
+    if [ "${RDMA_FW_CHECK:-1}" != "1" ]; then
+        warn "require_rdma_fw_program: SKIPPED by RDMA_FW_CHECK=0 — if UCX later" \
+             " fails to create a UD QP on one of these devices, this is why."
+        return 0
+    fi
+    [ -n "${dev_list}" ] || return 0
+
+    local want="${RDMA_REQUIRED_P4_PROGRAM:-pulsar}"
+
+    if ! command -v eth_dbgtool >/dev/null 2>&1 || ! command -v nicctl >/dev/null 2>&1; then
+        warn "cannot verify AI NIC firmware personality: eth_dbgtool/nicctl not" \
+             " found in PATH. REQUIRED personality is '${want}'; a card running" \
+             " 'hydra' cannot create a UD QP and UCX will fail ~2 min from now" \
+             " with 'Failed to create UCX worker: Input/output error'. Install the" \
+             " AINIC host_sw_pkg, or set RDMA_FW_CHECK=0 to accept the risk."
+        return 0
+    fi
+
+    local cards
+    cards="$(nicctl show card 2>/dev/null | awk '/^[0-9a-f]{8}-/{print $2}')"
+    [ -n "${cards}" ] || { warn "nicctl show card returned no cards — skipping" \
+        " firmware personality check"; return 0; }
+
+    local _tok _dev _bdf _prog _bad=0
+    # Comma-separated list: "roce_benic1p1:1,roce_benic2p1:1". Check EVERY
+    # device, not just the first — a single hydra card anywhere in the list
+    # takes the whole UCX worker down.
+    local _IFS_SAVE="${IFS}"; IFS=','
+    # shellcheck disable=SC2086
+    set -- ${dev_list}
+    IFS="${_IFS_SAVE}"
+    for _tok in "$@"; do
+        _dev="${_tok%%:*}"
+        [ -n "${_dev}" ] || continue
+        if ! _bdf="$(_rdma_card_bdf_for_ibdev "${_dev}" "${cards}")"; then
+            warn "could not map RDMA device '${_dev}' to a nicctl card BDF —" \
+                 " firmware personality NOT verified for it."
+            continue
+        fi
+        _prog="$(eth_dbgtool --bdf "${_bdf}" -V 2>/dev/null | awk -F': *' '/p4_program/{print $2}' | tr -d '[:space:]')"
+        if [ -z "${_prog}" ]; then
+            warn "eth_dbgtool reported no p4_program for ${_dev} (card ${_bdf})" \
+                 " — firmware personality NOT verified."
+            continue
+        fi
+        if [ "${_prog}" = "${want}" ]; then
+            ok "${_dev} (card ${_bdf}) firmware personality '${_prog}'"
+        else
+            err "${_dev} (card ${_bdf}) firmware personality is '${_prog}'," \
+                " required '${want}'."
+            _bad=1
+        fi
+    done
+
+    [ "${_bad}" -eq 0 ] || die "one or more pinned RDMA devices are running the" \
+        " wrong AI NIC firmware personality (required '${want}'). A 'hydra' card" \
+        " CANNOT create a UD queue pair: UCX's ud_verbs iface open fails with" \
+        " 'Invalid argument' / 'Input/output error', NIXL then fails to build a" \
+        " UCX worker, and vLLM dies ~2 minutes later as 'Engine core" \
+        " initialization failed' naming neither the NIC nor the firmware" \
+        " (measured 2026-10-04). Re-pin PREFILL_UCX_NET_DEVICES/" \
+        "DECODE_UCX_NET_DEVICES onto cards whose 'eth_dbgtool --bdf <card> -V'" \
+        " reports p4_program '${want}', or flash those cards. NOTE: fw_ver," \
+        " ethtool firmware-version, devlink asic.id and fw.soc_zephyr are" \
+        " IDENTICAL between hydra and pulsar — p4_program is the ONLY" \
+        " discriminator. Override with RDMA_FW_CHECK=0 at your own risk."
+
+    ok "AI NIC firmware personality check passed (all pinned devices '${want}')"
+}
 require_rdma_access() {
     local net_dev="${1:-}"
     if [ "${KV_TRANSPORT}" != "rdma" ]; then
@@ -674,17 +848,34 @@ require_rdma_access() {
             " link. Full ibv_devinfo output:"$'\n'"${_devinfo}"
     fi
     if [ -n "${net_dev}" ]; then
-        local _dev_name="${net_dev%%:*}"
-        if printf '%s\n' "${_devinfo}" | grep -q "${_dev_name}"; then
-            ok "configured UCX_NET_DEVICES device '${_dev_name}' present in ibv_devinfo"
-        else
-            warn "configured UCX_NET_DEVICES device '${_dev_name}' (from" \
-                 " '${net_dev}') not seen in ibv_devinfo output — double" \
-                 " check PREFILL_UCX_NET_DEVICES/DECODE_UCX_NET_DEVICES" \
-                 " against THIS host's actual device name (F3: the device" \
-                 " index is not guaranteed symmetric across hosts)."
-        fi
+        # UCX_NET_DEVICES is a COMMA-SEPARATED LIST ("roce_benic1p1:1,
+        # roce_benic2p1:1"). This used to be `${net_dev%%:*}`, which silently
+        # checked ONLY THE FIRST device and declared the whole pin good —
+        # so a typo'd or absent second rail sailed through this preflight and
+        # failed ~2 min later inside UCX instead. Check every entry.
+        local _ifs_save="${IFS}"; IFS=','
+        # shellcheck disable=SC2086
+        set -- ${net_dev}
+        IFS="${_ifs_save}"
+        local _entry _dev_name
+        for _entry in "$@"; do
+            _dev_name="${_entry%%:*}"
+            [ -n "${_dev_name}" ] || continue
+            if printf '%s\n' "${_devinfo}" | grep -q "${_dev_name}"; then
+                ok "configured UCX_NET_DEVICES device '${_dev_name}' present in ibv_devinfo"
+            else
+                warn "configured UCX_NET_DEVICES device '${_dev_name}' (from" \
+                     " '${net_dev}') not seen in ibv_devinfo output — double" \
+                     " check PREFILL_UCX_NET_DEVICES/DECODE_UCX_NET_DEVICES" \
+                     " against THIS host's actual device name (F3: the device" \
+                     " index is not guaranteed symmetric across hosts)."
+            fi
+        done
     fi
+
+    # F5 — must run BEFORE vLLM burns two minutes on a worker that cannot
+    # create a UD QP. See require_rdma_fw_program() above.
+    require_rdma_fw_program "${net_dev}"
 
     ok "RDMA device access preflight passed"
 }
