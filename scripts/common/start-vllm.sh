@@ -211,17 +211,38 @@ start_bg "vllm-${ROLE}" \
         --kv-transfer-config "${KV_TRANSFER_CONFIG}" \
         ${VLLM_EXTRA_ARGS:-}
 
-# Model load on 8x MI300X (TP=8, weight sharding + warmup + CUDA/HIP-graph
-# capture with --enable-prefix-caching) routinely takes many minutes — 1800s
-# is a floor, not a target; raise it if MODEL is larger than an 8B-class
-# model or GPU_MEM_UTIL forces extra graph re-capture passes.
+# Model load (weight sharding + warmup + HIP-graph capture with
+# --enable-prefix-caching) takes minutes. MEASURED on this lab at Qwen3-8B:
+# TP=1 ~90s, TP=2 ~150s. The old value here was a flat 1800s, which was not a
+# ceiling on load time so much as a ceiling on how long you waited to be told
+# about a FAILURE — every crash cost the full 30 minutes, because the poll
+# loop had no idea the process had already exited.
+#
+# wait_for_http_bg returns 2 the moment the process dies, so the timeout now
+# only bounds a genuinely SLOW start, not a dead one. 900s is ~6x the measured
+# TP=2 load and is ample; raise VLLM_READY_TIMEOUT for a larger model.
+VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-900}"
 LOGFILE="$(logfile_for "vllm-${ROLE}")"
-if wait_for_http "http://127.0.0.1:${PORT}/health" 1800; then
-    ok "vllm-${ROLE} healthy on port ${PORT}"
-    log "test with:"
-    log "  curl -s http://127.0.0.1:${PORT}/v1/models | python3 -m json.tool"
-else
-    err "vllm-${ROLE} did not become healthy within 1800s — last 60 log lines:"
-    tail -n 60 "${LOGFILE}" >&2
-    die "startup failed; see ${LOGFILE} for the full log"
-fi
+_t0="$(date +%s)"
+wait_for_http_bg "http://127.0.0.1:${PORT}/health" "${VLLM_READY_TIMEOUT}" "vllm-${ROLE}"
+_rc=$?
+_elapsed=$(( $(date +%s) - _t0 ))
+case "${_rc}" in
+    0)
+        ok "vllm-${ROLE} healthy on port ${PORT} (${_elapsed}s)"
+        log "test with:"
+        log "  curl -s http://127.0.0.1:${PORT}/v1/models | python3 -m json.tool"
+        ;;
+    2)
+        err "vllm-${ROLE} EXITED after ${_elapsed}s without becoming healthy" \
+            " — it died on its own, this is not a timeout. Last 60 log lines:"
+        tail -n 60 "${LOGFILE}" >&2
+        die "startup failed; see ${LOGFILE} for the full log"
+        ;;
+    *)
+        err "vllm-${ROLE} still alive but not healthy after ${_elapsed}s" \
+            " (VLLM_READY_TIMEOUT=${VLLM_READY_TIMEOUT}) — last 60 log lines:"
+        tail -n 60 "${LOGFILE}" >&2
+        die "startup timed out; see ${LOGFILE} for the full log"
+        ;;
+esac
