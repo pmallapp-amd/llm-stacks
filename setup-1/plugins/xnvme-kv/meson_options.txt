@@ -1,0 +1,10 @@
+option('nixl_path', type: 'string', value: '/usr/local/nixl',
+    description: 'NIXL install prefix')
+option('xnvme_incdir', type: 'string', value: '/usr/local/include',
+    description: 'libxnvme headers (libxnvme.h etc.)')
+option('xnvme_libdir', type: 'string', value: '/usr/local/lib/x86_64-linux-gnu',
+    description: 'libxnvme.so/.a location')
+option('rocm_path', type: 'string', value: '/opt/rocm',
+    description: 'ROCm install prefix (staged VRAM_SEG support)')
+option('enable_vram', type: 'boolean', value: true,
+    description: 'Build staged VRAM_SEG support (requires ROCm/HIP) — disable on hosts with no GPU')

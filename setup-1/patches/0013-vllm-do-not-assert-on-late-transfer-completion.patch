@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kv-cache <noreply@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] vllm: do not assert on a late KV transfer completion
+
+_update_from_kv_xfer_finished() asserts that every req_id handed back by a
+finished transfer is still in self.requests. It is driven by ASYNCHRONOUS
+completions, so that is not an invariant the scheduler can hold: a completion
+can always land after the request has been finished or aborted, and it
+reliably does so when the transport failed and the request was torn down with
+bytes still in flight.
+
+The consequence is out of all proportion to the fault. A per-request,
+recoverable transport error becomes an AssertionError inside the engine busy
+loop, which raises EngineDeadError and takes the entire server down. On a
+disaggregated pair it takes the peer with it: when our decode died this way the
+prefill followed with RuntimeError: cancelled, so a single timed-out transfer
+cost both halves and required a full teardown of both hosts to recover.
+
+Reproduced on a two-node NIXL/UCX P/D pair, Qwen2.5-72B-Instruct TP=4 per side,
+KV moving over RoCE:
+
+  ucx_utils.cpp:204  UCX AM send failed with status -80 (Endpoint timeout)
+  scheduler.py:2648  assert req_id in self.requests
+  AssertionError -> EngineDeadError -> EngineCore gone
+
+Three times, with two different triggers -- one deep request (4096-token
+context, concurrency 1) and a batch of shallow ones (1024-token context,
+concurrency 8) -- so it is not a concurrency race. The common factor is
+transfer volume: enough bytes in flight to reach the endpoint timeout.
+
+Both loops are guarded, not just the one in the traceback. finished_sending is
+what fired for us, but finished_recving has the identical assert on the
+identical asynchronous path and differs only in which side of the pair is
+holding the request.
+
+Dropping the unknown id is safe rather than merely survivable. self.requests is
+the scheduler's own index; a request leaves it via finish or abort, which is
+the same transition that frees its blocks. So if the id is gone the blocks are
+already back, _free_blocks() would be a double free, and adding it to
+finished_recving_kv_req_ids would schedule a dead request. Skipping with a
+warning is the only correct action, and the warning is what makes the
+underlying transport fault visible instead of silent.
+
+This does NOT fix the UCX timeout, which is a separate defect and the actual
+fault. It stops that fault from being fatal.
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2628,6 +2628,26 @@
+         * if finished_sending: free the blocks
+         # if finished_recving: add to state so we can
+             schedule the request during the next step.
++
++        A req_id arriving here that is NOT in self.requests is tolerated and
++        dropped. This path is driven by ASYNCHRONOUS transfer completions, so
++        a completion can always land after the scheduler has already finished
++        or aborted the request -- most obviously when the transport failed and
++        the request was torn down while bytes were still in flight. Asserting
++        here turns a recoverable, per-request transport fault into a fatal
++        EngineCore crash that takes the whole server with it, and on a
++        disaggregated pair it takes the peer down too.
++
++        Observed on NIXL/UCX P/D: `UCX AM send failed with status -80
++        (Endpoint timeout)` immediately followed by AssertionError here, on
++        both a single deep request and a batch of shallow ones. See the repo
++        handoff for the reproduction.
++
++        Dropping is safe, not merely survivable: self.requests is the scheduler's
++        own index, and a request leaves it via finish/abort, which is also what
++        frees its blocks. If the id is gone the blocks are already back, so
++        _free_blocks would be a double free and rescheduling would be a use of
++        a dead request.
+         """
+ 
+         if self.connector is not None:
+@@ -2636,7 +2656,15 @@
+         # KV Connector:: update recv and send status from last step.
+         for req_id in kv_connector_output.finished_recving or ():
+             logger.debug("Finished recving KV transfer for request %s", req_id)
+-            assert req_id in self.requests
++            if req_id not in self.requests:
++                # Late completion for a request the scheduler has already let
++                # go. Not an error: see the note above _update_from_kv_xfer_
++                # finished. Its blocks went back with the request, so there is
++                # nothing to free and nothing to schedule.
++                logger.warning(
++                    "Discarding finished_recving for unknown request %s "
++                    "(already finished or aborted).", req_id)
++                continue
+             req = self.requests[req_id]
+             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                 self.finished_recving_kv_req_ids.add(req_id)
+@@ -2645,7 +2673,11 @@
+                 self._free_blocks(self.requests[req_id])
+         for req_id in kv_connector_output.finished_sending or ():
+             logger.debug("Finished sending KV transfer for request %s", req_id)
+-            assert req_id in self.requests
++            if req_id not in self.requests:
++                logger.warning(
++                    "Discarding finished_sending for unknown request %s "
++                    "(already finished or aborted).", req_id)
++                continue
+             self._free_blocks(self.requests[req_id])
+ 
+     def _update_requests_with_invalid_blocks(

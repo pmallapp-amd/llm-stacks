@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kv-cache <noreply@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] rocm-aic: install the ionic verbs provider and vllm-router
+
+Without libionic1 the image has ZERO RDMA devices -- ibv_get_device_list()
+returns 0 even privileged with /dev/infiniband mounted -- and UCX silently
+falls back to TCP, so NIXL "works" while moving no RDMA bytes at all.
+vllm-router is upstream's P/D router, which proxy.py cannot substitute for.
+
+The rixl block sets PYTHONPATH explicitly. nixl_rocm is meson-installed into
+/opt/nixl/lib/python3/dist-packages, not pip-installed, and the Dockerfile's
+ENV PYTHONPATH is set BELOW this block -- so importing it here without that
+export fails at build time while succeeding in the finished image.
+
+Carried out-of-tree. See README.md and HANDOFF.md BLOCKER 4.
+---
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -529,6 +529,129 @@
+         || { echo "ERROR: hsa-snoop built without Prometheus mode (--prometheus absent)" >&2; exit 1; } && \
+     echo "PASS: hsa-snoop v${HSA_SNOOP_REF} with Prometheus exporter (incl. AIS metrics) installed"
+ 
++# ----- 6c. RDMA userspace provider + P/D router ------------------------------
++# Two pieces the MP-mode P/D architecture needs and the ROCm base image does
++# not carry. Both are cheap; both are load-bearing; one of them fails silently.
++#
++# (1) libionic1 — the AMD/Pensando USERSPACE verbs provider for the `ionic`
++#     RoCE NICs. libibverbs dlopen()s providers listed in /etc/libibverbs.d/,
++#     and Ubuntu's stock rdma-core (50.x in this base) ships mlx5, bnxt_re,
++#     irdma and friends but NOT ionic. Without this package
++#     ibv_get_device_list() returns 0 *inside the container* even though
++#     /dev/infiniband/uverbs* are present and the container is privileged.
++#
++#     That is not a loud failure. UCX simply omits every RDMA transport, and
++#     NIXL / vLLM's NixlConnector fall back to TCP: transfers still complete,
++#     needles still return, nothing errors — the stack just quietly stops being
++#     RDMA, which is the entire premise of MP P/D. See HANDOFF.md BLOCKER 4,
++#     and lab/verify_nixl_rdma.py for the check that catches it.
++#
++#     The .deb is staged into the build context at ainic/ by build.sh from the
++#     lab host's /opt/amd/ainic/deb-repo — a local file:// repo, not something
++#     apt can reach from inside a build. build.sh fails loudly when it is
++#     missing rather than letting a TCP-only image out the door.
++#
++# (2) vllm-router — upstream's P/D router (github.com/vllm-project/router). It
++#     threads the NIXL handshake and stamps ___prefill_addr_…___decode_addr_…
++#     into the request id; proxy.py only forwards HTTP prefill->decode and
++#     cannot substitute for it.
++#
++#     It is a self-contained Rust binary in a manylinux_2_28 wheel and declares
++#     NO dependency on vllm, so it cannot drag a second, non-ROCm vLLM into the
++#     image — only orjson is added. The version is pinned because this is the
++#     component that decides which instance prefills; an unpinned router is a
++#     silent behaviour change in the middle of the measurement.
++ARG VLLM_ROUTER_VERSION=0.1.15
++
++COPY ainic/ /tmp/ainic/
++RUN dpkg -i /tmp/ainic/libionic1_*.deb && \
++    rm -rf /tmp/ainic && \
++    test -e /etc/libibverbs.d/ionic.driver \
++        || { echo "ERROR: ionic.driver absent after installing libionic1" >&2; exit 1; } && \
++    echo "PASS: ionic userspace verbs provider installed"
++
++#     The vLLM check reads installed *metadata* rather than importing vllm.
++#     `import vllm` pulls in torch and dies with "No CUDA GPUs are available"
++#     on any machine without a visible GPU -- which is every docker build. An
++#     import-based guard here does not detect a displaced vLLM, it just fails
++#     the build 100% of the time. Build-time guards must not import
++#     GPU-dependent packages.
++RUN python3 -m pip install --no-cache-dir "vllm-router==${VLLM_ROUTER_VERSION}" && \
++    test -x /usr/local/bin/vllm-router && \
++    vllm-router --help 2>&1 | grep -q -- '--vllm-pd-disaggregation' \
++        || { echo "ERROR: vllm-router lacks --vllm-pd-disaggregation" >&2; exit 1; } && \
++    python3 -c 'import importlib.metadata as m, sys; sys.exit(0 if "rocm" in m.version("vllm") else 1)' \
++        || { echo "ERROR: installing vllm-router displaced the ROCm vLLM" >&2; exit 1; } && \
++    echo "PASS: vllm-router ${VLLM_ROUTER_VERSION} installed, ROCm vLLM intact"
++
++# (3) rixl -- the package name vLLM actually imports on ROCm (BLOCKER 5).
++#     vllm/distributed/nixl_utils.py selects the NIXL python package by platform:
++#
++#         package_name = "rixl" if current_platform.is_rocm() else "nixl"
++#
++#     This NIXL build installs `nixl_rocm` and ships a `nixl` shim for it. It
++#     ships no `rixl` AT ALL, so that import raises ImportError -- which
++#     nixl_utils CATCHES, quietly setting NixlWrapper = None. The only surface
++#     symptom is NixlConnector dying with RuntimeError("NIXL is not available")
++#     on an image where NIXL demonstrably works (lab/verify_nixl_rdma.py moves
++#     64 MiB over it). Baking the shim in is what stops a from-scratch rebuild
++#     from silently regressing to that state -- it lived only as a hand-applied
++#     layer until 2026-09-11.
++#
++#     The guard is import-based but safe: `rixl` pulls in nixl_rocm bindings,
++#     not torch, so it does not need a GPU and will not fail every build the
++#     way `import vllm` would.
++#
++#     This block must set PYTHONPATH itself, and must NOT import nixl_rocm.
++#     Both follow from one fact: /opt/nixl is wired into the environment by the
++#     `ENV` block ~35 lines BELOW here, so at THIS layer neither PYTHONPATH nor
++#     LD_LIBRARY_PATH points into it yet.
++#       - nixl_rocm is MESON-installed to /opt/nixl/lib/python3/dist-packages
++#         and is NOT a pip package (`pip list` shows nothing for it), so
++#         without the export below the probe is a ModuleNotFoundError.
++#       - actually importing it then ALSO needs libnixl.so from
++#         /opt/nixl/lib/x86_64-linux-gnu, equally absent from the loader path
++#         until that ENV -- so an import-based probe still dies with
++#         "libnixl.so: cannot open shared object file" even once PYTHONPATH
++#         is correct. build-nixl.sh exports both, but only into its own
++#         process, which does not outlive its RUN layer.
++#     So the site dir is derived with find_spec(), which LOCATES the package
++#     without executing it or dlopen'ing its extension module. That is the same
++#     rule the vllm-router guard above already states: a build-time guard must
++#     not import.
++#
++#     Both failures were observed on the first real from-scratch rebuild
++#     (2026-09-12, stage 36/37). The image was always correct at RUNTIME, which
++#     is exactly why hand-testing this shim inside a finished container passed
++#     while the build it is supposed to reproduce did not.
++RUN export PYTHONPATH="/opt/nixl/lib/python3/dist-packages:${PYTHONPATH:-}" && \
++    NIXL_PY=$(python3 -c 'import importlib.util as u, os; s = u.find_spec("nixl_rocm"); print(os.path.dirname(s.submodule_search_locations[0]))') \
++        || { echo "ERROR: cannot locate nixl_rocm under /opt/nixl -- did the meson install move?" >&2; exit 1; } && \
++    mkdir -p "${NIXL_PY}/rixl" && \
++    printf '%s\n' \
++'"""ROCm shim: vLLM imports rixl on ROCm; this NIXL build installs nixl_rocm.' \
++'' \
++'Mirrors nixl/__init__.py, registering the same submodules under rixl.*.' \
++'Keep the two in sync: they are the same shim twice. See patches/0012.' \
++'"""' \
++'' \
++'import importlib' \
++'import sys' \
++'' \
++'_pkg = importlib.import_module("nixl_rocm")' \
++'' \
++'for sub_name in ("_api", "_bindings", "_utils", "logging"):' \
++'    module = importlib.import_module(f"{_pkg.__name__}.{sub_name}")' \
++'    sys.modules[f"rixl.{sub_name}"] = module' \
++'    setattr(sys.modules[__name__], sub_name, module)' \
++'    for attr in dir(module):' \
++'        if not attr.startswith("_"):' \
++'            setattr(sys.modules[__name__], attr, getattr(module, attr))' \
++      > "${NIXL_PY}/rixl/__init__.py" && \
++    python3 -c 'import importlib.util as u, sys; sys.exit(0 if u.find_spec("rixl") else 1)' \
++        || { echo "ERROR: rixl shim not importable after install" >&2; exit 1; } && \
++    echo "PASS: rixl shim installed at ${NIXL_PY}/rixl"
++
+ # ----- 7. Runtime environment ------------------------------------------------
+ # Vars from upstream vLLM Dockerfile.rocm added here:
+ #   HSA_ENABLE_IPC_MODE_LEGACY=1  — legacy HIP IPC for cross-container KV registration (LMCache MP)

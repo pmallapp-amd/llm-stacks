@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kv-cache <noreply@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] lmcache: accept SPDK_NVMe_KV and XNVME_KV in the L2 adapter
+
+Carried out-of-tree. See README.md.
+---
+diff --git a/lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py
+index 26aebaf..c9a8fbb 100644
+--- a/lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/nixl_store_l2_adapter.py
+@@ -158,7 +158,8 @@ class NixlStorageAgent:
+         Args:
+             device: Device type of the L1 memory buffer (e.g. "cpu", "cuda").
+             backend: Nixl storage backend to use. One of: GDS, GDS_MT, POSIX,
+-                HF3FS (file-based) or OBJ, AZURE_BLOB (object-based).
++                HF3FS, AIS_MT (file-based) or OBJ, AZURE_BLOB, SPDK_NVMe_KV,
++                XNVME_KV (object-based).
+             backend_params: Backend-specific parameters. File-based backends
+                 require "file_path" and "use_direct_io" keys.
+             pool_size: Number of storage descriptor slots to pre-allocate.
+@@ -221,7 +222,7 @@ class NixlStorageAgent:
+                 use_direct_io=str(self.backend_params["use_direct_io"]).lower()
+                 == "true",
+             )
+-        elif self.backend in ["OBJ", "AZURE_BLOB"]:
++        elif self.backend in ["OBJ", "AZURE_BLOB", "SPDK_NVMe_KV", "XNVME_KV"]:
+             self.pool = NixlObjPool(num_total_objs=self.pool_size)
+             self.init_storage_handlers_object(
+                 page_size=l1_memory_desc.align_bytes,
+@@ -950,6 +951,8 @@ _VALID_NIXL_BACKENDS = (
+     "HF3FS",
+     "OBJ",
+     "AZURE_BLOB",
++    "SPDK_NVMe_KV",
++    "XNVME_KV",
+ )
+ _FILE_BACKENDS = ("GDS", "GDS_MT", "POSIX", "HF3FS", "AIS_MT")
+ 
+@@ -960,7 +963,8 @@ class NixlStoreL2AdapterConfig(L2AdapterConfigBase):
+ 
+     Fields:
+     - backend: Nixl storage backend
+-      (GDS, GDS_MT, POSIX, HF3FS, OBJ, AZURE_BLOB).
++      (GDS, GDS_MT, POSIX, HF3FS, AIS_MT, OBJ, AZURE_BLOB,
++      SPDK_NVMe_KV, XNVME_KV).
+     - backend_params: Backend-specific parameters as a
+       dict of string key-value pairs. For file-based
+       backends (GDS, GDS_MT, POSIX, HF3FS), must include

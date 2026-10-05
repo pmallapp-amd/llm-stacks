@@ -78,3 +78,8 @@ config/local.env
 # these once swept pre-scrub credentials into a commit via `git add -A`.
 .nfs*
 **/.nfs*
+
+# ---- setup-1/ — standalone all-in-one (rocm-aic) extraction, see AGENTS.md --
+# Deliberately self-contained; not integrated with scripts/, config/, src/
+# above. build.sh clones ROCm/rocm-aic here per host; never committed.
+setup-1/vendor/

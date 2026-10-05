@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kv-cache <noreply@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] vllm: gate LMCacheMPConnector's load path on num_external_tokens
+
+Backport of the guard from vLLM #47505 / LMCache #4028, which pairs with
+vLLM #46865. #46865 is ALREADY PRESENT in this image and is what arms the bug
+this fixes -- the two must ship together, and right now only the first half is
+here.
+
+Before #46865, MultiConnector.update_state_after_alloc() handed empty blocks to
+every non-chosen sub-connector. #46865 changed it to hand them the request's
+REAL blocks with num_external_tokens=0, because an offload connector needs
+blocks on every request or it can never populate a cold prefix. The new contract
+is therefore: gate LOADING on num_external_tokens, NOT on whether blocks is
+empty. Most connectors already did; LMCacheMPConnector does not.
+
+lmcache_mp_connector.update_state_after_alloc() never reads num_external_tokens
+at all -- it appears only in the signature and the docstring. The state machine
+decides purely on tracker.needs_retrieve(), which compares
+num_lmcache_hit_blocks > num_vllm_hit_blocks and knows nothing about whether
+this connector won the lookup. So when LMCache holds a prefix but NixlConnector
+was the chosen connector, the non-chosen LMCacheMPConnector now sees real blocks
+and wrongly moves PREFETCHING -> WAITING_FOR_LOAD, creating retrieve tasks for a
+load that must not happen.
+
+The leak is the worse half. In that same branch, `condition` also selects how
+much of the lookup lock range is released: false frees ALL locked chunks
+(num_lmcache_hit_blocks), true frees only the vLLM-computed prefix
+(num_vllm_hit_blocks) on the assumption that the retrieve will release the rest.
+For a non-chosen connector no retrieve ever runs, so the remainder is never
+freed, and end_session() does not release lookup locks either. The locks
+accumulate for as long as the server runs.
+
+Gating `condition` on num_external_tokens fixes both halves at once, which is
+why this is a one-line change rather than two. num_external_tokens == 0 sends
+the tracker straight to READY *and* selects the free-ALL branch, which is
+precisely the "transition directly to READY and release lookup locks" the
+upstream fix describes. Block tracking above the hunk is deliberately left
+unconditional -- that is the store path, and starving it is the bug #46865
+exists to fix.
+
+Fires only under MultiConnector[NixlConnector, LMCacheMPConnector] -- i.e.
+exactly the MP disaggregated-prefill topology, and not on either P/D pair this
+branch currently runs, which are in-process LMCacheConnectorV1.
+
+DO NOT VERIFY THIS WITH A NEEDLE TEST. The unguarded build returns correct
+answers and full needle counts; the symptom is spurious retrieve tasks and
+lookup locks that never drop, so it degrades under sustained load rather than
+failing a short run. Verify by mechanism: no PREFETCHING -> WAITING_FOR_LOAD
+transition on a non-chosen connector, and lock count returning to baseline
+across a run.
+
+THIS PATCH ALONE IS NOT ENOUGH -- it must ship with patches/0011.
+
+An earlier revision of this header claimed the vLLM copy is the one that loads,
+reasoning from KVConnectorFactory registering "LMCacheMPConnector" against this
+module. That is true but incomplete, and the conclusion drawn from it was wrong.
+At the bottom of this same module, _resolve_lmcache_mp_connector() hands off:
+
+    if os.environ.get("LMCACHE_USE_UPSTREAM_MP"):  -> the class in THIS file
+    try: from lmcache.integration.vllm.lmcache_mp_connector import ...
+                                                   -> that file  (default)
+    except ImportError:                            -> the class in THIS file
+
+LMCache is installed, so on a stock deployment the DEFAULT resolves to
+lmcache/integration/vllm/lmcache_mp_connector.py and this patch is a no-op --
+it applies cleanly, the build succeeds, and the bug survives untouched. 0011
+patches that copy. This one still matters: it covers LMCACHE_USE_UPSTREAM_MP=1
+and the ImportError fallback, both of which reach the class defined here.
+
+The error was caught by running the mechanism check against an UNPATCHED image
+and watching it fail inside the *other* file. Registration is not resolution --
+check where execution actually lands before deciding which copy to patch.
+
+Upstream LMCache #4028 is still open and #47294 was closed as the wrong fix
+direction, so re-check both before dropping this patch.
+
+Carried out-of-tree. See README.md.
+---
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
+@@ -836,7 +836,11 @@
+             tracker.append_block_ids(new_block_ids)
+ 
+         # Update the state of the tracker
+-        condition = tracker.needs_retrieve()
++        # Gate the LOAD path on num_external_tokens, not on `blocks`: since
++        # vLLM #46865 a non-chosen MultiConnector sub-connector receives the
++        # request's real blocks and must not load. 0 also frees ALL lookup
++        # locks below, which is what stops them leaking.
++        condition = num_external_tokens > 0 and tracker.needs_retrieve()
+         if tracker.state == LMCacheMPRequestState.PREFETCHING:
+             # If need to retrieve, change to WAITING_FOR_LOAD
+             # Otherwise, change to READY
