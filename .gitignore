@@ -78,3 +78,6 @@ config/local.env
 # these once swept pre-scrub credentials into a commit via `git add -A`.
 .nfs*
 **/.nfs*
+
+# Harness-local tool permissions; not shared state.
+.claude/
