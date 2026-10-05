@@ -155,6 +155,7 @@ AIC_XNVME_DEV=/dev/ng1n1 \
 MODEL=Qwen/Qwen2.5-3B-Instruct \
 HF_TOKEN=none \
 IMAGE_REF=rocm-aic:latest \
+AIC_CHUNK_SIZE=16 \
 bash deploy.sh
 ```
 
@@ -168,6 +169,27 @@ produces `AssertionError: DP adjusted local rank N is out of bounds for 1
 devices` for every rank past 0, and the container exits before ever touching
 the storage backend (safe to retry — nothing reached NIXL/XNVME init yet at
 that point).
+
+**`AIC_CHUNK_SIZE=16` is likewise not optional for this model, and is not
+`deploy.sh`'s default (unset → LMCache's own default of 256).** At the
+default chunk size, Qwen2.5-3B-Instruct's KV shape makes each stored object
+~9 MiB — and `nvme1`'s negotiated kernel transfer ceiling
+(`/sys/class/nvme/nvme1/queue/max_hw_sectors_kb`, confirmed via
+`nvme list-subsys` + that path) is **1024 KB**. Every store past that ceiling
+fails, but fails **silently from LMCache's point of view**: the container log
+shows `[XNVME_KV] op=store ... t=complete ok=0 sct=7 sc=234` immediately
+followed by `getXferStatus: backend 'XNVME_KV' returned error status
+NIXL_ERR_BACKEND`, while LMCache's own line right next to it still reads
+`Stored 2048 out of total 2048 tokens` — it does not surface the failure as
+one. Nothing about serving breaks (generation is unaffected; this is purely
+the storage side-channel), so this is easy to miss entirely unless you grep
+the container log specifically for `NIXL_ERR` after deploying. `AIC_CHUNK_SIZE=16`
+keeps each object at 576 KiB, safely under the 1 MiB ceiling — confirmed by
+the same log line reading `ok=1 sct=0 sc=0` afterward. See §3.3 for the
+general form of this problem (`setup-1/README.md` documents the identical
+failure shape on Qwen2.5-72B at TP=4, a different chunk size, same root
+cause: object size vs. the governing transfer ceiling for whichever plugin
+you're on).
 
 `HF_TOKEN=none` is the explicit "public model, no auth needed" spelling
 `deploy.sh` wants — `Qwen/Qwen2.5-3B-Instruct` is public. First run against
@@ -209,14 +231,61 @@ LMCache INFO: Created backend: NixlStorageBackend (NixlStaticStorageBackend)
 
 ### 3.2 ⚠️ Safety — read before doing anything else to this container
 
-**Never `docker kill`/`docker stop`/`timeout`-wrap `aic-xnvme-single` once
-it's up.** Any of those can wedge the device's `CC.EN`/`CSTS.RDY` handshake
-with no clean recovery short of restarting the DPU-side app from the
-device's own management console — nothing host-side (rescan, FLR, a script
-re-run) clears it. Let a run finish or fail on its own. The
-`docker rm -f` that `deploy.sh` itself does on a redeploy is the one
-sanctioned exception, and only against an otherwise-idle container (see §3
-above).
+**Never `docker kill`/`docker stop`/`timeout`-wrap a container actually
+driving the real Pensando DSC NVMe-KV function once it's up.** Doing so can
+wedge the device's `CC.EN`/`CSTS.RDY` handshake with no clean recovery short
+of restarting the DPU-side app from the device's own management console —
+nothing host-side (rescan, FLR, a script re-run) clears it. `deploy.sh`'s own
+banner prints `category: 1 (real NVMe-KV device)` for **any** `AIC_XNVME_DEV`
+matching the `/dev/ngXnY` naming convention — it cannot tell from the device
+path alone whether real silicon or a RAM-backed stand-in is actually behind
+it, so treat that banner line as unverified and check §3.3 before deciding
+how careful to be with a given container.
+
+The `docker rm -f` that `deploy.sh` itself does on a redeploy is the one
+sanctioned exception to "never kill", and only against an otherwise-idle
+container (see §3 above).
+
+### 3.3 Which device is actually behind `AIC_XNVME_DEV` — and why it changes
+the blast radius
+
+`.100` has **two** `/dev/ngXnY` devices, and they are architecturally nothing
+alike:
+
+- **`/dev/ng0n1`** — `.100`'s own real Pensando DSC function, PCIe
+  `0000:1c:00.0`. The host kernel sees this as a **plain local PCIe NVMe
+  controller** (`nvme-subsys0 ... nvme0 pcie 0000:1c:00.0` — `nvme.ko` over
+  PCIe, no `nvme_tcp`, no fabrics module, no network stack on the host side at
+  all). Whatever the DSC does internally to actually service that namespace —
+  talk to onboard flash, proxy it over the DSC's own network ports to some
+  backend — happens entirely inside the DPU's firmware/ASIC and is invisible
+  to `.100`'s OS. **This is the device the "never kill" warning above is
+  actually about.**
+- **`/dev/ng1n1`** — what this procedure deploys against. There is **no DSC
+  in this path at all**: `nvme connect` (§1.2) had the host's own kernel speak
+  `nvme_tcp` in plain software, over the ordinary management NIC, straight to
+  `.88`'s SPDK target process (`nvme-subsys1 ... nvme1 tcp
+  traddr=10.30.48.88`), which is itself backed by SPDK's RAM-only
+  `bdev_kvmalloc` (confirmed via `bdev_get_bdevs` on `.88` —
+  `"product_name": "KVMalloc disk"`), not any Pensando silicon. Killing a
+  container using *this* device cannot wedge DSC firmware, because there is
+  no DSC anywhere in the data path — worst case is a dropped TCP session and
+  an `nvme reconnect`.
+
+This also explains §3's `sct=7 sc=234` failure precisely: that status comes
+from the **host kernel's** `nvme_tcp` software queue
+(`/sys/class/nvme/nvme1/queue/max_hw_sectors_kb`), not from any DSC hardware
+limit — a constraint that is specific to `/dev/ng1n1`'s path and says nothing
+about what `/dev/ng0n1`'s real ceiling is (that one is whatever the DSC's own
+PCIe NVMe controller advertises, a separate and unmeasured number).
+
+**If you redeploy against `/dev/ng0n1` instead** (the real device, no `.88`
+dependency, no kernel NVMe-oF involved at all) — `BACKEND=xnvme
+AIC_XNVME_DEV=/dev/ng0n1`, dropping the `nvme connect` precondition in §1.2
+entirely — the "never kill" warning in §3.2 is the one that actually applies,
+in full, and `AIC_CHUNK_SIZE`'s correct value would need re-deriving against
+whatever that controller's own MDTS/transfer ceiling turns out to be, not the
+1024 KB measured here.
 
 ---
 
