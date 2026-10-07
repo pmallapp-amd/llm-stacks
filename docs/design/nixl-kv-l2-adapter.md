@@ -3,52 +3,6 @@
 Status: **specification**, 2026-09-17. Implements the fix for TODO 6.21.
 Read [HANDOFF §2](../HANDOFF.md#2-current-state) first.
 
-> **2026-10-07 — superseded on the `plugin-side-kv-split` branch.** The
-> `nixl_kv` adapter this document specifies (page tiling, commit-object
-> write, and §7 assert 1's mem-split-size refusal, all done in Python) has
-> been removed from that branch and replaced by `nixl_kv_thin`
-> (`overlays/lmcache/nixl_kv_thin_l2_adapter.py`), which registers/transfers
-> each object as ONE descriptor and leaves splitting/naming/commit-marker
-> atomicity entirely to the plugin's own fan-out
-> (`plugins/xnvme-kv/xnvme_kv_backend.cpp`). The wire grammar this document
-> specifies (§4's `{ns}@{key}~{ordinal}` pages, `{ns}@{key}!c` commit) is
-> UNCHANGED and still the authoritative reference — only who constructs
-> those names moved, from this Python module to the plugin. Sections 1-3
-> (why a Python-side fix was chosen over patching `nixl_store`) are
-> historical: that trade-off no longer applies once the plugin owns
-> splitting, since a vendor-image patch was never the alternative being
-> weighed there.
->
-> **2026-10-07, later the same day — the "one descriptor" premise required
-> dropping LMCache's persistent pinned L1 buffer, not just moving naming
-> into the plugin.** `NixlStorageAgent.init_mem_handlers()` (reused
-> unchanged by `nixl_kv` above) registers that buffer **once**, as a single
-> `align_bytes`-tiled dlist — any object bigger than one page is
-> unavoidably `ceil(size/align_bytes)` separate local (DRAM) descriptors in
-> NIXL's eyes, confirmed empirically in `docs/TODO.md` §6.35 (a 256 KB
-> chunk is always 64 pages, never 1). NIXL's `prepXfer()` requires the
-> local and remote descriptor counts in one `transfer()` call to match 1:1
-> (`xnvme_kv_backend.cpp`: `local.descCount() != remote.descCount()` →
-> `NIXL_ERR_INVALID_PARAM`) — so a page-tiled local side can never be
-> paired against one storage name, no matter what the plugin does with
-> that name once it receives it. `nixl_kv` above never fought this: it
-> mirrors the page count on the storage side (`page_count` separate
-> `~ordinal` names, one batched N:N transfer) — its "splitting" already
-> happens in Python, at the naming layer, before the plugin ever runs.
->
-> `nixl_kv_thin_l2_adapter.py` therefore does **not** inherit from
-> `NixlStorageAgent` and does **not** call `init_mem_handlers()`. Every
-> store/load registers exactly the one DRAM range involved in that call,
-> ephemerally (`register_memory`/`initialize_xfer`/`transfer`, then
-> `deregister_memory` once the handle settles — the same shape
-> `scripts/verify/_nixl_kv_thin_smoke.py` uses), so NIXL always hands the
-> plugin exactly one local descriptor per object and the plugin's fan-out
-> genuinely does all the splitting. The cost is explicit: a
-> register/deregister round trip on every store and load, where `nixl_kv`
-> pays that cost once at startup and reuses the persistent registration
-> forever after. **Unmeasured on real hardware — benchmark before trusting
-> this adapter on a path anything else depends on.**
-
 ## 1. The problem, stated correctly
 
 The handoff has said the cause of `retrieve_ops=0` is LMCache's per-daemon

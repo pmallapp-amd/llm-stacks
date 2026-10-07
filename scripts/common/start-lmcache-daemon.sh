@@ -191,14 +191,34 @@
 # with a measurement.
 # ───────────────────────────────────────────────────────────────────────────
 #
-# pool_size/mem_split_n internals (how nixl_store's fixed-slot pool tiled a
-# multi-MiB LMCache chunk into align_bytes-sized slots, and the tuning
-# history behind its default pool size) are no longer relevant to this
-# script: nixl_store's case was removed along with the rest of the 3-way L2
-# adapter choice above. nixl_kv_thin is content-addressed and has no pool —
-# see that section's comment for where splitting now happens instead
-# (inside the plugin, against whatever max_value_size it queries off the
-# device, not a fixed align_bytes tiling grid).
+# pool_size counts --l1-align-bytes-sized (default 4096 B — NOT overridden
+# by this script) storage slots, ONE PER RAW L1 PAGE, never one per LMCache
+# KV chunk (init_storage_handlers_object(), :397-446, and the
+# get_memory_indices()/get_storage_indices() call chain in
+# _execute_store_in_the_loop(), :880-960 — a multi-MiB LMCache chunk tiles
+# into mem_size/align_bytes separate pool slots). This resolves the open
+# question at HANDOFF §12.7 / tmp/TOPOLOGY-KV-DATAPATH.md §4.5 about a 10 MiB
+# LMCache page against XNVME_KV's 32 KiB per-value ceiling: that tension was
+# analyzed against the WRONG layer (the in-process LMCacheEngineConfig
+# chunk_size). On THIS path the adapter never sees a whole chunk as one
+# storage unit — only align_bytes-sized (4096 B) tiles, which stay under
+# both backends' declared max_value_size. Confirmed LIVE against the
+# installed plugins in rocm-aic:mp-pd-ionic2609
+# (nixl_agent.get_plugin_params()): XNVME_KV declares max_value_size=32768,
+# SPDK_NVMe_KV declares 524288 — both » 4096, so _resolve_mem_split()
+# (:250-283) resolves mem_split_n=1 for both at this daemon's default page
+# size: no adapter-level split ever engages. (XNVME_KV's own internal
+# multipart splitting inside the plugin, HANDOFF §12.7's "32 KiB parts", is
+# an unrelated, lower-layer mechanism and is unaffected by any of this.)
+#
+# LMCACHE_L2_POOL_SIZE's default (below) is the vendor's own tested value
+# (rixl-bench's stack/tracks/rocm-aic/docker-compose.storage.yml, both the
+# lmcache-spdk and lmcache-xnvme services) — empirically the largest pool
+# that comes up in ~90s; an L1-size-matched value (5,242,880 at the default
+# 20 GiB L1 / 4096 B) was still spinning at 100% CPU after 10+ minutes with
+# zero forward progress. It is a tested ceiling, not a capacity-matched
+# value — override LMCACHE_L2_POOL_SIZE and re-verify startup time if you
+# raise it.
 #
 # _HYBRID_L1_SINGLE_REGION_L2_ADAPTERS (distributed/config.py:27-30) lists
 # "nixl_store" as requiring a single-region L1 — but that constraint
@@ -296,6 +316,16 @@ fi
 
 setup_nixl_kv_env "${_ROLE}"
 
+# --l1-align-bytes is deliberately NOT overridden below — every reference
+# this repo has (the vendor's own docker-compose.storage.yml, and the
+# in-process LMCacheConnectorV1 YAML surface's own KV_MAX_VALUE_SIZE_EFFECTIVE
+# headroom reasoning, before that surface was removed — TODO 6.23) leaves it
+# at the built-in default (4096 B), and the
+# "L2 (KV STORAGE) TIER" comment above shows why that default keeps
+# mem_split_n=1 for both backends. LMCACHE_L2_POOL_SIZE's default is the
+# vendor's own tested value — see that same comment.
+_L2_POOL_SIZE="${LMCACHE_L2_POOL_SIZE:-2000000}"
+
 case "${_ROLE}" in
     prefill) _SLOT_OFFSET="${KV_SLOT_OFFSET_PREFILL}" ;;
     decode)  _SLOT_OFFSET="${KV_SLOT_OFFSET_DECODE}"  ;;
@@ -332,74 +362,92 @@ case "${KV_BACKEND}" in
 esac
 
 # ─────────────────────────────────────────────────────────────────────────────
-# L2 ADAPTER TYPE — "nixl_kv_thin" only.
+# L2 ADAPTER TYPE — "nixl_kv" (this repo's) or "nixl_store" (the vendor's).
 #
-# Formerly a 3-way choice (LMCACHE_L2_ADAPTER_TYPE=nixl_kv|nixl_kv_thin|
-# nixl_store): nixl_kv (this repo's own Python-side content-addressed
-# adapter — page tiling, commit-object write, and the mem_split_n==1 hard
-# assert all done in Python) and nixl_store (the vendor's per-daemon-uuid4
-# pool, kept only as an A/B negative control — see "THE CONTENT-DERIVED-KEY
-# CONSTRAINT" above for why its object names can never be shared across
-# daemons) have both been removed from this script. nixl_kv_thin supersedes
-# nixl_kv outright (same wire grammar — "{ns}@{key}~{ordinal}" pages,
-# "{ns}@{key}!c" commit — now produced by the plugin's own fan-out,
-# plugins/xnvme-kv/xnvme_kv_backend.cpp, instead of by ~1,180 lines of
-# Python), and nixl_store's A/B role is no longer needed once the thing it
-# was controlling against (nixl_kv's Python-side protocol) no longer exists
-# in this branch.
-#
-# ── The geometry fingerprint (docs/design/nixl-kv-l2-adapter.md §5) ────────
-# ObjectKey carries model_name, kv_rank, object_group_id, chunk_hash and
-# cache_salt — and NO dtype, and NO KV-plane layout. Two daemons on
-# different --kv-cache-dtype, or on a fused-vs-split KV cache, therefore
-# produce THE SAME KEY FOR DIFFERENT BYTES, at an identical byte count,
-# which no length check can catch. Patch 0009 exists because exactly that
-# plane mismatch corrupts every chunk without raising.
-#
-# So every object name is prefixed with a hash over everything that changes
-# on-wire meaning. Both nodes derive it from the same config/cluster.env
-# (and invariant 8 already requires both roles to agree on
-# LMCACHE_CHUNK_SIZE), so they agree BY CONSTRUCTION — and any divergence
-# changes the namespace, turning what would have been silent corruption
-# into an ordinary miss. It is also the migration lever: this backend has
-# no delete primitive, so a schema change cannot drain the namespace;
-# bumping the leading version term moves to a fresh key space instead.
-#
-# Override LMCACHE_L2_NAMESPACE to force a fresh key space by hand.
-if [ -n "${LMCACHE_L2_NAMESPACE:-}" ]; then
-    _L2_NAMESPACE="${LMCACHE_L2_NAMESPACE}"
-    info "L2 namespace: ${_L2_NAMESPACE} (forced via LMCACHE_L2_NAMESPACE)"
-else
-    _L2_NS_INPUT="v1|${MODEL}|${TP_SIZE}|${LMCACHE_CHUNK_SIZE}|${KV_CACHE_DTYPE}|${LMCACHE_L1_ALIGN_BYTES:-4096}|${KV_MAX_VALUE_SIZE_EFFECTIVE}"
-    _L2_NAMESPACE="$(printf '%s' "${_L2_NS_INPUT}" | sha256sum | cut -c1-12)"
-    info "L2 namespace: ${_L2_NAMESPACE}  <- sha256(${_L2_NS_INPUT})"
-fi
+# nixl_kv is the content-addressed adapter that makes the L2 tier a SHARED,
+# cross-node cache (docs/design/nixl-kv-l2-adapter.md, TODO 6.21). nixl_store
+# is kept reachable, unmodified, as the A/B control: it names objects
+# obj_{i}_{uuid4} per daemon, so its L2 tier is a per-daemon capacity
+# extension that can never serve a peer's key. Flipping between them is one
+# env var, which is what makes a negative control cheap on a cluster where
+# every measurement has historically needed one.
+_L2_ADAPTER_TYPE="${LMCACHE_L2_ADAPTER_TYPE:-nixl_kv}"
 
-# Refuse the characters the adapter's own name grammar reserves (@ field
-# separator, ~ tile ordinal, ! commit suffix). from_dict() and
-# 25-validate-lmcache-config.sh both check this too; checking here as well
-# means a bad value is caught at the layer that BUILT it, naming the
-# variable to fix.
-case "${_L2_NAMESPACE}" in
-    *@*|*~*|*!*)
-        die "start-lmcache-daemon.sh: L2 namespace" \
-            " '${_L2_NAMESPACE}' contains one of the reserved" \
-            " characters @ ~ ! — these separate fields, tile" \
-            " ordinals and the commit suffix in the adapter's object" \
-            " names (docs/design/nixl-kv-l2-adapter.md §4), so a" \
-            " namespace containing one makes names ambiguous." \
-            " Set LMCACHE_L2_NAMESPACE to a value without them."
+case "${_L2_ADAPTER_TYPE}" in
+    nixl_kv)
+        # ── The geometry fingerprint (design §5) ───────────────────────────
+        # ObjectKey carries model_name, kv_rank, object_group_id, chunk_hash
+        # and cache_salt — and NO dtype, and NO KV-plane layout. Two daemons
+        # on different --kv-cache-dtype, or on a fused-vs-split KV cache,
+        # therefore produce THE SAME KEY FOR DIFFERENT BYTES, at an identical
+        # byte count, which no length check can catch. Patch 0009 exists
+        # because exactly that plane mismatch corrupts every chunk without
+        # raising.
+        #
+        # So every object name is prefixed with a hash over everything that
+        # changes on-wire meaning. Both nodes derive it from the same
+        # config/cluster.env (and invariant 8 already requires both roles to
+        # agree on LMCACHE_CHUNK_SIZE), so they agree BY CONSTRUCTION — and
+        # any divergence changes the namespace, turning what would have been
+        # silent corruption into an ordinary miss.
+        #
+        # It is also the migration lever: this backend has no delete
+        # primitive, so a schema change cannot drain the namespace. Bumping
+        # the leading version term moves to a fresh key space instead of
+        # colliding with stale data. It additionally isolates us from the
+        # 36,864 stale obj_N_uuid objects and from the other party sharing
+        # smc3 (KV_SLOT_OFFSET_* gives NO isolation here: XNVME_KV's
+        # make_key() ignores devId entirely once metaInfo is set).
+        #
+        # Override LMCACHE_L2_NAMESPACE to force a fresh key space by hand.
+        if [ -n "${LMCACHE_L2_NAMESPACE:-}" ]; then
+            _L2_NAMESPACE="${LMCACHE_L2_NAMESPACE}"
+            info "L2 namespace: ${_L2_NAMESPACE} (forced via LMCACHE_L2_NAMESPACE)"
+        else
+            _L2_NS_INPUT="v1|${MODEL}|${TP_SIZE}|${LMCACHE_CHUNK_SIZE}|${KV_CACHE_DTYPE}|${LMCACHE_L1_ALIGN_BYTES:-4096}|${KV_MAX_VALUE_SIZE_EFFECTIVE}"
+            _L2_NAMESPACE="$(printf '%s' "${_L2_NS_INPUT}" | sha256sum | cut -c1-12)"
+            info "L2 namespace: ${_L2_NAMESPACE}  <- sha256(${_L2_NS_INPUT})"
+        fi
+
+        # Refuse the characters the adapter's own name grammar reserves
+        # (@ field separator, ~ tile ordinal, ! commit suffix). from_dict()
+        # and 25-validate-lmcache-config.sh both check this too; checking
+        # here as well means a bad value is caught at the layer that BUILT
+        # it, naming the variable to fix.
+        case "${_L2_NAMESPACE}" in
+            *@*|*~*|*!*)
+                die "start-lmcache-daemon.sh: L2 namespace" \
+                    " '${_L2_NAMESPACE}' contains one of the reserved" \
+                    " characters @ ~ ! — these separate fields, tile" \
+                    " ordinals and the commit suffix in the adapter's object" \
+                    " names (docs/design/nixl-kv-l2-adapter.md §4), so a" \
+                    " namespace containing one makes names ambiguous." \
+                    " Set LMCACHE_L2_NAMESPACE to a value without them."
+                ;;
+        esac
+        [ -n "${_L2_NAMESPACE}" ] || die "start-lmcache-daemon.sh: computed" \
+            " an empty L2 namespace — sha256sum or cut is missing/broken" \
+            " on this node."
+
+        # NOTE: no pool_size. nixl_kv is content-addressed and has no pool;
+        # its from_dict() REJECTS pool_size rather than ignoring it, so that
+        # a config copied from a nixl_store deployment fails loudly instead
+        # of looking accepted while the key it set does nothing.
+        _L2_ADAPTER_JSON="{\"type\":\"nixl_kv\",\"backend\":\"${KV_BACKEND}\",\"backend_params\":${_L2_BACKEND_PARAMS_JSON},\"namespace\":\"${_L2_NAMESPACE}\"}"
+        ;;
+    nixl_store)
+        warn "L2 adapter type is 'nixl_store' (the vendor's). Its object" \
+             " names carry a per-daemon uuid4, so this tier is a per-daemon" \
+             " capacity extension and CANNOT serve a key stored by the peer" \
+             " node or by a previous run of this one. This is the A/B" \
+             " control, not a working shared cache — see TODO 6.21."
+        _L2_ADAPTER_JSON="{\"type\":\"nixl_store\",\"backend\":\"${KV_BACKEND}\",\"backend_params\":${_L2_BACKEND_PARAMS_JSON},\"pool_size\":${_L2_POOL_SIZE}}"
+        ;;
+    *)
+        die "start-lmcache-daemon.sh: LMCACHE_L2_ADAPTER_TYPE must be" \
+            " nixl_kv|nixl_store, got '${_L2_ADAPTER_TYPE}'."
         ;;
 esac
-[ -n "${_L2_NAMESPACE}" ] || die "start-lmcache-daemon.sh: computed" \
-    " an empty L2 namespace — sha256sum or cut is missing/broken" \
-    " on this node."
-
-# NOTE: no pool_size. nixl_kv_thin is content-addressed and has no pool;
-# its from_dict() REJECTS pool_size rather than ignoring it, so that a
-# config copied from a nixl_store-style deployment fails loudly instead of
-# looking accepted while the key it set does nothing.
-_L2_ADAPTER_JSON="{\"type\":\"nixl_kv_thin\",\"backend\":\"${KV_BACKEND}\",\"backend_params\":${_L2_BACKEND_PARAMS_JSON},\"namespace\":\"${_L2_NAMESPACE}\"}"
 
 # Parse the spec with the SAME installed config classes the daemon itself
 # uses, before ever spawning it — a typo'd key or a bad JSON escape fails

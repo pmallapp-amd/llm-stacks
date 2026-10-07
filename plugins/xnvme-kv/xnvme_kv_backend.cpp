@@ -35,17 +35,12 @@
 #include <unistd.h>
 #include <utility>      // std::pair, for the candidate list
 
-// Populated by query_max_value_size() at construction. See the declaration in
-// the header for why the content-addressed fan-out path now reads this
-// (via effective_max_value_size()) instead of the compiled-in/configured
-// constant.
+// Populated by query_max_value_size() at construction; diagnostic only as of
+// 2026-09-17 — see the declaration in the header for why nothing downstream
+// reads it to decide what to advertise anymore, and why a stale/zero value is
+// still always the safe direction for the one thing that DOES still touch it
+// (query_max_value_size()'s own validation logic).
 std::atomic<uint32_t> nixlXnvmeKvEngine::discovered_max_value_size_{0};
-
-uint32_t nixlXnvmeKvEngine::effective_max_value_size() {
-    const uint32_t discovered =
-        discovered_max_value_size_.load(std::memory_order_relaxed);
-    return discovered != 0 ? discovered : xnvme_kv_configured_max_value_size();
-}
 
 // See the declaration in xnvme_kv_backend.h for why this exists and why it is
 // deliberately not cached.
@@ -118,140 +113,12 @@ static inline void xnvme_kv_key_hex(const uint8_t *key, int key_len, char *out) 
     out[i * 2] = '\0';
 }
 
-// Fixed 1-byte payload every STORE commit marker writes. Content is
-// irrelevant — queryMem()/the retrieve-side commit-check only ever test for
-// the KEY's existence, never read this payload's bytes back. Read-only,
-// never freed, safe to share across every concurrent commit op.
-static const char     kXnvmeKvCommitMarker[1] = {0x01};
-static constexpr uint32_t kXnvmeKvCommitMarkerLen = 1;
-
-// ---- Content-addressed fan-out: build + enqueue every slice of `obj` -------
-//
-// See the declaration in xnvme_kv_backend.h for the ordering invariant this
-// depends on (caller sets obj->parts_pending before calling this).
-void nixlXnvmeKvEngine::build_and_enqueue_parts(XnvmeKvObjectCtx *obj, QueueWorker *qw) {
-    std::vector<XnvmeKvWorkEx *> batch;
-    batch.reserve(obj->num_parts);
-    for (uint32_t k = 0; k < obj->num_parts; ++k) {
-        const uint32_t offset    = k * obj->max_value_size;
-        const uint32_t remaining = obj->total_len - offset;
-        const uint32_t len       = std::min(obj->max_value_size, remaining);
-
-        auto *work = new XnvmeKvWorkEx{};
-        work->op      = obj->op;
-        work->req     = obj->req;
-        work->kind    = XnvmeKvWorkKind::kPart;
-        work->obj     = obj;
-        work->buf     = static_cast<char *>(obj->buf_base) + offset;
-        work->buf_len = len;
-        if (obj->vram_dst_base)
-            work->vram_dst = static_cast<char *>(obj->vram_dst_base) + offset;
-
-        // "~ordinal" — deliberately not "#", which stays reserved/retired
-        // with patch 0007's now-superseded Python-side split scheme (see
-        // docs/design/nixl-kv-l2-adapter.md §4 for why the two must never be
-        // confused when reading device keys).
-        const std::string part_key = obj->meta_info + "~" + std::to_string(k);
-        make_key(0, 0, part_key, work->key, &work->key_len);
-        batch.push_back(work);
-    }
-    {
-        std::lock_guard<std::mutex> lk(qw->mbox_mtx);
-        for (auto *w : batch) qw->mbox.push_back(w);
-    }
-    qw->mbox_cv.notify_one();
-}
-
 void nixlXnvmeKvEngine::kv_complete_cb(XnvmeKvWorkEx *work, bool ok) {
     auto *req = work->req;
-
-    if (work->kind == XnvmeKvWorkKind::kCommit) {
-        // STORE commit marker landed (or failed) — the last op for its
-        // object; nothing left to trigger.
-        if (!ok) req->error.store(true, std::memory_order_relaxed);
-        if (req->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-            req->cv.notify_all();
-        delete work;
-        return;
-    }
-
-    if (work->kind == XnvmeKvWorkKind::kCommitCheck) {
-        XnvmeKvObjectCtx *obj = work->obj;
-        if (ok) {
-            // Commit marker present: arm and issue the real parts. MUST set
-            // parts_pending before enqueueing — see build_and_enqueue_parts().
-            obj->parts_pending.store(static_cast<int>(obj->num_parts),
-                                      std::memory_order_release);
-            build_and_enqueue_parts(obj, work->qw);
-            // req->pending reserved num_parts + 1 slots for this object at
-            // postXfer() time; release this check's own slot now, the parts'
-            // slots release as each of them completes below.
-            if (req->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-                req->cv.notify_all();
-        } else {
-            // No commit marker == object was never (fully) stored: an
-            // ordinary miss, not a transport error. The N part-slots
-            // reserved for this object will now never be submitted —
-            // release every one of them plus this check's own slot, so
-            // checkXfer() does not hang waiting for work that is never
-            // coming.
-            req->error.store(true, std::memory_order_relaxed);
-            const int released = static_cast<int>(obj->num_parts) + 1;
-            if (req->pending.fetch_sub(released, std::memory_order_acq_rel) == released)
-                req->cv.notify_all();
-            delete obj;
-        }
-        // The check's own tiny retrieve buffer — heap-allocated per-check in
-        // postXfer() (unlike the STORE-side commit marker, which is a
-        // shared read-only constant) because the device DMAs into it.
-        delete[] static_cast<char *>(work->buf);
-        delete work;
-        return;
-    }
-
-    // kind == kPart: either an ordinary single-op descriptor (empty
-    // metaInfo, obj == nullptr — unchanged legacy behavior) or one slice of
-    // a content-addressed object (obj != nullptr).
     if (!ok) req->error.store(true, std::memory_order_relaxed);
-    bool req_done = (req->pending.fetch_sub(1, std::memory_order_acq_rel) == 1);
-
-    XnvmeKvObjectCtx *obj = work->obj;
-    if (obj) {
-        if (!ok) obj->parts_error.store(true, std::memory_order_relaxed);
-        if (obj->parts_pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            // Last part of this object resolved.
-            if (obj->op == NIXL_WRITE) {
-                if (!obj->parts_error.load(std::memory_order_relaxed)) {
-                    // All parts durable: write the commit marker. Its own
-                    // completion releases req->pending's reserved slot.
-                    auto *commit = new XnvmeKvWorkEx{};
-                    commit->op      = NIXL_WRITE;
-                    commit->kind    = XnvmeKvWorkKind::kCommit;
-                    commit->req     = req;
-                    commit->buf     = const_cast<char *>(kXnvmeKvCommitMarker);
-                    commit->buf_len = kXnvmeKvCommitMarkerLen;
-                    make_key(0, 0, obj->meta_info + "!c", commit->key, &commit->key_len);
-                    {
-                        std::lock_guard<std::mutex> lk(work->qw->mbox_mtx);
-                        work->qw->mbox.push_back(commit);
-                    }
-                    work->qw->mbox_cv.notify_one();
-                } else {
-                    // A part failed: the commit will never be attempted.
-                    // Release its reserved slot directly.
-                    if (req->pending.fetch_sub(1, std::memory_order_acq_rel) == 1)
-                        req_done = true;
-                }
-            }
-            // RETRIEVE: nothing further on last-part — the group's
-            // success/failure already lives in req->error; there is no
-            // second phase after parts on the read side (the commit-check
-            // already ran FIRST, before any part was issued).
-            delete obj;
-        }
+    if (req->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        req->cv.notify_all();
     }
-
-    if (req_done) req->cv.notify_all();
     delete work;
 }
 
@@ -982,28 +849,14 @@ nixl_status_t nixlXnvmeKvEngine::queryMem(const nixl_reg_dlist_t         &descs,
     for (int i = 0; i < n; ++i) {
         const nixlBlobDesc &d = descs[i];
 
-        // Content-addressed existence == the commit marker exists, not the
-        // raw key: a metaInfo'd object may be stored as many
-        // "{meta_info}~{ordinal}" parts (see postXfer()'s fan-out), and the
-        // only key written AFTER every part is durable is "{meta_info}!c" —
-        // checking anything else could report a hit on a partially-written
-        // object. Empty metaInfo (kv_io.py/nixlbench) is unaffected: it never
-        // goes through the fan-out/commit protocol at all, so its existence
-        // probe stays exactly what it always was, devId/addr-derived.
-        //
-        // IDENTICAL derivation to the store/retrieve path in postXfer()
-        // otherwise. A query that hashed differently from the write would be
-        // worse than no query at all: it would report a miss for data that
-        // is present and silently disable the cache. Note there is no
-        // slot-offset term here, matching postXfer() — the SPDK backend adds
-        // one, this one never has.
+        // IDENTICAL derivation to the store/retrieve path in postXfer(). A
+        // query that hashed differently from the write would be worse than no
+        // query at all: it would report a miss for data that is present and
+        // silently disable the cache. Note there is no slot-offset term here,
+        // matching postXfer() — the SPDK backend adds one, this one never has.
         uint8_t key[XNVME_KV_KEY_MAX_LEN] = {};
         uint8_t key_len = 0;
-        if (!d.metaInfo.empty()) {
-            make_key(d.devId, d.addr, d.metaInfo + "!c", key, &key_len);
-        } else {
-            make_key(d.devId, d.addr, d.metaInfo, key, &key_len);
-        }
+        make_key(d.devId, d.addr, d.metaInfo, key, &key_len);
 
         struct xnvme_cmd_ctx ctx = xnvme_cmd_ctx_from_dev(query_dev_);
         const int rc = xnvme_kvs_exist(&ctx, nsid_, key, key_len);
@@ -1329,24 +1182,6 @@ nixl_status_t nixlXnvmeKvEngine::prepXfer(
 
 // ---- postXfer — async, non-blocking -----------------------------------------
 
-// A descriptor with non-empty metaInfo goes through the content-addressed
-// fan-out/commit protocol (see "Content-addressed fan-out" above); one with
-// empty metaInfo (kv_io.py/nixlbench) keeps the exact original one-op,
-// devId/addr-keyed behavior, untouched. Both are planned here, in one pass,
-// so VRAM staging offsets — which must advance by each descriptor's FULL
-// length regardless of whether it ends up split — are computed exactly like
-// the pre-fan-out code did.
-namespace {
-struct XnvmeKvPostXferPlan {
-    std::string meta_info;        // empty => legacy single-op path
-    void       *local_buf  = nullptr;  // staging slice (VRAM) or real addr (DRAM)
-    void       *vram_dst   = nullptr;  // non-null only for VRAM retrieve
-    uint32_t    len         = 0;
-    uint32_t    num_parts   = 0;        // meaningful only when meta_info non-empty
-    bool        memcpy_failed = false;  // VRAM store staging copy failed
-};
-}  // namespace
-
 nixl_status_t nixlXnvmeKvEngine::postXfer(
         const nixl_xfer_op_t   &operation,
         const nixl_meta_dlist_t &local,
@@ -1365,23 +1200,27 @@ nixl_status_t nixlXnvmeKvEngine::postXfer(
     char  *staging_ptr = vram ? static_cast<char *>(req->staging_) : nullptr;
     size_t staging_off = 0;
 
-    const uint32_t ceiling = effective_max_value_size();
+    // Set pending BEFORE submitting any work (avoids a race where a fast
+    // completion decrements to 0 before all work items are posted).
+    req->pending.store(n, std::memory_order_release);
 
-    std::vector<XnvmeKvPostXferPlan> plans(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         const auto &mem_desc  = local[i];
         const auto &file_desc = remote[i];
-        auto &p = plans[static_cast<size_t>(i)];
 
+        auto *work = new XnvmeKvWorkEx{};
+        work->buf_len = static_cast<uint32_t>(mem_desc.len);
+        work->op      = operation;
+        work->req     = req;
         // metadataP points back at whatever registerMem() created for this
         // exact region (nixlMetaDesc contract) — retrieve the meta_info we
         // stashed there so callers with their own object name (e.g. LMCache's
-        // OBJ mode) don't collide on devId/addr alone. Guard for null since
-        // not every xfer-descriptor-building path is confirmed to populate
-        // it identically.
+        // OBJ mode) don't collide on devId/addr alone. Guard for
+        // null since not every xfer-descriptor-building path is confirmed to
+        // populate it identically (see plan's Part 4 verification).
         auto *file_md = static_cast<nixlXnvmeKvMD *>(file_desc.metadataP);
-        p.meta_info = file_md ? file_md->meta_info : std::string();
-        p.len = static_cast<uint32_t>(mem_desc.len);
+        const std::string &meta_info = file_md ? file_md->meta_info : std::string();
+        make_key(file_desc.devId, file_desc.addr, meta_info, work->key, &work->key_len);
 
         if (vram) {
             void *slice = staging_ptr + staging_off;
@@ -1393,114 +1232,27 @@ nixl_status_t nixlXnvmeKvEngine::postXfer(
                                          mem_desc.len, hipMemcpyDeviceToHost);
                 if (e != hipSuccess) {
                     XNVME_PLUGIN_ERR << "VRAM->staging hipMemcpy failed: " << hipGetErrorString(e);
-                    p.memcpy_failed = true;
+                    kv_complete_cb(work, false);
+                    continue;
                 }
 #endif
             } else {
-                p.vram_dst = reinterpret_cast<void *>(mem_desc.addr);
+                work->vram_dst = reinterpret_cast<void *>(mem_desc.addr);
             }
-            p.local_buf = slice;
+            work->buf = slice;
         } else {
-            p.local_buf = reinterpret_cast<void *>(mem_desc.addr);
-        }
-
-        if (!p.meta_info.empty()) {
-            const uint32_t len1 = p.len ? p.len : 1;   // never 0 parts, even for a 0-byte object
-            p.num_parts = (len1 + ceiling - 1) / ceiling;
-        }
-    }
-
-    // Reserve every slot this batch will ever decrement, BEFORE anything is
-    // submitted (avoids a race where a fast completion decrements to 0
-    // before all work items are posted) — generalized from "1 per
-    // descriptor" to "however many ops each descriptor now expands into":
-    // 1 for the legacy path, num_parts+1 (parts plus a commit/commit-check)
-    // for the content-addressed path.
-    int total_pending = 0;
-    for (const auto &p : plans)
-        total_pending += p.meta_info.empty() ? 1 : static_cast<int>(p.num_parts) + 1;
-    req->pending.store(total_pending, std::memory_order_release);
-
-    for (int i = 0; i < n; ++i) {
-        const auto &file_desc = remote[i];
-        auto &p = plans[static_cast<size_t>(i)];
-
-        if (p.memcpy_failed) {
-            // This descriptor's bytes never made it into the staging buffer;
-            // none of its ops will ever be submitted. Release every slot it
-            // reserved above instead of leaving checkXfer() waiting forever.
-            const int released = p.meta_info.empty() ? 1 : static_cast<int>(p.num_parts) + 1;
-            req->error.store(true, std::memory_order_relaxed);
-            if (req->pending.fetch_sub(released, std::memory_order_acq_rel) == released)
-                req->cv.notify_all();
-            continue;
+            work->buf = reinterpret_cast<void *>(mem_desc.addr);
         }
 
         // Round-robin each descriptor across all queues.
         uint32_t idx = next_queue_.fetch_add(1, std::memory_order_relaxed) %
                        static_cast<uint32_t>(num_queues_);
         QueueWorker *qw = workers_[idx].get();
-
-        if (p.meta_info.empty()) {
-            // Legacy path: exactly one op, devId/addr-derived key, unchanged.
-            auto *work = new XnvmeKvWorkEx{};
-            work->buf_len  = p.len;
-            work->op       = operation;
-            work->req      = req;
-            work->buf      = p.local_buf;
-            work->vram_dst = p.vram_dst;
-            make_key(file_desc.devId, file_desc.addr, p.meta_info, work->key, &work->key_len);
-            {
-                std::lock_guard<std::mutex> lk(qw->mbox_mtx);
-                qw->mbox.push_back(work);
-            }
-            qw->mbox_cv.notify_one();
-            continue;
+        {
+            std::lock_guard<std::mutex> lk(qw->mbox_mtx);
+            qw->mbox.push_back(work);
         }
-
-        // Content-addressed path.
-        auto *obj = new XnvmeKvObjectCtx();
-        obj->req           = req;
-        obj->meta_info      = p.meta_info;
-        obj->op             = operation;
-        obj->buf_base       = p.local_buf;
-        obj->vram_dst_base  = p.vram_dst;
-        obj->total_len      = p.len;
-        obj->max_value_size = ceiling;
-        obj->num_parts      = p.num_parts;
-
-        if (operation == NIXL_WRITE) {
-            // STORE: issue every part now. The commit marker is synthesized
-            // from kv_complete_cb() once they all land — see "Content-
-            // addressed fan-out" above.
-            obj->parts_pending.store(static_cast<int>(obj->num_parts),
-                                      std::memory_order_release);
-            build_and_enqueue_parts(obj, qw);
-        } else {
-            // RETRIEVE: gate every part behind a commit-marker probe first,
-            // so a partially-written (never committed) object is never
-            // handed up as a partial hit. obj->parts_pending stays at its
-            // default 0 until the check succeeds (see kv_complete_cb()'s
-            // kCommitCheck handling) — build_and_enqueue_parts() is the only
-            // thing that ever arms it.
-            auto *check = new XnvmeKvWorkEx{};
-            check->op      = operation;
-            check->req     = req;
-            check->kind    = XnvmeKvWorkKind::kCommitCheck;
-            check->obj     = obj;
-            // Heap-allocated, not the shared commit-marker constant: the
-            // device DMAs its retrieved bytes into this buffer, so unlike
-            // the STORE-side marker (read-only, safely shared) every
-            // concurrent check needs its own. Freed in kv_complete_cb().
-            check->buf     = new char[kXnvmeKvCommitMarkerLen];
-            check->buf_len = kXnvmeKvCommitMarkerLen;
-            make_key(0, 0, obj->meta_info + "!c", check->key, &check->key_len);
-            {
-                std::lock_guard<std::mutex> lk(qw->mbox_mtx);
-                qw->mbox.push_back(check);
-            }
-            qw->mbox_cv.notify_one();
-        }
+        qw->mbox_cv.notify_one();
     }
 
     return NIXL_IN_PROG;
