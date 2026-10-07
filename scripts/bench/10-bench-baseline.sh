@@ -2,7 +2,7 @@
 # 10-bench-baseline.sh — cold-start baseline, cache deliberately bypassed.
 #
 # Node:          anywhere with network reach to the target endpoint
-#                (proxy by default, or --target prefill|decode directly).
+#                (proxy by default, or --target=prefill|decode directly).
 # Prerequisites: scripts/bench/01-install-benchy.sh; the endpoint under
 #                test is up (scripts/proxy/start-proxy.sh and/or
 #                scripts/prefill/03-start-prefill.sh /
@@ -12,7 +12,7 @@
 #                a warm-vs-cold DELTA, and this baseline is the "cold"
 #                side of every such delta.
 #
-# usage: 10-bench-baseline.sh [--target prefill|decode|proxy]
+# usage: 10-bench-baseline.sh [--target=prefill|decode|proxy]
 #
 # WHY this is its own script rather than depth=0 rows embedded inside
 # 20-bench-prefix-cache.sh: --no-cache is a distinct, stronger guarantee
@@ -33,7 +33,6 @@ TARGET="proxy"
 for arg in "$@"; do
     case "${arg}" in
         --target=*) TARGET="${arg#--target=}" ;;
-        --target) shift; TARGET="${1:-}" ;;
         *) die "unknown argument: ${arg} (expected --target=prefill|decode|proxy)" ;;
     esac
 done

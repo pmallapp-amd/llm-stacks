@@ -114,7 +114,7 @@ _run_step() {
     return "${rc}"
 }
 
-_run_step 10-bench-baseline.sh --target proxy || true
+_run_step 10-bench-baseline.sh --target=proxy || true
 BASELINE_RUNDIR="${LAST_RUNDIR}"
 if [ "${_overall_rc}" -ne 0 ]; then
     err "baseline failed — stopping (prefix-cache/concurrency results" \

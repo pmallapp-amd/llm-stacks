@@ -1707,6 +1707,35 @@ that build is a separate open question. See
 TROUBLESHOOTING.md's `ipc_wrapper.py:85` entry (2026-10-01 box, at the
 top) for the full measurement and its caveats, and TODO 6.47.
 
+**2026-10-07 — `gpu_memory_utilization=0.45` avoided the fault twice in a
+row on smc2 (decode); does NOT overturn "not a headroom problem" above.**
+Full stack (vLLM + LMCache MP daemon + the `nixl_kv` L2 adapter), fresh
+containers, `GPU_MEM_UTIL=0.85` (the repo default): decode's `EngineCore`
+died at `ipc_wrapper.py:85` during `REGISTER_KV_CACHE`, identical
+signature to this entry, reproduced on a second fresh attempt after
+clearing the resulting zombie daemon (item 20). Only change:
+`GPU_MEM_UTIL=0.45` (passed as a one-off env override, not yet wired to
+persist — see `config/cluster.env`'s `GPU_MEM_UTIL` comment). Both the
+LMCache daemon and vLLM came up healthy; a subsequent `scripts/bench/
+run-all.sh --quick` ran end to end against the live proxy with no
+further faults.
+
+This is one data point at one additional value, on top of the existing
+"0.85 → 0.60 changed nothing" result — not a root-cause finding, and not
+strong enough to contradict the extensive same-process reproduction above
+showing the import fails independent of any allocator headroom at all.
+Plausible reconciliation: a lower utilization changes vLLM's *memory-
+profiling sequence* before it commits its KV-cache reservation (this repo
+reports "174 GiB free" at OOM time despite the failure, i.e. this is not
+a simple capacity exhaustion), which could shift timing/ordering enough
+to dodge whichever process/context state triggers the import fault,
+without fixing it. Re-test at 0.60 and 0.45 again before trusting this as
+reproducible, and record whether it holds on smc1 too (only exercised on
+decode/smc2 so far). `KV_CACHE_MEMORY_BYTES` (vLLM's own
+`kv_cache_memory_bytes` config field, bypasses the utilization-fraction
+profiling path entirely per its docstring) is an untried, more targeted
+experiment — see `config/cluster.env`'s `GPU_MEM_UTIL` comment.
+
 ### 20. Zombie PID silently blocks a daemon restart
 
 **Cause:** the role container's PID 1 is `sleep infinity`, which never
