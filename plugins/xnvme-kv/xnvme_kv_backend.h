@@ -183,7 +183,50 @@ struct nixlXnvmeKvReqH : public nixlBackendReqH {
 
 class nixlXnvmeKvEngine;
 
-// Async I/O work item — heap-allocated in postXfer(), freed by completion cb.
+// Distinguishes a regular data op from the two synthetic ops the
+// content-addressed fan-out/commit scheme introduces. Only ever kCommit or
+// kCommitCheck when the originating descriptor had non-empty metaInfo — the
+// empty-metaInfo (kv_io.py/nixlbench) path never produces anything but kPart
+// and never touches XnvmeKvObjectCtx at all. See the "content-addressed
+// fan-out" section of xnvme_kv_backend.cpp for the full protocol.
+enum class XnvmeKvWorkKind {
+    kPart,         // one <=max_value_size slice of a STORE or RETRIEVE
+    kCommit,       // STORE only: "{meta_info}!c" marker, sent after all parts succeed
+    kCommitCheck,  // RETRIEVE only: probe for "{meta_info}!c" before issuing any part reads
+};
+
+// Per-logical-object state for a single metaInfo-keyed descriptor that may
+// span more than one on-device KV value. Heap-allocated once per such
+// descriptor inside postXfer(), freed once that object's protocol (all parts
+// durable + commit written, or commit-check resolved + all parts read) is
+// fully resolved. Never shared across descriptors or across postXfer() calls.
+struct XnvmeKvObjectCtx {
+    nixlXnvmeKvReqH *req = nullptr;
+    std::string      meta_info;      // base content key, WITHOUT ~ordinal/!c suffix
+    nixl_xfer_op_t   op = NIXL_WRITE;
+
+    // Local-side base pointers this object's parts slice into. For DRAM,
+    // buf_base is the real destination/source; vram_dst_base is null. For
+    // VRAM, buf_base is the staging-buffer slice (host DRAM) and
+    // vram_dst_base is the real VRAM address parts hipMemcpy to/from.
+    void    *buf_base       = nullptr;
+    void    *vram_dst_base  = nullptr;   // non-null only for VRAM_SEG
+    uint32_t total_len      = 0;
+    // Ceiling used to compute num_parts, frozen at postXfer() time so a
+    // concurrent change to the effective ceiling can never desync the part
+    // count decided here from the offsets computed later (RETRIEVE's parts
+    // are built later still, from inside the commit-check's completion
+    // callback — see kCommitCheck handling in kv_complete_cb()).
+    uint32_t max_value_size = 0;
+    uint32_t num_parts      = 0;
+
+    std::atomic<int>  parts_pending{0};
+    std::atomic<bool> parts_error{false};
+};
+
+// Async I/O work item — heap-allocated in postXfer() or (for a STORE commit /
+// RETRIEVE commit-check's follow-on parts) inside kv_complete_cb(), freed by
+// completion cb.
 struct XnvmeKvWorkEx {
     struct QueueWorker     *qw      = nullptr;
     uint8_t                 key[XNVME_KV_KEY_MAX_LEN] = {};
@@ -192,6 +235,12 @@ struct XnvmeKvWorkEx {
     uint32_t                buf_len = 0;
     nixl_xfer_op_t          op      = NIXL_WRITE;
     nixlXnvmeKvReqH         *req    = nullptr;
+    XnvmeKvWorkKind          kind   = XnvmeKvWorkKind::kPart;
+    // Valid only when kind == kPart AND the originating descriptor had
+    // non-empty metaInfo (the content-addressed fan-out path). Null for the
+    // legacy empty-metaInfo path, and null for kCommit/kCommitCheck work
+    // (those act on req directly — see kv_complete_cb()).
+    XnvmeKvObjectCtx        *obj    = nullptr;
     // VRAM_SEG READ only: destination VRAM pointer to hipMemcpy `buf` (a
     // staging-buffer slice) into once the retrieve completes. Null for
     // DRAM_SEG transfers and for all WRITEs.
@@ -296,23 +345,35 @@ public:
     // query_max_value_size(). 0 = not discovered (no backend created yet, the
     // query failed, or the device reported "not indicated").
     //
-    // AS OF 2026-09-17 THIS IS DIAGNOSTIC ONLY — nothing downstream reads it
-    // to decide what to advertise. Before this date, the plugin's getParams()
-    // read this field directly, gated behind NIXL_KV_USE_DEVICE_MAX_VALUE_SIZE,
-    // which had a call-order defect: getParams() can be (and is, by
-    // scripts/verify/20-verify-nixl-plugin.sh) called BEFORE create_backend(),
-    // i.e. before this field is ever populated, so the opt-in silently did
-    // nothing for that caller. getParams() now calls the call-order-independent
-    // xnvme_kv_configured_max_value_size() instead (see its declaration above),
-    // and this field's only remaining job is to give query_max_value_size()
-    // something to hold the device's number in while it validates the
-    // configured value against it.
+    // REVISED: no longer diagnostic-only. getParams() still calls the
+    // call-order-independent xnvme_kv_configured_max_value_size() (unaffected
+    // by this change — see its declaration above). But the content-addressed
+    // fan-out path's splitting math (postXfer()/kv_complete_cb(), see
+    // "content-addressed fan-out" in xnvme_kv_backend.cpp) now reads THIS
+    // field, via effective_max_value_size(), as the operating ceiling —
+    // deliberately, because the compiled-in/configured constant exists only to
+    // work around THIS firmware's self-report (4096) understating its real,
+    // hand-measured ceiling (32768). A future firmware revision is expected to
+    // self-report accurately, at a much larger ceiling — the fan-out code must
+    // not keep splitting at today's conservative size once that happens, and
+    // using the queried value directly (falling back to the configured
+    // constant only when nothing was discovered) means it doesn't have to be
+    // taught about that change later. The fan-out math itself is written
+    // scale-agnostic — `ceil(len / ceiling)` sub-parts, whatever the ceiling —
+    // so this is the only place the two eras of firmware behavior diverge.
     //
     // Static rather than per-instance for the same reason it always was:
     // nothing that reads it has an engine pointer. In practice one process
     // opens one KV device, so the multi-engine race this was written to
     // tolerate remains theoretical.
     static std::atomic<uint32_t> discovered_max_value_size_;
+
+    // The ceiling the content-addressed fan-out path actually splits against:
+    // discovered_max_value_size_ if query_max_value_size() found one (nonzero),
+    // else xnvme_kv_configured_max_value_size() as a last-resort default. See
+    // discovered_max_value_size_'s comment for why this, and not the
+    // configured value, is the source of truth going forward.
+    static uint32_t effective_max_value_size();
 
     // Locate the KV namespace's generic char device, e.g. "/dev/ng3n1", or ""
     // if none is found. Never guesses a fixed path.
@@ -490,6 +551,17 @@ private:
     // so dropping one silently leaves a caller blocked in checkXfer()/waitXfer()
     // forever; failing it surfaces an error instead.
     void          fail_queued_work(QueueWorker *qw, std::deque<XnvmeKvWorkEx *> &local);
+
+    // Content-addressed fan-out: build every <=max_value_size slice for `obj`
+    // (per obj->num_parts/max_value_size, frozen at postXfer() time) and push
+    // them onto `qw`'s mailbox. Used both for STORE's immediate part issuance
+    // (called from postXfer()) and RETRIEVE's deferred part issuance (called
+    // from kv_complete_cb() once a kCommitCheck confirms the object exists).
+    // Caller MUST set obj->parts_pending = obj->num_parts BEFORE calling this
+    // — same "set pending before submitting" ordering postXfer() already
+    // documents for req->pending, for the same reason (a fast completion must
+    // never observe the counter at 0 before every part has been posted).
+    static void   build_and_enqueue_parts(XnvmeKvObjectCtx *obj, QueueWorker *qw);
 
     nixl_status_t start_workers();
     void          stop_workers();

@@ -36,10 +36,10 @@ WHY A WRAPPER EXISTS AT ALL
         absolute  addr // 4096        = 162593   -> out of range
         relative (addr - ptr) // 4096 = 0        -> correct
 
-    This is NOT a defect in this repo's `nixl_kv` adapter. Verified by
+    This is NOT a defect in this repo's `nixl_kv_thin` adapter. Verified by
     A/B against the untouched vendor `nixl_store`, which fails on the
     identical line with the identical error and `Total success: 0`.
-    `nixl_kv` inherits `get_memory_indices` from `NixlStorageAgent`
+    `nixl_kv_thin` inherits `get_memory_indices` from `NixlStorageAgent`
     unchanged, so it inherits the defect.
 
 WHY PATCH HERE AND NOT IN THE ADAPTER
@@ -49,7 +49,7 @@ WHY PATCH HERE AND NOT IN THE ADAPTER
     an index shifted by `ptr // 4096`. Whether production is therefore
     silently mis-indexed is an OPEN QUESTION that needs its own decisive
     test (see docs/TODO.md), not an assumption folded into a benchmark
-    run. Changing `nixl_kv_l2_adapter.py` would change the live serving
+    run. Changing `nixl_kv_thin_l2_adapter.py` would change the live serving
     path on the strength of that assumption.
 
     So the fix is applied to the vendor base class IN THIS PROCESS ONLY.
@@ -94,7 +94,7 @@ def _install_base_relative_index_patch() -> None:
     """Make L1 page indices base-relative, and range-check them.
 
     Patches the vendor `NixlStorageAgent` base class, so every adapter
-    that inherits from it (`nixl_kv`, `nixl_store`,
+    that inherits from it (`nixl_kv_thin`, `nixl_store`,
     `nixl_store_dynamic`) is fixed by one patch.
     """
     from lmcache.v1.distributed.l2_adapters.nixl_store_l2_adapter import (

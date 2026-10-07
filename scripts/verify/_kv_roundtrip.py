@@ -23,20 +23,25 @@ derive metaInfo purely from (nonce, size), never from each other — is what
 makes this test actually exercise cross-process key AGREEMENT rather than
 just cross-process plumbing.
 
-Multipart split: mimics LMCache's own sub-key convention documented in
-plugins/nvme-kv/spdk_nvme_kv_backend.h's make_key() comment (and, for
-XNVME_KV, tmp/TOPOLOGY-KV-DATAPATH.md §4.5's "`mem_split_n` — and the
-`#{j}` landmine") — "LMCache names objects obj_{slot}_{uuid4}[#{part}]",
-i.e. chunk `i` of a multi-part page is stored under `f"{base_meta}#{i}"`.
-That suffix is LOAD-BEARING for XNVME_KV specifically, which keys off
-metaInfo and ignores addr/offset entirely: drop the suffix and every
-sub-part after the first silently overwrites the one before it, with no
-error at any layer. A --size larger than KV_MAX_VALUE_SIZE_EFFECTIVE is
-REQUIRED to exercise this split path at all — see
-30-verify-kv-roundtrip.sh's --size default and comment, and this file's
-own do_read() byte-compare, which is the only thing that would ever catch
-a collapsed suffix (or, on SPDK_NVMe_KV, an off-by-one in the split
-boundary arithmetic).
+Multipart split: done entirely by the BACKEND, not this script. This file
+issues exactly ONE descriptor of the full --size under ONE bare metaInfo —
+no `#{i}`-suffixed sub-keys constructed here — and relies on the backend's
+own internal fan-out (plugins/xnvme-kv/xnvme_kv_backend.cpp's
+build_and_enqueue_parts(), "~ordinal"/"!c" commit-marker protocol) to
+split/reassemble transparently. This is the same thing
+overlays/lmcache/nixl_kv_thin_l2_adapter.py does: one register+transfer call
+per object, regardless of size, with no size cap of its own — the cap, and
+the splitting it requires, lives entirely on the device side now. A --size
+larger than KV_MAX_VALUE_SIZE_EFFECTIVE is REQUIRED to actually exercise
+that fan-out — see 30-verify-kv-roundtrip.sh's --size default and comment,
+and this file's own do_read() byte-compare, which is the only thing that
+would ever catch a collapsed ordinal or an off-by-one in the split boundary
+arithmetic.
+
+(Earlier revisions of this script pre-split --size into `#{i}`-suffixed
+sub-keys itself, mimicking the since-removed Python-side `nixl_store`/patch
+0007 convention. That mode is gone along with the adapter it was an A/B
+control for — this script now always exercises the real caller path.)
 """
 from __future__ import annotations
 
@@ -68,12 +73,6 @@ def derive_payload(nonce: str, size: int) -> bytes:
 
 def base_meta_info(payload: bytes) -> str:
     return f"kvstack-selftest-{hashlib.sha256(payload).hexdigest()}"
-
-
-def chunk_meta_infos(base_meta: str, num_parts: int) -> list[str]:
-    if num_parts == 1:
-        return [base_meta]
-    return [f"{base_meta}#{i}" for i in range(num_parts)]
 
 
 def find_query_callable(agent):
@@ -425,18 +424,14 @@ def main() -> int:
 
     payload = derive_payload(args.nonce, args.size)
     base_meta = base_meta_info(payload)
-    num_parts = max(1, (args.size + args.max_value_size - 1) // args.max_value_size)
-    metas = chunk_meta_infos(base_meta, num_parts)
 
-    chunks = []
-    off = 0
-    for i in range(num_parts):
-        part_len = min(args.max_value_size, args.size - off)
-        chunks.append(payload[off:off + part_len])
-        off += part_len
+    # One descriptor, one bare key, whatever its real size — the backend
+    # fans it out internally. No '#{i}' suffixing here at all.
+    metas = [base_meta]
+    chunks = [payload]
 
-    print(f"INFO: mode={args.mode} size={args.size} max_value_size={args.max_value_size} "
-          f"num_parts={num_parts} base_meta={base_meta}")
+    print(f"INFO: mode={args.mode} size={args.size} "
+          f"max_value_size={args.max_value_size} base_meta={base_meta}")
 
     # backends=[] on PURPOSE. nixl_agent_config(backends=[X]) makes the agent
     # instantiate X itself, during construction, with DEFAULT parameters — and

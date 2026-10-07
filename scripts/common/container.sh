@@ -79,8 +79,8 @@
 #   container.sh shim                       # write the /opt/kvstack shim
 #   container.sh vllm-patch                 # derive the nixl_utils.py override
 #   container.sh lmcache-patch              # derive the 0011 override
-#   container.sh adapter-overlay            # resolve the nixl_kv mount target
-#   container.sh adapter-check <role>       # prove nixl_kv is registered
+#   container.sh adapter-overlay            # resolve the nixl_kv_thin mount target
+#   container.sh adapter-check <role>       # prove nixl_kv_thin is registered
 #   container.sh plugin-build               # rebuild libplugin_XNVME_KV.so
 #   container.sh up <prefill|decode>        # start the long-lived container
 #   container.sh exec <role> <cmd...>       # run something inside it
@@ -467,12 +467,16 @@ PYEOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# adapter-overlay — resolve where to mount THIS REPO's nixl_kv L2 adapter.
+# adapter-overlay — resolve where to mount THIS REPO's nixl_kv_thin L2
+# adapter.
 #
-# WHAT. overlays/lmcache/nixl_kv_l2_adapter.py is the content-addressed,
-# cross-node-capable L2 adapter that fixes TODO 6.21. See
-# docs/design/nixl-kv-l2-adapter.md. It is mounted INTO the installed
-# lmcache l2_adapters package directory as a NEW FILE.
+# WHAT. overlays/lmcache/nixl_kv_thin_l2_adapter.py is the content-addressed,
+# cross-node-capable L2 adapter (TODO 6.21), with splitting/naming/commit
+# pushed into the plugin's own fan-out (plugins/xnvme-kv/
+# xnvme_kv_backend.cpp) rather than done in Python — see that module's
+# docstring, and docs/design/nixl-kv-l2-adapter.md for the wire grammar it
+# still conforms to. It is mounted INTO the installed lmcache l2_adapters
+# package directory as a NEW FILE.
 #
 # WHY A NEW FILE AND NOT A PATCH. l2_adapters/__init__.py does
 #   for _finder, _module_name, _ispkg in pkgutil.iter_modules(__path__):
@@ -480,11 +484,7 @@ PYEOF
 #           add_pending_module(...)
 # so ANY *_l2_adapter.py present in that directory is auto-discovered and
 # lazily imported when its type name is requested. Dropping a file in is
-# therefore the entire registration mechanism: ZERO vendor files edited,
-# and zero textual conflict with patches 0006/0007, which both modify
-# nixl_store_l2_adapter.py inside an image we cannot rebuild. It also
-# leaves nixl_store byte-identical as an A/B control — switching between
-# the broken and fixed adapter is one --l2-adapter JSON edit.
+# therefore the entire registration mechanism: ZERO vendor files edited.
 #
 # WHY find_spec AND NOT A HARDCODED PATH. Same reasoning as
 # cmd_lmcache_patch: the package exists at more than one path in this image
@@ -493,26 +493,22 @@ PYEOF
 # and pkgutil simply never sees the file because Python imports the package
 # from somewhere else. find_spec().submodule_search_locations[0] is the
 # directory the interpreter will actually scan.
-_ADAPTER_SRC() { echo "${REPO_ROOT}/overlays/lmcache/nixl_kv_l2_adapter.py"; }
+_ADAPTER_SRC() { echo "${REPO_ROOT}/overlays/lmcache/nixl_kv_thin_l2_adapter.py"; }
 _ADAPTER_DIR() { echo "${STACK_ROOT}/lmcache-adapter"; }
 
 cmd_adapter_overlay() {
     local src; src="$(_ADAPTER_SRC)"
     local adir; adir="$(_ADAPTER_DIR)"
     mkdir -p "${adir}"
-    step "Resolving mount target for nixl_kv_l2_adapter.py in ${IMAGE}"
+    step "Resolving mount target for nixl_kv_thin_l2_adapter.py in ${IMAGE}"
 
     [ -f "${src}" ] || die "adapter source not found: ${src}"
 
-    # Compile with the IMAGE's interpreter, not the host's: a syntax error
-    # or a 3.12-ism mismatch must fail here, not inside the daemon's log.
-    # compile() rather than py_compile: the repo is mounted read-only here
-    # and py_compile insists on writing __pycache__ beside the source.
     docker run --rm -v "${REPO_ROOT}:${REPO_ROOT}:ro" \
         --entrypoint python3 "${IMAGE}" -c \
         'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
         "${src}" \
-        || die "nixl_kv_l2_adapter.py does not compile under the image's" \
+        || die "nixl_kv_thin_l2_adapter.py does not compile under the image's" \
                " python3 — refusing to mount it."
 
     local pkgdir
@@ -526,8 +522,8 @@ print(spec.submodule_search_locations[0] if spec else "")' \
         " re-read it and update this function rather than mounting into a" \
         " guessed path, which would be a silent no-op."
 
-    echo "${pkgdir}/nixl_kv_l2_adapter.py" > "${adir}/target-path"
-    ok "nixl_kv adapter mounts over ${pkgdir}/nixl_kv_l2_adapter.py"
+    echo "${pkgdir}/nixl_kv_thin_l2_adapter.py" > "${adir}/target-path"
+    ok "nixl_kv_thin adapter mounts over ${pkgdir}/nixl_kv_thin_l2_adapter.py"
 }
 
 # adapter-check — prove the overlay is actually DISCOVERABLE, not just
@@ -536,22 +532,22 @@ print(spec.submodule_search_locations[0] if spec else "")' \
 # against a LIVE container.
 cmd_adapter_check() {
     local role="$1"; local cname; cname="$(_cname "${role}")"
-    step "Checking nixl_kv is registered inside ${cname}"
+    step "Checking nixl_kv_thin is registered inside ${cname}"
     docker exec "${cname}" python3 -c '
 import sys
 from lmcache.v1.distributed.l2_adapters.config import get_l2_adapter_config_class
 try:
-    cls = get_l2_adapter_config_class("nixl_kv")
+    cls = get_l2_adapter_config_class("nixl_kv_thin")
 except Exception as exc:
-    sys.exit(f"FAIL: nixl_kv is NOT registered: {exc!r}")
-print(f"OK: nixl_kv -> {cls.__module__}.{cls.__name__}")
+    sys.exit(f"FAIL: nixl_kv_thin is NOT registered: {exc!r}")
+print(f"OK: nixl_kv_thin -> {cls.__module__}.{cls.__name__}")
 import importlib.util
-spec = importlib.util.find_spec("lmcache.v1.distributed.l2_adapters.nixl_kv_l2_adapter")
+spec = importlib.util.find_spec("lmcache.v1.distributed.l2_adapters.nixl_kv_thin_l2_adapter")
 print(f"OK: module resolves to {spec.origin}")
-' || die "nixl_kv did not register inside ${cname} — the overlay is" \
+' || die "nixl_kv_thin did not register inside ${cname} — the overlay is" \
          " present but pkgutil did not discover it, or the module raised" \
          " on import. Check: container.sh exec ${role}" \
-         " python3 -c 'import lmcache.v1.distributed.l2_adapters.nixl_kv_l2_adapter'"
+         " python3 -c 'import lmcache.v1.distributed.l2_adapters.nixl_kv_thin_l2_adapter'"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
