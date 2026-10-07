@@ -1,7 +1,31 @@
 # Design: `nixl_kv` — a content-addressed, cross-node LMCache L2 adapter
 
-Status: **specification**, 2026-09-17. Implements the fix for TODO 6.21.
+Status: spec written 2026-09-17 (unchanged below); implemented fresh
+2026-10-07 at `overlays/lmcache/nixl_kv_l2_adapter.py`, with an independent
+naming-scheme unit test at `overlays/lmcache/test_nixl_kv_naming.py` and an
+adapter-level smoke test at `scripts/verify/35-verify-nixl-kv-smoke.sh`.
+Implements the fix for TODO 6.21.
 Read [HANDOFF §2](../HANDOFF.md#2-current-state) first.
+
+## 0. Implementation note (2026-10-07)
+
+This is a from-scratch rewrite — it does not reuse code from any prior
+implementation of this spec. It follows the sections below as written
+(naming scheme §4, geometry fingerprint §5, protocol §6, hard asserts §7,
+counters §8/§8.1) without deviation that's worth calling out separately.
+
+One thing is **not yet confirmed against the installed LMCache package**:
+the base class `NixlKvL2Adapter` inherits from
+(`lmcache.v1.distributed.l2_adapters.base.L2Adapter`, a name inferred from
+this spec's own references to `NixlStoreL2Adapter`'s method names, not read
+directly from the installed package) and the call that registers
+`NixlKvL2AdapterConfig` under the type name `"nixl_kv"`
+(`register_l2_adapter_config`, same caveat). Both are exercised, and fail
+loudly if wrong, by `scripts/common/container.sh adapter-check` and
+`scripts/common/25-validate-lmcache-config.sh --l2-adapter-json ...` — run
+both against a real node before trusting this beyond the parts already unit
+tested (the naming scheme) and smoke tested against the real DSC (the
+store/commit/load protocol, independent of the LMCache registration layer).
 
 ## 1. The problem, stated correctly
 

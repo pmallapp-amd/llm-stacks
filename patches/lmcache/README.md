@@ -30,6 +30,21 @@ a new image still has them, and what breaks if it doesn't.
 Re-measured against the running image 2026-09-17 (see the recipe below for the
 exact commands and their output).
 
+> **Scope note (added with the `nixl_kv` adapter, see
+> [`../../docs/design/nixl-kv-l2-adapter.md`](../../docs/design/nixl-kv-l2-adapter.md)):**
+> `0006`/`0007`/`0008` are about the **vendor's own** `nixl_store` L2 adapter
+> (`v1/distributed/l2_adapters/nixl_store_l2_adapter.py`) recognizing the
+> `XNVME_KV`/`SPDK_NVMe_KV` backend names. This stack's default L2 adapter
+> type is now `nixl_kv` (`overlays/lmcache/nixl_kv_l2_adapter.py`), a wholly
+> separate module, dropped alongside `nixl_store_l2_adapter.py` rather than
+> patched into it, that never imports or touches that file — it has **no
+> dependency on `0006`/`0007`/`0008`.** Those three rows below still matter
+> only if `LMCACHE_L2_ADAPTER_TYPE=nixl_store` (the A/B negative control
+> `scripts/common/start-lmcache-daemon.sh` still supports) is actually run
+> with `KV_BACKEND=XNVME_KV` or `SPDK_NVMe_KV`. `0009` and `0011` are
+> unaffected by this — `0009` lives in the vLLM-facing GPU connector, not any
+> L2 adapter, and `0011` fixes `LMCacheMPConnector` itself.
+
 | Patch | In image? | Diff carried here? | Status on the live path | What it does | If a future image lacks it |
 |---|---|---|---|---|---|
 | `0006` accept `SPDK_NVMe_KV`/`XNVME_KV` in the L2 adapter (`v1/distributed/l2_adapters/nixl_store_l2_adapter.py`) | **YES** | no — deleted | **LIVE** | Adds both names to two allowlists: the `elif self.backend in [...]` branch routing a backend to `init_storage_handlers_object`/`mem_type="OBJ"`, and `_VALID_NIXL_BACKENDS` (the config-time validator). | **LOUD.** The MP daemon rejects `backend: XNVME_KV` in its `--l2-adapter` JSON — `25-validate-lmcache-config.sh` fails before the daemon spawns, or the daemon dies constructing the NIXL backend. Re-deriving it is two string literals in two lists. |

@@ -49,10 +49,11 @@ esac
 info "role: ${THIS_ROLE}   local IPs: ${_local_ips:-<none>}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-role script list. 10- (network) applies everywhere. 20-/30- (NIXL
-# plugin / KV roundtrip) only make sense on a compute node — they need
-# ${VENV} and NIXL_PLUGIN_DIR, neither of which exist on the storage
-# target. 40- (full disaggregation) needs only network reach to the proxy
+# Per-role script list. 10- (network) applies everywhere. 20-/30-/35- (NIXL
+# plugin / KV roundtrip / nixl_kv adapter smoke) only make sense on a
+# compute node — they need ${VENV} and NIXL_PLUGIN_DIR, neither of which
+# exist on the storage target. 40- (full disaggregation) needs only network
+# reach to the proxy
 # and both vLLM servers, so it applies from ANY host including a jump
 # host with THIS_ROLE=unknown — it is the one check that's meaningful
 # regardless of which box is running it.
@@ -63,12 +64,13 @@ case "${THIS_ROLE}" in
         SCRIPTS+=("10-verify-network.sh")
         SCRIPTS+=("20-verify-nixl-plugin.sh")
         SCRIPTS+=("30-verify-kv-roundtrip.sh")
+        SCRIPTS+=("35-verify-nixl-kv-smoke.sh")
         SCRIPTS+=("40-verify-disagg.sh")
         SCRIPTS+=("50-verify-pd-direct.sh")
         ;;
     target)
         SCRIPTS+=("10-verify-network.sh")
-        info "skipping 20-/30- on the target: they require \${VENV} +" \
+        info "skipping 20-/30-/35- on the target: they require \${VENV} +" \
              " NIXL_PLUGIN_DIR, which only exist on a compute node" \
              " (SMC1/SMC2). Run those from prefill or decode instead."
         SCRIPTS+=("40-verify-disagg.sh")
@@ -81,8 +83,9 @@ case "${THIS_ROLE}" in
         info "role unknown (not one of PREFILL_HOST/DECODE_HOST/TARGET_HOST)" \
              " — running only the checks meaningful from an arbitrary host:" \
              " network reachability and the full end-to-end disaggregation" \
-             " proof. Run 20-/30- directly on SMC1 or SMC2 for the" \
-             " plugin-level and roundtrip-level checks; run 50- directly" \
+             " proof. Run 20-/30-/35- directly on SMC1 or SMC2 for the" \
+             " plugin-level, roundtrip-level and adapter-level checks;" \
+             " run 50- directly" \
              " on SMC2 (decode) for its log-based direct-transfer verdict."
         SCRIPTS+=("10-verify-network.sh")
         SCRIPTS+=("40-verify-disagg.sh")
@@ -143,10 +146,12 @@ case "${THIS_ROLE}" in
     target)
         printf '%-32s %-8s %s\n' "20-verify-nixl-plugin.sh" "N/A" "compute-node only" >&2
         printf '%-32s %-8s %s\n' "30-verify-kv-roundtrip.sh" "N/A" "compute-node only" >&2
+        printf '%-32s %-8s %s\n' "35-verify-nixl-kv-smoke.sh" "N/A" "compute-node only" >&2
         ;;
     unknown)
         printf '%-32s %-8s %s\n' "20-verify-nixl-plugin.sh" "N/A" "run on SMC1/SMC2 directly" >&2
         printf '%-32s %-8s %s\n' "30-verify-kv-roundtrip.sh" "N/A" "run on SMC1/SMC2 directly" >&2
+        printf '%-32s %-8s %s\n' "35-verify-nixl-kv-smoke.sh" "N/A" "run on SMC1/SMC2 directly" >&2
         ;;
 esac
 
