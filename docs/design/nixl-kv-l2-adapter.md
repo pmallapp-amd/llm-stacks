@@ -71,12 +71,39 @@ All measured on the live cluster 2026-09-17. Re-measure before trusting
 | probe latency | **57 µs** per descriptor | at page granularity a chunk costs 0.53 s |
 | `page_size` (`--l1-align-bytes`) | **4096** | the transfer unit |
 | declared `max_value_size` | **32768** | `4096 ≤ 32768` ⇒ `mem_split_n == 1` |
-| chunk geometry (Qwen3-8B, chunk=256) | 36 MiB = **9,216 pages per ObjectKey** | one key ⇒ many device objects |
+| chunk geometry (Qwen3-8B, **`TP_SIZE=1`**, chunk=256) | 36 MiB = **9,216 pages per ObjectKey** | one key ⇒ many device objects |
 | `make_key()` with non-empty `metaInfo` | FNV-1a×2 of `metaInfo` alone, **ignores devId/addr** | a content-derived `metaInfo` is a stable cross-node address |
 | `registerMem` for `OBJ_SEG` | `new nixlXnvmeKvMD()` + string copy, **no device I/O** | dynamic per-transfer registration is cheap |
 | device key length | `make_key` emits 12 B, device `key_max=16` | 4 spare bytes available |
 | delete primitive | **none wired** | device space is never reclaimed |
 | namespace size | 1 GiB = **262,144 pages** ≈ 28 chunks ≈ 7k tokens | demonstrable, not sustainable |
+
+**The chunk-geometry row is per rank, and `TP_SIZE` is its dominant term —
+it was previously stated without one, which invites reading it at
+`config/cluster.env`'s `TP_SIZE=8` default rather than at the `TP_SIZE=1`
+the figure was measured under** (`creds/active.env` → `setup-4.env` sets
+`MODEL=Qwen/Qwen3-8B`, `TP_SIZE=1`). Using this repo's own formula
+(`scripts/target/05-check-chunk-ceiling.sh:20`, with the `TP >= kv_heads`
+branch at `:87-96`) on Qwen3-8B's 36 layers / 8 KV heads / head_dim 128 /
+bf16 at chunk=256:
+
+| `TP_SIZE` | kv heads per rank | `phy_size` per rank | pages @ 4096 |
+|---|---|---|---|
+| **1** (deployed) | 8 | **37,748,736 B = 36 MiB** | **9,216** |
+| 8 | 1 | 4,718,592 B = 4.5 MiB | 1,152 |
+
+Every figure in this document derived from that row is **correct as
+written, i.e. computed at `TP_SIZE=1`** — verified: 9,216 x 57 µs =
+0.525 s (§2's "0.53 s", also §6), and 262,144 / 9,216 = 28.4 (§2 and §10's
+"≈28 chunks"). The defect was only the missing label; reading the row at
+`TP=8` is what would put an 8x error into the page count and everything
+downstream of it.
+
+Note the counter-intuitive direction: raising `TP_SIZE` *shrinks* the
+per-rank chunk, because GQA shards KV heads until `TP >= kv_heads` and
+then pins one head per rank — so Qwen2.5-72B at `TP=8` (10 MiB) stores a
+*smaller* object per key than Qwen3-8B at `TP=1` (36 MiB), despite being
+9x the model. Quote `TP_SIZE` with any chunk-geometry figure.
 
 ## 3. Why a new module, not a patch to `nixl_store`
 
