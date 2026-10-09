@@ -25,10 +25,16 @@ Last updated 2026-09-30. Covers SETUP 4 (the Pensando DSC lab); the
 >    [`docs/setups/setup-4.md`](setups/setup-4.md) §2.5/§2.5.1; the gate is
 >    `require_rdma_fw_program()` in `scripts/common/lib.sh`.
 > 2. **`ipc_wrapper.py:85` KV-cache registration OOM** (§7 item 19,
->    TROUBLESHOOTING.md, TODO 6.47) — root cause still NOT established, and
->    it is **no longer masked**: with leg A fixed, execution now reaches
->    `REGISTER_KV_CACHE` and this is what stops decode. **This is the only
->    thing between the cluster and a served decode request.**
+>    TROUBLESHOOTING.md, TODO 6.47) — root cause still NOT established, but
+>    **no longer blocking as of 2026-10-08**: it only fires at
+>    `GPU_MEM_UTIL=0.85`, and both nodes now come up clean at **0.45**, with
+>    `scripts/verify/40-verify-disagg.sh` passing all 9 checks end to end.
+>    The fault itself is unfixed — 0.45 is a workaround, and it is **not
+>    persisted** (one-off env override; `creds/setup-4.env`'s
+>    `DECODE_GPU_MEM_UTIL` is dead code that nothing reads). A restart that
+>    forgets it silently reverts to 0.85 and re-breaks both nodes, prefill
+>    **silently**. See §7 item 19's 2026-10-08 entry for the per-role
+>    asymmetry and the two-command health check.
 >
 > §3 (block-level) is unaffected by blocker 2 **provided no vLLM is
 > resident on the node** — see §7 item 19.
@@ -58,8 +64,8 @@ ask a KV-block question of an engine-level harness.
 | Harness | Layer | Answers | Status on this cluster |
 |---|---|---|---|
 | **`lmcache bench l2`** (§3) | L2 adapter → NIXL → device | KV blocks stored/requested, **hit rate**, block size, **store/load MB/s**, per-key latency | ✅ **VERIFIED 2026-09-18** — numbers in §3.7, device-cross-checked |
-| **llama-benchy** (§4) | HTTP / inference engine | TTFT, tokens/s, prefix-cache benefit, concurrency behaviour | ⚠️ **VERIFIED 2026-09-18, BLOCKED TODAY** — harness runs end to end, but the stack will not start (§1.4, §7 item 19); see also the F5 confound in §4.4 |
-| **the three KV paths** (§4A) | all three at once | which path actually moved KV — P→D, L1→L2→device, cold read-back | ⚠️ **MEASURED 2026-09-21, BLOCKED TODAY** — same blocker as §4 |
+| **llama-benchy** (§4) | HTTP / inference engine | TTFT, tokens/s, prefix-cache benefit, concurrency behaviour | ✅ **UNBLOCKED 2026-10-08** — stack serves at `GPU_MEM_UTIL=0.45` (§7 item 19); rung 40 passes 9/9, TTFT 2.15× warm-vs-cold. See the F5 confound in §4.4 |
+| **the three KV paths** (§4A) | all three at once | which path actually moved KV — P→D, L1→L2→device, cold read-back | ✅ **UNBLOCKED 2026-10-08** — P→D confirmed live: `NixlPullConnector` 78 MB/transfer @ 2797 MB/s, decode external prefix-cache hit rate 100 % |
 | **nixlbench** (§5) | NIXL transport | raw per-backend transfer bandwidth and latency | ❌ **NOT BUILT** — source only, blocked on a missing dependency (§5.2) |
 
 **The ✅/❌ in that last column mixes two different claims — read it
@@ -1736,6 +1742,98 @@ decode/smc2 so far). `KV_CACHE_MEMORY_BYTES` (vLLM's own
 profiling path entirely per its docstring) is an untried, more targeted
 experiment — see `config/cluster.env`'s `GPU_MEM_UTIL` comment.
 
+**2026-10-08 — reproduced at 0.85 on a fully idle GPU; 0.45 confirmed on
+BOTH nodes; `kv_cache_memory_bytes` TRIED and does NOT bypass the fault.**
+Three of the open questions above are now answered:
+
+1. **Not headroom — measured on a clean GPU.** After clearing the leaked
+   IPC pin described below, every GPU on smc2 read `297771008` B (284 MiB,
+   the idle baseline). Starting decode at `GPU_MEM_UTIL=0.85` gave
+   `Available KV cache memory: 146.77 GiB` / `GPU KV cache size:
+   1,068,736 tokens`, reached `Wrapping 36 KV cache tensors for IPC`, and
+   the daemon failed at `ipc_wrapper.py:85`:
+
+   ```
+   torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 MiB.
+   GPU 0 has a total capacity of 191.98 GiB of which 175.18 GiB is free.
+   Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is
+   reserved by PyTorch but unallocated.
+   ```
+
+   A 2 MiB allocation failing against 175 GiB free, in a process holding
+   **zero** PyTorch allocations, is a stronger form of the existing
+   "174 GiB free" datapoint: no fragmentation story and no capacity story
+   survives it. Treat "not a headroom problem" as settled.
+
+2. **`kv_cache_memory_bytes` does NOT bypass it** — the "untried, more
+   targeted experiment" named above and in `config/cluster.env`. On vLLM
+   `0.26.0+rocm`, `VLLM_EXTRA_ARGS="--kv-cache-memory-bytes 42949672960"`
+   never reaches the IPC path at all: `request_memory()` in
+   `vllm/v1/worker/utils.py:435` still validates free VRAM against the
+   utilization fraction first and dies with `ValueError: Free memory on
+   device cuda:0 (121.32/191.98 GiB) on startup is less than desired GPU
+   memory utilization (0.85, 163.19 GiB)`. The flag parses and is
+   accepted; it simply does not remove the utilization check from the
+   startup path on this build, contrary to its own docstring. Re-read
+   `request_memory()` in the installed build before spending time here
+   again.
+
+3. **0.45 holds on smc1 too** (the entry above asked for this). Both nodes
+   now run `GPU_MEM_UTIL=0.45` and both daemons log `Registered KV cache
+   for GPU ID <id> with 36 layers` — which **prefill had never once done**
+   before this date.
+
+**The failure is role-asymmetric, and prefill's half is silent. That is
+the operationally important part.** At 0.85:
+
+| | decode (smc2) | prefill (smc1) |
+|---|---|---|
+| symptom | **fatal** — `ConnectionError: LMCache server did not respond to register_kv_caches within 300.0s`; EngineCore dies | **silent** — `vllm-prefill.log` stops after `Wrapping 36 KV cache tensors for IPC`; server comes up healthy and serves |
+| daemon | dies, leaves a zombie (item 20) | alive, but with **no GPU context ever registered** |
+| visible as | node down, obvious | `No GPU context registered for instance ID <n>` on every store; `No GPU context found for model ... during lookup!` on every lookup |
+
+Measured 2026-10-08: prefill had been in that state since **2026-10-07
+14:57** — about 16 hours — serving traffic throughout. The proxy hides it
+by design: `prefill priming failed (TimeoutError: ) — degraded,
+forwarding to decode without a primed cache`. Output stays correct, so
+nothing alarms, but every request pays the proxy's full 60 s priming
+timeout before falling through and the KV tier contributes nothing.
+End-to-end this reads as a **hang**, not a cache miss: a ~1 400-token
+streaming request returned TTFB `60.7 s` (and, before the proxy was
+separately restarted, zero bytes / `HTTP 000`), while a 20-token request
+answered in 0.03 s. That shape is what makes this look like a network or
+proxy bug rather than a registration failure.
+
+**Confirming a healthy node is cheap, so confirm it.** After any restart,
+on **each** node:
+
+```bash
+docker exec kvstack-<role> grep -c 'Registered KV cache' /var/log/kvstack/lmcache-mp-daemon.log
+docker exec kvstack-<role> grep -c 'No GPU context'      /var/log/kvstack/lmcache-mp-daemon.log
+```
+
+The first must be ≥ 1 for the current start; the second must be 0.
+`/health`, `/v1/models` and short completions **all pass** on a node whose
+LMCache leg is dead — none of them touch it.
+
+After the fix, same hardware and prompt: TTFB `0.029–0.077 s` (from
+60.7 s), decode `External prefix cache hit rate: 100.0%` (from 0.7 %),
+`NixlPullConnector` moving 78 MB per transfer at 2797 MB/s, and
+`scripts/verify/40-verify-disagg.sh` passing all 9 checks with TTFT
+improving 2.15× (threshold 1.5×) — the same script having failed
+`request 1 body non-empty` an hour earlier.
+
+**Related, and easy to misdiagnose as this OOM: the daemon pins a dead
+engine's KV cache.** Killing vLLM does not free its KV cache while the MP
+daemon still holds the imported CUDA IPC handles. Measured 2026-10-08 on
+smc2 with vLLM already dead (a zombie, item 20): GPU 0 still read
+**70.98 GiB** used, while `rocm-smi --showpids` attributed only 682 MiB to
+the daemon — because the pin is an *import* of an allocation the dead
+exporter owned. Stopping the daemon dropped GPU 0 to 284 MiB at once.
+Until that memory is released the next start fails the `request_memory()`
+precheck quoted in (2), which is a **different** error from this item's
+OOM. **Restart the daemon, not just vLLM.**
+
 ### 20. Zombie PID silently blocks a daemon restart
 
 **Cause:** the role container's PID 1 is `sleep infinity`, which never
@@ -1744,11 +1842,35 @@ lingers as a **zombie**, and `start-lmcache-daemon.sh`'s liveness check
 uses `kill -0`, which succeeds against a defunct pid — so it reports
 `already running (pid N) — not restarting` for a daemon that is
 actually dead, and silently refuses to start a working one in its place.
-**NOT FIXED.**
+**NOT FIXED** in the scripts.
 
-**Solution:** `container.sh down <role>` then `up <role>`. Recreating the
-container is the only reliable way to clear the zombie (this is the same
-underlying fact §7 item 8 depends on for a genuinely cold reader).
+**Solution (lighter, measured 2026-10-08):** the zombie cannot be reaped
+without replacing PID 1, but it does not have to be — only the **pidfile**
+blocks the restart. Verify death by process *state* instead of `kill -0`,
+clear the pidfile, then start normally:
+
+```bash
+docker exec kvstack-<role> bash -c '
+for n in vllm-<role> lmcache-mp-daemon; do
+  pf=/run/kvstack/$n.pid; [ -f "$pf" ] || continue
+  p=$(cat "$pf"); st=$(ps -o stat= -p "$p" 2>/dev/null | tr -d " ")
+  case "$st" in ""|Z*) echo "clearing $n (pid $p stat=[$st])"; rm -f "$pf" ;; esac
+done'
+```
+
+`ps -o stat=` prints nothing for a reaped pid and `Z`/`Zs` for a zombie;
+both mean "not running", and `kill -0` cannot distinguish either from a
+live process. Measured clearing `lmcache-mp-daemon pid=10016 stat=[Zs]`
+on smc2, then restarting daemon and vLLM successfully **without touching
+the container**. `container.sh down`/`up` still works and is still the
+right move when you want a genuinely cold reader (§7 item 8).
+
+**Trap: the pidfile holds a container-namespace pid.** Checking it against
+a host `ps` is meaningless and will make a live daemon look dead.
+`rocm-smi` and `/sys/class/kfd/` report **host** pids while `ps` inside
+the container reports **namespace** pids; for the same process these
+differ (measured 2026-10-08: the MP daemon was pid `6091` in-container and
+`55802` on the host). Run the check inside the container, as above.
 
 ### 21. RDMA mode connects anyway over TCP
 
@@ -1801,6 +1923,32 @@ never names a device. The UCX `WARN` that does — and that lists the
 correct device names to use instead — sits ~6 lines **above**
 `EngineCore failed to start` in the container's `vllm-decode.log`.
 Always read upward from that line, not just at it.
+
+### 24. `assert req_id in self.requests` kills EngineCore once KV transfer actually works
+
+**Cause:** `vllm/v1/core/sched/scheduler.py:2648`, in
+`_update_from_kv_xfer_finished()` — a NIXL KV transfer completes and is
+reported for a request the scheduler has already dropped. The assert has
+no handling path, so `EngineCore` dies and the API server follows with
+`vllm.v1.engine.exceptions.EngineDeadError`. **NOT FIXED**; upstream
+assert, no workaround known.
+
+**Measured 2026-10-08 on setup-4**, immediately after item 19's
+registration failure was fixed: both nodes' EngineCores died within ~60 s
+of each other (decode 08:46:12, prefill 08:47:14) under ordinary proxy
+traffic. Restarting both cleared it, and it did not recur across the
+verification runs that followed.
+
+**Why it shows up *now*:** while LMCache registration was failing (item
+19) no real KV transfers happened, so nothing ever reached this code path.
+Fixing registration is what made it reachable. Expect it to be latent on
+any deployment whose LMCache/NIXL leg has silently been dead.
+
+**Suspected trigger:** a request that disappears mid-transfer — a client
+disconnect or a truncated stream. While debugging, read streaming
+responses to completion rather than truncating them (`curl ... | head`).
+This is a hypothesis, not a confirmed reproducer: the observed crash also
+followed ordinary, non-aborted requests.
 
 ---
 
