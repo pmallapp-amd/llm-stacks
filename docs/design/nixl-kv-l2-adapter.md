@@ -244,6 +244,48 @@ Any future change to `register_obj_names()`'s descriptor shape must keep
 (1) intact — a return to positional or otherwise call-scoped `devId`
 reintroduces this bug regardless of ordering discipline.
 
+**`devId` disjointness is necessary but NOT sufficient — the agent itself
+must be serialised.** The two mechanisms above make concurrent stores
+disjoint by *name*. They say nothing about the `nixl_agent` object those
+stores all share: `register_memory`/`deregister_memory` append to and erase
+from one section-descriptor list, and xfer handles live in one table.
+Neither is thread-safe, and `submit_store_task` reaches them from
+`run_in_executor(None, ...)` — the default pool, `min(32, cpu+4)` threads
+wide, so 32 on these nodes.
+
+Measured 2026-10-09, llama-benchy sweep at `concurrency=4`: the daemon
+aborted on **3 of 3 runs**, after 9, 9 and 13 requests, always immediately
+after `nixl_agent.cpp:1144 getXferStatus: backend 'XNVME_KV' returned
+error status NIXL_ERR_BACKEND`, with three different heap signatures —
+`double free or corruption (!prev)`, `corrupted size vs. prev_size while
+consolidating`, and a `std::vector<nixlSectionDesc>::operator[]` assertion
+`'__n < this->size()'`. That last one names the raced structure outright:
+one thread indexes the section vector while another thread's
+`deregister_memory` shrinks it. The abort cascades — the dead daemon takes
+`EngineCore` with it and vLLM's API server then shuts itself down, so the
+visible symptom is a stack that answers `/v1/models` and hangs on
+generation.
+
+`NixlKvStorageAgent._agent_lock` (an `RLock`, because `_do_xfer` is called
+from inside the already-locked `write_pages`/`read_pages`/`write_commit`/
+`read_commit` bodies) is therefore held across each whole
+register → transfer → deregister span, not per call: the descriptors must
+stay valid for the lifetime of the handle that references them. With it,
+the same sweep completes with zero corruption events and both daemons
+surviving.
+
+This serialises L2 I/O within a daemon. That is the intended trade — the
+alternative measured is a daemon that does not survive the benchmark.
+
+**Still open after this fix, and a separate defect:** at `concurrency=4`
+the backend returns `NIXL_ERR_BACKEND` for roughly half the writes (239 of
+497 stores, 2026-10-09) *without* corrupting anything. The same code does
+403 stores with **zero** errors at `concurrency` 1–2. Since the lock now
+serialises every agent API call, this cannot be an API-level race; it is
+load- or batch-size-dependent inside the backend or the device queue. Any
+`depth=4096, concurrency=4` benchmark number is measuring a ~50%-failing
+L2 until that is fixed.
+
 Commit object payload (JSON, `≤ max_value_size`, padded to `align_bytes`):
 
 ```json

@@ -127,6 +127,28 @@ class NixlKvStorageAgent:
         self._devid_lock = threading.Lock()
         self._next_devid = 0
 
+        # Serialises every call into self._agent. The devId counter above
+        # makes OBJ registrations disjoint by NAME (§6), but the agent and
+        # its backend carry their own shared mutable state — the section
+        # descriptor list that register_memory/deregister_memory append to
+        # and erase from, and the xfer handle table. None of it is
+        # thread-safe, and store tasks reach it from the default executor,
+        # which is min(32, cpu+4) threads wide (32 on these nodes).
+        #
+        # Measured 2026-10-09: concurrency=4 in the llama-benchy sweep
+        # aborts the daemon ~3/3 runs, always right after
+        # "getXferStatus: backend 'XNVME_KV' returned NIXL_ERR_BACKEND",
+        # with three different heap signatures — "double free or corruption
+        # (!prev)", "corrupted size vs. prev_size while consolidating", and
+        # a std::vector<nixlSectionDesc>::operator[] assertion
+        # '__n < this->size()'. That last one names the raced structure
+        # outright: one thread indexes the section vector while another
+        # thread's deregister_memory shrinks it.
+        #
+        # RLock, not Lock: _do_xfer takes it and is called from inside
+        # write_pages/read_pages/etc., which already hold it.
+        self._agent_lock = threading.RLock()
+
         self.max_value_size = int(
             self._agent.get_plugin_params(backend_name).get("max_value_size", 0)
         )
@@ -147,28 +169,30 @@ class NixlKvStorageAgent:
         """
         probe_name = f"__nixl_kv_self_probe__{time.time_ns()}"
         try:
-            descs = self._agent.get_reg_descs(
-                [(0, 1, self.next_devid(), probe_name)], "OBJ")
-            qfn = getattr(self._agent, "query_memory", None)
-            if qfn is None:
-                raise RuntimeError(
-                    "agent.query_memory does not exist on this nixl_agent build")
-            qfn(descs, self._backend)
+            with self._agent_lock:
+                descs = self._agent.get_reg_descs(
+                    [(0, 1, self.next_devid(), probe_name)], "OBJ")
+                qfn = getattr(self._agent, "query_memory", None)
+                if qfn is None:
+                    raise RuntimeError(
+                        "agent.query_memory does not exist on this nixl_agent build")
+                qfn(descs, self._backend)
             return True
         except Exception:
             logger.exception("nixl_kv self-probe failed — lookup path may be dead")
             return False
 
     def _do_xfer(self, op: str, local_reg, remote_reg) -> None:
-        handle = self._agent.initialize_xfer(
-            op, local_reg.trim(), remote_reg.trim(),
-            self._agent.name, backends=[self._backend])
-        try:
-            self._agent.transfer(handle)
-            while self._agent.check_xfer_state(handle) == "PROC":
-                time.sleep(0.001)
-        finally:
-            self._agent.release_xfer_handle(handle)
+        with self._agent_lock:
+            handle = self._agent.initialize_xfer(
+                op, local_reg.trim(), remote_reg.trim(),
+                self._agent.name, backends=[self._backend])
+            try:
+                self._agent.transfer(handle)
+                while self._agent.check_xfer_state(handle) == "PROC":
+                    time.sleep(0.001)
+            finally:
+                self._agent.release_xfer_handle(handle)
 
     def write_pages(self, base_addr: int, page_count: int, align_bytes: int,
                     namespace: str, object_key_string: str) -> int:
@@ -183,13 +207,14 @@ class NixlKvStorageAgent:
             local_tuples.append((addr, align_bytes, 0, ""))
             obj_tuples.append((0, align_bytes, devid, page_name(namespace, object_key_string, i)))
 
-        local_reg = self._agent.register_memory(local_tuples, "DRAM", backends=[self._backend])
-        obj_reg = self._agent.register_memory(obj_tuples, "OBJ", backends=[self._backend])
-        try:
-            self._do_xfer("WRITE", local_reg, obj_reg)
-        finally:
-            self._agent.deregister_memory(local_reg, backends=[self._backend])
-            self._agent.deregister_memory(obj_reg, backends=[self._backend])
+        with self._agent_lock:
+            local_reg = self._agent.register_memory(local_tuples, "DRAM", backends=[self._backend])
+            obj_reg = self._agent.register_memory(obj_tuples, "OBJ", backends=[self._backend])
+            try:
+                self._do_xfer("WRITE", local_reg, obj_reg)
+            finally:
+                self._agent.deregister_memory(local_reg, backends=[self._backend])
+                self._agent.deregister_memory(obj_reg, backends=[self._backend])
         return page_count * align_bytes
 
     def write_commit(self, namespace: str, object_key_string: str, page_count: int,
@@ -208,16 +233,17 @@ class NixlKvStorageAgent:
         buf = (ctypes.c_ubyte * len(payload))(*payload)
         addr = ctypes.addressof(buf)
         devid = self.next_devid()
-        local_reg = self._agent.register_memory([(addr, len(payload), 0, "")], "DRAM",
-                                                  backends=[self._backend])
-        obj_reg = self._agent.register_memory(
-            [(0, len(payload), devid, commit_name(namespace, object_key_string))],
-            "OBJ", backends=[self._backend])
-        try:
-            self._do_xfer("WRITE", local_reg, obj_reg)
-        finally:
-            self._agent.deregister_memory(local_reg, backends=[self._backend])
-            self._agent.deregister_memory(obj_reg, backends=[self._backend])
+        with self._agent_lock:
+            local_reg = self._agent.register_memory([(addr, len(payload), 0, "")], "DRAM",
+                                                      backends=[self._backend])
+            obj_reg = self._agent.register_memory(
+                [(0, len(payload), devid, commit_name(namespace, object_key_string))],
+                "OBJ", backends=[self._backend])
+            try:
+                self._do_xfer("WRITE", local_reg, obj_reg)
+            finally:
+                self._agent.deregister_memory(local_reg, backends=[self._backend])
+                self._agent.deregister_memory(obj_reg, backends=[self._backend])
         # Keep buf alive until the transfer completes (it does, synchronously,
         # inside _do_xfer above) — referenced here only to document the
         # lifetime requirement, not because ctypes needs the hint.
@@ -232,8 +258,9 @@ class NixlKvStorageAgent:
         if qfn is None:
             raise RuntimeError("agent.query_memory does not exist on this nixl_agent build")
         name = commit_name(namespace, object_key_string)
-        descs = self._agent.get_reg_descs([(0, self.max_value_size, 0, name)], "OBJ")
-        resp = qfn(descs, self._backend)
+        with self._agent_lock:
+            descs = self._agent.get_reg_descs([(0, self.max_value_size, 0, name)], "OBJ")
+            resp = qfn(descs, self._backend)
         first = resp[0] if isinstance(resp, (list, tuple)) else resp
         return {} if (first is not None and first is not False) else None
 
@@ -241,16 +268,17 @@ class NixlKvStorageAgent:
         buf = (ctypes.c_ubyte * self.max_value_size)()
         addr = ctypes.addressof(buf)
         devid = self.next_devid()
-        local_reg = self._agent.register_memory([(addr, self.max_value_size, 0, "")], "DRAM",
-                                                  backends=[self._backend])
-        obj_reg = self._agent.register_memory(
-            [(0, self.max_value_size, devid, commit_name(namespace, object_key_string))],
-            "OBJ", backends=[self._backend])
-        try:
-            self._do_xfer("READ", local_reg, obj_reg)
-        finally:
-            self._agent.deregister_memory(local_reg, backends=[self._backend])
-            self._agent.deregister_memory(obj_reg, backends=[self._backend])
+        with self._agent_lock:
+            local_reg = self._agent.register_memory([(addr, self.max_value_size, 0, "")], "DRAM",
+                                                      backends=[self._backend])
+            obj_reg = self._agent.register_memory(
+                [(0, self.max_value_size, devid, commit_name(namespace, object_key_string))],
+                "OBJ", backends=[self._backend])
+            try:
+                self._do_xfer("READ", local_reg, obj_reg)
+            finally:
+                self._agent.deregister_memory(local_reg, backends=[self._backend])
+                self._agent.deregister_memory(obj_reg, backends=[self._backend])
         return json.loads(bytes(buf).rstrip(b"\x00"))
 
     def read_pages(self, base_addr: int, page_count: int, align_bytes: int,
@@ -266,13 +294,14 @@ class NixlKvStorageAgent:
             local_tuples.append((addr, align_bytes, 0, ""))
             obj_tuples.append((0, align_bytes, devid, page_name(namespace, object_key_string, i)))
 
-        local_reg = self._agent.register_memory(local_tuples, "DRAM", backends=[self._backend])
-        obj_reg = self._agent.register_memory(obj_tuples, "OBJ", backends=[self._backend])
-        try:
-            self._do_xfer("READ", local_reg, obj_reg)
-        finally:
-            self._agent.deregister_memory(local_reg, backends=[self._backend])
-            self._agent.deregister_memory(obj_reg, backends=[self._backend])
+        with self._agent_lock:
+            local_reg = self._agent.register_memory(local_tuples, "DRAM", backends=[self._backend])
+            obj_reg = self._agent.register_memory(obj_tuples, "OBJ", backends=[self._backend])
+            try:
+                self._do_xfer("READ", local_reg, obj_reg)
+            finally:
+                self._agent.deregister_memory(local_reg, backends=[self._backend])
+                self._agent.deregister_memory(obj_reg, backends=[self._backend])
 
     def close(self) -> None:
         pass
