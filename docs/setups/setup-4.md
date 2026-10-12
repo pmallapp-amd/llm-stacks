@@ -38,7 +38,7 @@ inside the allocation; **anything above 2 reaches into a neighbour's GPUs.**
 
 Currently pinned at `TP_SIZE=1`. Note this is *not* a workaround for the
 `ipc_wrapper.py:85` fault — that was an early theory and it is wrong (the fault
-reproduces at TP=1, single-process; see `docs/BRINGUP.md` §7 item 19).
+reproduces at TP=1, single-process; see `docs/KNOWN-ISSUES.md` item 19).
 
 Three gaps this pin does **not** close — know them before you trust it:
 
