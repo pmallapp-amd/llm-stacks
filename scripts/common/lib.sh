@@ -151,7 +151,7 @@ wait_for_http_bg() {
         pid="$(cat "${pf}" 2>/dev/null || true)"
         [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null || return 2
         # `kill -0` SUCCEEDS against a zombie — container PID 1 is
-        # `sleep infinity` and never reaps its children (BRINGUP §7 item 20),
+        # `sleep infinity` and never reaps its children (KNOWN-ISSUES.md item 20),
         # so a defunct vLLM would otherwise look alive for the full timeout.
         # Field 3 of /proc/pid/stat is the state; comm (field 2) can contain
         # spaces, so strip through the last ')' rather than splitting on space.
