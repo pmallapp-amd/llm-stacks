@@ -11,7 +11,8 @@ Do not fork the existing invariant lists. They remain authoritative:
 
 - `docs/HANDOFF.md` §4 — the 11 numbered invariants
 - `docs/HANDOFF.md` §5 — traps that have actually bitten
-- `docs/BRINGUP.md` §1 — conventions, and §7 — known-issue register
+- `docs/BRINGUP.md` — the bring-up procedure itself
+- `docs/KNOWN-ISSUES.md` — the numbered known-issue register
 
 ---
 
@@ -91,7 +92,7 @@ finished when the box is returned to the state you found it in.
 - Zombie PIDs defeat `stop-lmcache-daemon.sh`: container PID 1 is `sleep infinity`
   and never reaps, so `kill -0` succeeds against a defunct pid and the daemon
   reports "already running — not restarting" when it is dead
-  (`docs/BRINGUP.md` §7 item 20). Verify death; do not trust the message.
+  (`docs/KNOWN-ISSUES.md` item 20). Verify death; do not trust the message.
 
 ## 4. Measure, don't trust the recorded state
 
