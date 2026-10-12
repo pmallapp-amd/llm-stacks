@@ -141,6 +141,85 @@ measured ceiling.
 the configuration measured working. Changing this value changes on-wire
 object geometry, which would require a namespace drain (currently blocked).
 
+#### Above 32768 there is ONE gate, and it is a safety gate, not a limit
+
+An earlier revision of this note claimed page sizes above 32 KiB were
+"gated by two independent mechanisms" and that 32 KiB was "the largest
+usable page". **That was wrong and is retracted.** A later "64 KiB works
+and is only stopped by a Python assert" revision was also wrong in a
+different way. **Measured 2026-10-12: the behaviour is PLUGIN-DEPENDENT, and
+the two nodes currently run different plugin binaries** (`smc1` clean,
+`smc2` reverted `beca7b7` fan-out — see `docs/KV-BLOCK-MOVEMENT.md` and
+AGENTS.md §5.1). NIXL is byte-identical on both nodes, so the sub-chunking
+is **not** "inside NIXL's vendor transfer engine" and **not** absent from
+this repo's source — it is this repo's own reverted fan-out build, live only
+on decode.
+
+**On the clean build (`smc1`/prefill), the 32768 ceiling is real and is
+reached.** A single device Store carries the full `align_bytes` (1:1), and
+`align_bytes=65536` **fails outright**: `store_ops=4`, `completions_ok=0`,
+`completions_err=36`, 0/32 keys stored. 4096/16384/32768 all succeed 32/32
+with `completions_err=0`, following `device_ops_per_key = pages + 1`
+(measured 2080/544/288 ops for 32 keys at 256 KiB/key). The item 10
+`sct=7 sc=234` ceiling does **not** "belong to a different code path" — this
+path reaches it directly, and 32768 is exactly the largest page that works.
+
+**On the fan-out build (`smc2`/decode), the ceiling is never reached.**
+`build_and_enqueue_parts()` splits every page by the device-discovered
+`value_max=4096`, so **no single device Store command ever exceeds 4096
+bytes**, and `align_bytes=65536` "succeeds" 32/32. The law is
+`ops = pages × (⌈align_bytes/4096⌉ + 1) + keys × 2`. Decode's commit-read
+path is additionally broken: `read_commit()` registers `max_value_size`, so
+the plugin requests `⌈mvs/4096⌉` parts when only one was written — measured
+`completions_err` of exactly 224 (=32×7) at `mvs=32768` and 480 (=32×15) at
+`mvs=65536`; prefill has 0 such errors.
+
+**The remaining gate is about atomicity, not capability.**
+`nixl_kv_l2_adapter.py:371` (`§7 assert 1`) refuses when
+`align_bytes > max_value_size`:
+
+> `the value-size split this would require has no recorded sub_size and no
+> atomicity. Refusing to start.`
+
+Read that carefully: the objection is that the 16 pieces are **not
+crash-consistent**, not that they cannot be written. Raising
+`NIXL_KV_MAX_VALUE_SIZE` to enable larger pages **bypasses a deliberate
+safety gate** — it works mechanically, but a crash mid-write leaves
+independently-keyed fragments with nothing recording that the set is
+incomplete. Do not raise it in production on the strength of the throughput
+numbers alone.
+
+Measured on the **decode/fan-out build** across three sizes (2026-10-12)
+— the below is *that* build's law, not a property of the hardware:
+
+| `align_bytes` | device ops/key | ops per KiB | bandwidth |
+|---|---|---|---|
+| 4096 | 4 | 1.00 | 0.60–0.67 MB/s |
+| 32768 | 11 | 0.34 | 4.8–5.5 MB/s |
+| 65536 | **19** | **0.29** | **8.95 MB/s** |
+
+`device_ops_per_key = ceil(align_bytes / 4096) + 3` holds exactly at all
+three points. The 64 KiB run resolved the previously-unexplained `+3` by
+direct wire count: **16 × `len=4096` (data) + 2 × `len=1` + 1 × `len=94`
+(the commit JSON)**. The **clean build's** law is the simpler
+`device_ops_per_key = pages + 1` (2080/544/288 ops for 32 keys at
+4096/16384/32768), and it does **not** hold the 65536 point — that one fails
+0/32 (see above).
+
+Ops per *key* rises with page size; ops per *byte* falls. Key rate stays
+flat (~143–171/s — the serialized producer of item 11), so bandwidth scales
+with page size almost for free. The gain comes from amortizing the fixed
+3-op overhead: 75% of ops are overhead at 4 KiB, 27% at 32 KiB, 16% at
+64 KiB.
+
+Full per-`align_bytes` tables for both builds, the read-path error
+arithmetic, and the reproduction recipe are in
+[`docs/KV-BLOCK-MOVEMENT.md`](KV-BLOCK-MOVEMENT.md).
+
+Changing `align_bytes` changes the namespace fingerprint and therefore
+strands every object already written, and there is no delete primitive to
+reclaim them.
+
 ### 11. Huge `submit_retry`, low bandwidth
 
 Measured ~568 retries per completed op. The reactor busy-spins on `-EBUSY`
@@ -464,6 +543,44 @@ exporter owned. Stopping the daemon dropped GPU 0 to 284 MiB at once.
 Until that memory is released the next start fails the `request_memory()`
 precheck quoted in (2), which is a **different** error from this item's
 OOM. **Restart the daemon, not just vLLM.**
+
+### 19b. `No GPU context found ... during lookup!` — the daemon is up and the L2 tier is unreachable
+
+**Measured 2026-10-12 on decode.** The daemon answers `/status`, reports
+`event_loop_alive: true`, and serves Prometheus — and still rejects **every**
+lookup:
+
+```
+ERROR: No GPU context found for model Qwen/Qwen3-8B with world size 2 during lookup!
+       (lookup.py:205)
+```
+
+The rejection happens at `lookup.py:205`, **before** L1 or L2 is consulted. So
+the whole KV tier reads as idle: `l2_lookup_calls`, `l2_commit_writes` and every
+device `store_ops`/`retrieve_ops` stay at zero while traffic flows normally.
+Nothing in `/status` says anything is wrong — the counters are *honest*, the
+tier genuinely did nothing.
+
+**Cause:** a vLLM worker registers its GPU context with the daemon when its
+connector initialises. Restart the daemon under a **live** vLLM and that
+registration is lost with the old process; the new daemon never acquires one.
+This is the same hazard item 19's table calls "alive, but with **no GPU context
+ever registered**".
+
+**Consequence for benchmarking:** a full llama-benchy sweep ran in this state on
+2026-10-12 and produced a healthy-looking 100 % `vllm:external_prefix_cache_hits_total`
+— entirely from the NixlConnector P→D leg, with the LMCache tier contributing
+nothing. **Always cross-check `:8080/status` before attributing a hit rate to
+the KV cache.**
+
+**Fix:** respect bring-up order (`AGENTS.md` §6) — daemon first, **then** vLLM.
+After any daemon restart, restart the role's vLLM or the L2 tier stays dark.
+Grep for the line directly:
+
+```bash
+docker exec kvstack-<role> grep -c 'No GPU context found' \
+    /var/log/kvstack/lmcache-mp-daemon.log
+```
 
 ### 20. Zombie PID silently blocks a daemon restart
 

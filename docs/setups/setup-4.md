@@ -36,7 +36,7 @@ Enforced by `TP_SIZE`, which here is a **tenancy ceiling, not a tuning knob**.
 yields exactly `HIP_VISIBLE_DEVICES=0,1` and `TP_SIZE=1` yields `0`. Either is
 inside the allocation; **anything above 2 reaches into a neighbour's GPUs.**
 
-Currently pinned at `TP_SIZE=1`. Note this is *not* a workaround for the
+Currently pinned at `TP_SIZE=2`. Note this is *not* a workaround for the
 `ipc_wrapper.py:85` fault — that was an early theory and it is wrong (the fault
 reproduces at TP=1, single-process; see `docs/KNOWN-ISSUES.md` item 19).
 
@@ -56,12 +56,12 @@ a sandbox the tooling enforces. Check residency before and after every run.
 ### 1.2 RDMA — 2 rails per node, rail 1 and rail 2 ONLY
 
 Each node has 8 RoCE devices. **This project may use 2 of them per node:
-`roce_benic1p1` and `roce_benic2p1`.** Rails 3–8 are out of scope.
+`ionic_0` and `ionic_1`.** Rails 3–8 are out of scope.
 
 | Node | Allocated | Netdev / address | Off-limits |
 |---|---|---|---|
-| smc1 | `roce_benic1p1:1`, `roce_benic2p1:1` | `benic1p1` 30.1.1.1/24, `benic2p1` 30.1.2.1/24 | rails 3–8 |
-| smc2 | `roce_benic1p1:1`, `roce_benic2p1:1` | `benic1p1` 30.2.1.1/24, `benic2p1` 30.2.2.1/24 | rails 3–8 |
+| smc1 | `ionic_0:1`, `ionic_1:1` | `enp9s0` 30.1.1.1/24, `enp38s0` 30.1.2.1/24 | rails 3–8 |
+| smc2 | `ionic_0:1`, `ionic_1:1` | `enp9s0` 30.2.1.1/24, `enp38s0` 30.2.2.1/24 | rails 3–8 |
 
 Set via `PREFILL_UCX_NET_DEVICES` / `DECODE_UCX_NET_DEVICES` as a comma-separated
 list; `setup_ucx_env()` passes the value to `UCX_NET_DEVICES` verbatim.
@@ -75,19 +75,30 @@ all 8 devices are visible, and `UCX_NET_DEVICES` is the only thing narrowing it.
 Measured **2026-10-04**, on both nodes. Where these contradict `config/cluster.env`
 or `creds/setup-4.env` comments, these win (`AGENTS.md` §4).
 
-### 2.1 RDMA device names are `roce_benicNp1`, not `ionic_N`
+### 2.1 RDMA device names are `ionic_N` again — `roce_benicNp1` is gone
 
-The 2026-09-29 reboot renamed every device. `ionic_*` **no longer exists on either
-node.** All 8 `roce_benic<N>p1` (N=1..8) are present and `PORT_ACTIVE` on both.
+The 2026-09-29 reboot renamed every device to `roce_benic<N>p1`, and an
+earlier revision of this section recorded that as current. **That is now
+inverted. Measured 2026-10-12 on both nodes:** all 8 devices on each are
+`ionic_0 .. ionic_7`, and **`roce_benic*` no longer exists on either node.**
+This matches the post-flash pattern §2.5.1 item 2 describes (a pulsar flash
+relocates the Ethernet function and renames the RDMA device to `ionic_N`), and
+the Ethernet functions are indeed relocated to their own bus. **But a direct
+personality read on 2026-10-12 shows every card is still `hydra`** (§2.5) — so
+on this box the `ionic_N` rename is not, by itself, proof of a pulsar flash;
+probe `p4_program`, do not infer it from the name.
 
-Any pin of the form `ionic_7:1` resolves to nothing. `require_rdma_access()` only
-*warns* on a missing device name — the failure then surfaces ~95 s later as
-`NIXL_ERR_BACKEND` / `EngineCore failed to start`, naming neither the device nor
-the cause. **Re-derive from `/sys/class/infiniband/*` at every bring-up.**
+Any pin of the form `roce_benicNp1:1` now resolves to nothing.
+`require_rdma_access()` only *warns* on a missing device name — the failure
+then surfaces ~95 s later as `NIXL_ERR_BACKEND` / `EngineCore failed to
+start`, naming neither the device nor the cause. **Re-derive from
+`/sys/class/infiniband/*` at every bring-up.**
 
-The old `ionic_N -> benic<N+1>p1` mapping table in `config/cluster.env`, and its
-claim that only `ionic_2/3/5/6` line up across hosts, are both obsolete. Device
-`roce_benic<N>p1` now names the same physical rail on both hosts, symmetrically.
+The old `ionic_N -> benic<N+1>p1` mapping table in `config/cluster.env`,
+and its claim that only `ionic_2/3/5/6` line up across hosts, are both
+obsolete — and so is this section's own earlier `roce_benic<N>p1` naming.
+Device `ionic_N` names the same physical rail on both hosts, symmetrically;
+our allocation is `ionic_0:1` and `ionic_1:1` (§1.2).
 
 ### 2.2 The fabric IS routed between smc1 and smc2 — RETRACTS "no route"
 
@@ -155,9 +166,67 @@ Enforced in code by `require_rdma_fw_program()` (`scripts/common/lib.sh`),
 called from `require_rdma_access()`, so it fails in ~3 s instead of ~2 min.
 Escape hatches: `RDMA_FW_CHECK=0`, `RDMA_REQUIRED_P4_PROGRAM=<name>`.
 
-> **State as measured 2026-10-04: all 8 cards on smc1 AND smc2 are `hydra`.**
-> No rail can carry leg A until cards are flashed to `pulsar`. This — not the
-> `ionic_*` rename alone — is the root of the long-standing leg A blocker.
+> **State as measured 2026-10-04, RE-CONFIRMED 2026-10-12: all 8 cards on
+> smc1 AND smc2 are `hydra`.**
+>
+> Re-confirmation read-only on 2026-10-12: with the raw `eth_dbgtool`/`nicctl`
+> dispatchers aborting (`no AMD NIC cards detected`), each card was probed via the
+> `hydra` backend directly (`/usr/sbin/eth_dbgtool-ainic-vulcano-rudra-hydra
+> --bdf <card> -V`); all 8 cards on both nodes report `p4_program: hydra`. Note
+> this is *despite* the devices now being named `ionic_0..ionic_7` (§2.1) — so on
+> this box, `ionic_N` naming does **not** by itself indicate a pulsar flash; the
+> personality was positively re-confirmed, it did not follow from the naming.
+
+#### RETRACTED 2026-10-12: `hydra` cards on this box DO create UD queue pairs
+
+The claim above that a `hydra` card "cannot create a UD queue pair", and the
+conclusion that **"no rail can carry leg A until cards are flashed to `pulsar`"**,
+are **contradicted by the running system**. Measured 2026-10-12, with all 8
+cards probing `p4_program: hydra`:
+
+```
+rdma resource show qp | grep -w UD
+  10 x  dev=ionic_0/1  state=RTS  comm=VLLM::Worker_TP     # smc1 AND smc2
+  10 x  dev=ionic_1/1  state=RTS  comm=VLLM::Worker_TP     # smc1 AND smc2
+```
+
+20 UD QPs per node, all in **RTS**, created by the live vLLM workers on the two
+allocated rails. UCX built its worker, vLLM started, and the P→D NIXL leg moved
+**75.67 GB over 602 transfers (~12.6 GB/s)** during the 2026-10-12 benchmark —
+all on cards reported as `hydra`.
+
+So one of two things is true, and **which one is not yet established**: either
+the personality probe is not reporting what we think it reports (the `pulsar`
+backend could not run — `libsdkvulcano_csrint.so` missing — so only the `hydra`
+backend answered, and it may be reporting its own identity rather than the
+card's), or a `hydra` card can carry `ud_verbs` on the current driver stack.
+
+**Consequence — do not flash on the strength of §2.5 alone.** The UD-QP failure
+mode in §2.5 is real and was genuinely observed in the past, but it is **not**
+the current state of this box, and flashing is destructive on shared hardware.
+Before treating firmware as the cause of any future leg-A failure, first check
+whether UD QPs exist and are RTS (`rdma resource show qp | grep -w UD`). If they
+are, the firmware is not your blocker.
+
+#### STANDING DECISION 2026-10-12: `hydra` is accepted on this box — do NOT reflash
+
+**The acceptance test is behavioural, not a personality string:** if vLLM and
+the LMCache daemon start, and UD QPs reach RTS on the two allocated rails, the
+firmware is fine. That is the current measured state on both nodes, and it has
+carried 75.67 GB of P→D traffic.
+
+Therefore **`p4_program: hydra` is not, by itself, a defect to be remediated
+here.** Do not flash these cards to `pulsar`:
+
+- flashing is destructive and shared-visible — it drops the co-tenant's traffic
+  on the port as well as ours;
+- the thing it would fix is not currently broken;
+- §2.5.1 is retained **only** as a procedure for the day a card genuinely
+  cannot create a UD QP. It is not a recommendation, and it is not maintenance.
+
+If a future leg-A failure appears, work the order: UD QPs → device names →
+`UCX_NET_DEVICES` pin → `UCX_IB_ROCE_SUBNET_PREFIX_LEN` (§2.3). Reach for
+firmware last, and only with a card proven unused.
 
 Flashing is **destructive and shared-visible**: it takes down the co-tenant's
 traffic on that port as well as ours (`docs/HANDOFF.md`). Flash only cards
@@ -279,7 +348,7 @@ scripts/common/deploy.sh --node compute --no-creds   # --no-creds unless creds c
 tr '\0' '\n' < /proc/$(cat /run/kvstack/vllm-<role>.pid)/environ | grep HIP_VISIBLE_DEVICES
 # exactly the two allocated rails
 tr '\0' '\n' < /proc/$(cat /run/kvstack/vllm-<role>.pid)/environ | grep UCX_NET_DEVICES
-# QPs only on roce_benic1p1 / roce_benic2p1
+# QPs only on ionic_0 / ionic_1
 rdma resource show qp
 ```
 

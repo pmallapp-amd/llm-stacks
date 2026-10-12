@@ -309,3 +309,37 @@ from now if nobody recorded whether that run was TCP or RDMA, what
 of `scripts/proxy/disagg_proxy.py`'s sequential priming logic was actually
 running. Never quote a number from this harness without pointing at the
 run directory that produced it.
+
+## 10. llama-benchy measures the SERVING layer only
+
+llama-benchy is an HTTP client. Everything it reports comes through the
+proxy → prefill/decode vLLM path, so it can observe end-to-end latency and
+nothing below it. It **cannot** vary or observe `align_bytes`, L2 hit/miss,
+or device IOPS — those live below the serving layer and are invisible to a
+prompt/reply harness. Do not read a llama-benchy result as a statement about
+the KV *tier*.
+
+For KV-block-level measurement — per-`align_bytes` op counts, the clean-vs-
+fan-out plugin laws, the device ceiling, and `align_bytes`'s unsettable-on-
+serving-path caveat — use `lmcache bench l2` driven via
+`scripts/bench/l2-block-bench.py`, and read
+[`docs/KV-BLOCK-MOVEMENT.md`](KV-BLOCK-MOVEMENT.md).
+
+**Measured 2026-10-12: the tie between the serving layer and the KV tier is
+even weaker than the scope note above implies.** During a full reduced
+llama-benchy sweep, the L2 tier saw **zero activity** — `l2_lookup_calls`,
+`l2_commit_writes`, and every device store/retrieve op counter were
+unchanged across the run — while decode's
+`vllm:external_prefix_cache_hits_total` rose by **507,119**. Every one of
+those hits came from the **NixlConnector P→D RDMA leg** (+75.67 GB over 602
+transfers, ~12.6 GB/s), not from LMCache.
+
+**Consequently, reading vLLM's `external_prefix_cache_*` counters as an
+LMCache/KV-tier hit rate is wrong on this deployment.** A high external
+prefix cache hit rate here means the direct P→D NixlConnector leg is
+working, and says nothing about whether LMCache's L2 is being touched at
+all. To determine what the LMCache tier actually did, cross-check the
+daemon's own `http://127.0.0.1:8080/status` and `/metrics` (see
+`docs/HANDOFF.md` §3 for the intended meaning of each counter) — those, not
+vLLM's prefix-cache counters, are the authoritative source for LMCache
+occupancy and op counts.

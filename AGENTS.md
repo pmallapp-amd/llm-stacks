@@ -118,6 +118,42 @@ Each of these has cost hours by failing late and misattributed. Check them first
 | Every pinned device in the list exists | `ibv_devinfo` | `require_rdma_access()` |
 | KV device is the KV namespace, not the boot drive | `nvme ns-descs` → `csi: 0x1` | `assert_kv_char_device()` |
 | GPUs in our allocation are actually free | GPU residency, owning pid's cgroup | — (manual) |
+| **Both nodes run the SAME `libplugin_XNVME_KV.so`** | `md5sum` + `nm -C … \| grep -c build_and_enqueue_parts` | — (manual; `container.sh` does **not**) |
+
+### 5.1 The plugin-parity trap — found and FIXED 2026-10-12
+
+Decode was running a **reverted** commit (`beca7b7`) whose
+`build_and_enqueue_parts()` fan-out split every page by the device-discovered
+`value_max=4096`, while prefill ran the clean 1:1 build. `libnixl.so` was
+byte-identical on both, which is what proved NIXL was not the source.
+
+**Resolved 2026-10-12** by `container.sh plugin-build` on decode (old `.so`
+retained as `libplugin_XNVME_KV.so.fanout-beca7b7.bak`). Both nodes now build
+to 174152 B with zero `build_and_enqueue_parts` symbols, and measure identically
+(4 KiB: 2080 device ops, 0 errors on both).
+
+The trap itself is **not** fixed and will recur: `container.sh:624` rebuilds the
+plugin **only when the `.so` is absent**, and the install gate (`:608-614`) only
+greps for a symbol both builds export. So a stale binary still survives every
+redeploy. Check it explicitly after any image or node change:
+
+```bash
+md5sum /opt/kvstack/plugins/libplugin_XNVME_KV.so          # must match across nodes
+nm -C /opt/kvstack/plugins/libplugin_XNVME_KV.so | grep -c build_and_enqueue_parts
+# 0 -> clean build    2 -> fan-out build (reverted beca7b7)
+```
+
+Full measured consequences, including the per-`align_bytes` op-count laws and
+the 224/480 commit-read error fingerprint, are in
+[`docs/KV-BLOCK-MOVEMENT.md`](docs/KV-BLOCK-MOVEMENT.md).
+
+### 5.2 `align_bytes` is not settable on the serving path
+
+`start-lmcache-daemon.sh` never passes `--l1-align-bytes` (`:466-474`,
+deliberate). `LMCACHE_L1_ALIGN_BYTES` feeds **only** the namespace fingerprint
+(`:407`), so setting it strands every existing object — there is no delete
+primitive — while leaving the real `align_bytes` at the default 4096. To vary
+it, drive the adapter directly with `lmcache bench l2 --l1-align-bytes N`.
 
 **The firmware one is the trap.** A `hydra` card cannot create a UD queue pair,
 so UCX fails to build a worker and vLLM dies ~2 minutes later as "Engine core

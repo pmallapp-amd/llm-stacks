@@ -58,6 +58,9 @@ the measurement wins; say what you measured.
 - Procedure: [`docs/BRINGUP.md`](docs/BRINGUP.md) — numbered steps, nothing else
 - Failures: [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md) — 24 numbered entries
 - This lab's identity and allocation: [`docs/setups/setup-4.md`](docs/setups/setup-4.md)
+- KV-block movement per `align_bytes`, and the live plugin-parity trap:
+  [`docs/KV-BLOCK-MOVEMENT.md`](docs/KV-BLOCK-MOVEMENT.md) — read before
+  quoting any device-level op count, IOPS or bandwidth number
 - Per-node sanity: `scripts/{prefill,decode}/verify/run-all.sh`
 - Cross-node data path: `scripts/verify/` rungs 10–60
 
