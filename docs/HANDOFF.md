@@ -40,7 +40,12 @@ assumed, and what is still wrong.
 > **Three results from the 2026-09-18 late session, two of them negative
 > and both of those load-bearing:**
 >
-> 1. **P→D over RDMA RoCEv2 is NOT achievable on this stack.** Not a
+> 1. **P→D over RDMA RoCEv2 is NOT achievable on this stack.**
+>    **No longer true — the cause was firmware personality.** Rails 1–2
+>    were flashed `hydra`→`pulsar` on 2026-10-04, and P→D has since moved
+>    75.67 GB over RoCEv2 (`docs/setups/setup-4.md` §2.5). The measurement
+>    below stands for a `hydra` card; the conclusion drawn from it does not
+>    generalise to this stack. Not a
 >    tuning problem. Two layers were wrong: `container.sh` never mapped
 >    `/dev/infiniband`, so the container had **no RDMA access at all**
 >    while the host showed 8 uverbs devices (now fixed); and with the

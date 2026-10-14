@@ -162,6 +162,13 @@ initialization failed" — naming neither the NIC nor the firmware. `fw_ver`,
 and pulsar cards; `eth_dbgtool`'s `p4_program` is the only discriminator. Note
 it takes the **card** BDF, which is a PCI ancestor of the netdev function.
 
+**And `eth_dbgtool` is itself personality-specific.** On a host holding mixed
+flavours the `/usr/sbin/eth_dbgtool` dispatcher aborts with
+`no AMD NIC cards detected`, and falling back to a single backend binary makes
+every card report that backend's own personality — a uniform answer that is an
+echo, not a reading. Probe with **both** backends and compare; see
+[`docs/setups/setup-4.md`](docs/setups/setup-4.md) §2.5.
+
 Flashing firmware is destructive on shared hardware — it drops the co-tenant's
 traffic on that port too. Flash only cards proven unused.
 

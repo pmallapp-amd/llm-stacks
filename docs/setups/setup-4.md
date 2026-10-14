@@ -77,16 +77,17 @@ or `creds/setup-4.env` comments, these win (`AGENTS.md` §4).
 
 ### 2.1 RDMA device names are `ionic_N` again — `roce_benicNp1` is gone
 
-The 2026-09-29 reboot renamed every device to `roce_benic<N>p1`, and an
-earlier revision of this section recorded that as current. **That is now
-inverted. Measured 2026-10-12 on both nodes:** all 8 devices on each are
-`ionic_0 .. ionic_7`, and **`roce_benic*` no longer exists on either node.**
-This matches the post-flash pattern §2.5.1 item 2 describes (a pulsar flash
-relocates the Ethernet function and renames the RDMA device to `ionic_N`), and
-the Ethernet functions are indeed relocated to their own bus. **But a direct
-personality read on 2026-10-12 shows every card is still `hydra`** (§2.5) — so
-on this box the `ionic_N` rename is not, by itself, proof of a pulsar flash;
-probe `p4_program`, do not infer it from the name.
+**Measured 2026-10-12 on both nodes:** all 8 devices on each are
+`ionic_0 .. ionic_7`, with their Ethernet functions relocated to their own bus,
+and **`roce_benic*` no longer exists on either node.** The `roce_benic<N>p1`
+naming that the 2026-09-29 reboot produced is gone.
+
+**The `ionic_N` name does not tell you the card's personality.** §2.5.1 item 2
+describes the rename as a *consequence* of a pulsar flash, but only 2 of the 8
+cards here were ever flashed (§2.5) and all 8 nevertheless carry `ionic_N`
+names. Why the other 6 renamed is not established in this file. Either way the
+inference does not run backwards: **probe `p4_program` per card (§2.5), never
+infer personality from the device name.**
 
 Any pin of the form `roce_benicNp1:1` now resolves to nothing.
 `require_rdma_access()` only *warns* on a missing device name — the failure
@@ -166,23 +167,47 @@ Enforced in code by `require_rdma_fw_program()` (`scripts/common/lib.sh`),
 called from `require_rdma_access()`, so it fails in ~3 s instead of ~2 min.
 Escape hatches: `RDMA_FW_CHECK=0`, `RDMA_REQUIRED_P4_PROGRAM=<name>`.
 
-> **State as measured 2026-10-04, RE-CONFIRMED 2026-10-12: all 8 cards on
-> smc1 AND smc2 are `hydra`.**
->
-> Re-confirmation read-only on 2026-10-12: with the raw `eth_dbgtool`/`nicctl`
-> dispatchers aborting (`no AMD NIC cards detected`), each card was probed via the
-> `hydra` backend directly (`/usr/sbin/eth_dbgtool-ainic-vulcano-rudra-hydra
-> --bdf <card> -V`); all 8 cards on both nodes report `p4_program: hydra`. Note
-> this is *despite* the devices now being named `ionic_0..ionic_7` (§2.1) — so on
-> this box, `ionic_N` naming does **not** by itself indicate a pulsar flash; the
-> personality was positively re-confirmed, it did not follow from the naming.
+#### Personality state: 2 `pulsar` / 6 `hydra` per node — DERIVED, not freshly probed
 
-#### RETRACTED 2026-10-12: `hydra` cards on this box DO create UD queue pairs
+| devices | rails | cards | personality | basis |
+|---|---|---|---|---|
+| `ionic_0`, `ionic_1` | 1, 2 — **this project's allocation** (§1.2) | `0000:06:00.0`, `0000:23:00.0` | **`pulsar`** | §2.5.1 flash record, 2026-10-04 |
+| `ionic_2 .. ionic_7` | 3–8 — out of scope | — | `hydra` | never flashed |
 
-The claim above that a `hydra` card "cannot create a UD queue pair", and the
-conclusion that **"no rail can carry leg A until cards are flashed to `pulsar`"**,
-are **contradicted by the running system**. Measured 2026-10-12, with all 8
-cards probing `p4_program: hydra`:
+This follows from §2.5.1's own record: those two cards were flashed to pulsar
+`1.130.0-a-149` on 2026-10-04, and the payoff table measured them as pulsar with
+UD QP **OK** against an untouched hydra card that **FAILED**. The card-BDF ↔ rail
+map puts them at rails 1 and 2, which §1.2 allocates to this project.
+
+**This is a derivation from the records in this file, not a fresh measurement.
+A fresh two-backend probe of all 8 cards is outstanding.** Treat the table as
+the working assumption, not as a reading.
+
+#### How to probe personality correctly on a mixed host
+
+**A personality-specific probe binary cannot be trusted to report a card's
+personality — only its own.** Calling
+`/usr/sbin/eth_dbgtool-ainic-vulcano-rudra-hydra` against all 8 cards asks a
+hydra-only tool "are you hydra?" eight times and gets "hydra" eight times. That
+is an echo, not a personality read. This box has produced exactly that false
+uniform result once already.
+
+1. Run **both** backends directly against each card's BDF and compare:
+   `/usr/sbin/eth_dbgtool-ainic-vulcano-rudra-pulsar` and
+   `...-rudra-hydra`. A card is whichever backend reports a healthy
+   `p4_program` match for itself. A card that both deny — or both claim — is a
+   new anomaly, not a result to force-pick.
+2. **Caveat:** the `pulsar` backend has been seen unable to run at all
+   (`libsdkvulcano_csrint.so` missing). If only one backend executes, you do
+   **not** have a personality read, whatever it prints. Fix the library first.
+3. Treat the dispatcher's `no AMD NIC cards detected` / `card discovery failed`
+   abort as **positive evidence that the host is mixed-personality** (§2.5.1
+   item 3), never as a tooling defect to route around by calling one backend
+   directly.
+
+#### The UD-QP evidence is from the pulsar rails — it does not exculpate `hydra`
+
+Measured 2026-10-12, both nodes:
 
 ```
 rdma resource show qp | grep -w UD
@@ -190,43 +215,33 @@ rdma resource show qp | grep -w UD
   10 x  dev=ionic_1/1  state=RTS  comm=VLLM::Worker_TP     # smc1 AND smc2
 ```
 
-20 UD QPs per node, all in **RTS**, created by the live vLLM workers on the two
-allocated rails. UCX built its worker, vLLM started, and the P→D NIXL leg moved
-**75.67 GB over 602 transfers (~12.6 GB/s)** during the 2026-10-12 benchmark —
-all on cards reported as `hydra`.
+20 UD QPs per node in **RTS**, created by the live vLLM workers, and the P→D
+NIXL leg moved **75.67 GB over 602 transfers (~12.6 GB/s)**. All of it on
+`ionic_0`/`ionic_1` — the two **pulsar** rails. This is the precondition above
+being *satisfied*, exactly where it predicts success; it is **not** evidence
+that a hydra card can carry `ud_verbs`.
 
-So one of two things is true, and **which one is not yet established**: either
-the personality probe is not reporting what we think it reports (the `pulsar`
-backend could not run — `libsdkvulcano_csrint.so` missing — so only the `hydra`
-backend answered, and it may be reporting its own identity rather than the
-card's), or a `hydra` card can carry `ud_verbs` on the current driver stack.
+**Nothing on this box has shown a `hydra` card creating a UD QP.** Rails 3–8,
+the actual hydra cards, have never been exercised against a UD-QP workload here
+— untested and out of scope (§1.2), not proven to work.
 
-**Consequence — do not flash on the strength of §2.5 alone.** The UD-QP failure
-mode in §2.5 is real and was genuinely observed in the past, but it is **not**
-the current state of this box, and flashing is destructive on shared hardware.
-Before treating firmware as the cause of any future leg-A failure, first check
-whether UD QPs exist and are RTS (`rdma resource show qp | grep -w UD`). If they
-are, the firmware is not your blocker.
+#### STANDING DECISION: do NOT reflash
 
-#### STANDING DECISION 2026-10-12: `hydra` is accepted on this box — do NOT reflash
+Neither reason is "hydra is fine here":
 
-**The acceptance test is behavioural, not a personality string:** if vLLM and
-the LMCache daemon start, and UD QPs reach RTS on the two allocated rails, the
-firmware is fine. That is the current measured state on both nodes, and it has
-carried 75.67 GB of P→D traffic.
+- `ionic_0` and `ionic_1` are **already pulsar**. There is nothing to flash to
+  satisfy this precondition within this project's scope.
+- `ionic_2 .. ionic_7` are **out of scope** (§1.2) — not this project's to flash
+  regardless of personality, and plausibly another tenant's (`AGENTS.md` §1, §2).
 
-Therefore **`p4_program: hydra` is not, by itself, a defect to be remediated
-here.** Do not flash these cards to `pulsar`:
+§2.5.1 is retained **only** as a procedure for the day a card genuinely cannot
+create a UD QP. It is not a recommendation and it is not maintenance.
 
-- flashing is destructive and shared-visible — it drops the co-tenant's traffic
-  on the port as well as ours;
-- the thing it would fix is not currently broken;
-- §2.5.1 is retained **only** as a procedure for the day a card genuinely
-  cannot create a UD QP. It is not a recommendation, and it is not maintenance.
-
-If a future leg-A failure appears, work the order: UD QPs → device names →
-`UCX_NET_DEVICES` pin → `UCX_IB_ROCE_SUBNET_PREFIX_LEN` (§2.3). Reach for
-firmware last, and only with a card proven unused.
+If a leg-A failure appears on `ionic_0`/`ionic_1`, work the order: UD QPs →
+device names → `UCX_NET_DEVICES` pin → `UCX_IB_ROCE_SUBNET_PREFIX_LEN` (§2.3) →
+firmware last. Checking `rdma resource show qp | grep -w UD` first is a fast way
+to rule firmware *out* — but a behavioural pass is **not** a substitute for the
+`p4_program` check, and firmware **is** your blocker on a genuine hydra rail.
 
 Flashing is **destructive and shared-visible**: it takes down the co-tenant's
 traffic on that port as well as ours (`docs/HANDOFF.md`). Flash only cards
@@ -298,7 +313,10 @@ Flashing cards `06:00.0` and `23:00.0` to pulsar `1.130.0-a-149`:
    `/usr/sbin/nicctl-ainic-vulcano-rudra-{pulsar,hydra}`. Once the host holds
    **mixed** flavours, the dispatcher aborts with a misleading
    `no AMD NIC cards detected` / `card discovery failed` — for *every* card,
-   including untouched ones. **Call the backend binary directly** on a mixed host.
+   including untouched ones. That abort is the mixed-host signal. **Call the
+   backend binaries directly — both of them, per §2.5's probe procedure.**
+   Calling only one yields a uniform answer that is the tool's identity, not
+   the cards'.
 4. A freshly flashed card may report `Invalid card handle` to both backends while
    still working perfectly as an RDMA device. Management-plane health and
    data-plane health are independent here; test the data plane before concluding
