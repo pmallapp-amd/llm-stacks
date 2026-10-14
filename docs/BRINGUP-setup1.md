@@ -1,4 +1,4 @@
-# BRINGUP-setup1 — all-in-one vLLM + SPDK, step by step
+# BRINGUP-setup1 — all-in-one vLLM + real-DSC MI210, step by step
 
 Covers **setup-1** only (see [`setups/setup-1.md`](setups/setup-1.md) for the
 topology/host facts this procedure assumes). Everything here runs against
@@ -17,10 +17,17 @@ you go back to TinyLlama).
 | Role | Host | Address |
 |---|---|---|
 | compute (`kv_both`, vLLM) | `yw-dell-gen4-1` | `10.30.48.100` |
-| target (SPDK NVMe-KV) | `yw-dell-gen4-2` | `10.30.48.88` |
 
-Credentials: `creds/setup-1.env` (gitignored). Both hosts: `root` / password
-auth only, no key accepted.
+**This is now a single-host procedure.** `yw-dell-gen4-2` (`10.30.48.88`) was
+used earlier as a `.100`-reachable SPDK target behind `/dev/ng1n1`, confirmed
+safe and working — but that was a stand-in, not the end goal. As of
+2026-10-05 this procedure deploys only against `/dev/ng0n1`, `.100`'s own real
+Pensando DSC NVMe-KV function, with no second host involved. See
+`setup-1/HANDOFF.md` §0-1 for why, and for the incident that resulted
+(`ng0n1` wedged on its first real store — unresolved as of this writing).
+
+Credentials: `creds/setup-1.env` (gitignored). `root` / password auth only, no
+key accepted.
 
 Every command below is run **on the host itself** (ssh in first), not from a
 control machine — `setup-1/build.sh`/`deploy.sh` expect to run locally where
@@ -30,55 +37,29 @@ Docker and the GPU live.
 
 ## 1. Preconditions — confirm before every session, not just the first
 
-These do not survive a reboot of either host. Check them in order; each
-later step assumes the one before it already holds.
+These do not survive a reboot of the host. Check them in order; each later
+step assumes the one before it already holds.
 
-### 1.1 Target listener (`.88`)
-
-```bash
-ssh root@10.30.48.88
-/root/kv_spdk/scripts/rpc.py -s /var/tmp/spdk.sock nvmf_get_subsystems \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d[1]["listen_addresses"], indent=2))'
-```
-
-Expect **two** entries: `1.1.0.2:4420` (the target's own default, unreachable
-from `.100` — see `setup-1.md` §3) and `10.30.48.88:4420` (the one `.100`
-actually uses). If the second one is missing — e.g. after `.88` rebooted and
-`nvmf_tgt` came back fresh — re-add it (additive, does not disturb the
-existing namespace or the other listener):
-
-```bash
-/root/kv_spdk/scripts/rpc.py -s /var/tmp/spdk.sock nvmf_subsystem_add_listener \
-    -t tcp -a 10.30.48.88 -s 4420 nqn.2016-06.io.spdk:cnode1
-```
-
-**Do not** restart, reconfigure further, or kill this `nvmf_tgt` — it predates
-this project's work on the host and its ownership, while usable, was only
-ever confirmed for this one additive change.
-
-### 1.2 Storage connection (`.100`)
+### 1.1 Storage device (`.100`)
 
 ```bash
 ssh root@10.30.48.100
 nvme list-subsys
 ```
 
-Expect `nvme-subsys1` with NQN `nqn.2016-06.io.spdk:cnode1`, state `live`,
-`traddr=10.30.48.88`. If it's absent (reboot, or the kernel dropped the
-session):
+Expect `nvme-subsys0` with NQN `nqn.2019-08.com.pensando:nvm-subsystem-sn-8001-0-0`,
+`nvme0 pcie 0000:1c:00.0`, state **`live`**. If it instead shows `dead`, stop —
+that is the §3.2 wedge, it needs an out-of-band DPU-side restart before
+anything below is actionable (see `setup-1/HANDOFF.md` §0). Don't retry a
+deploy against a `dead` subsystem; nothing host-side clears it.
 
-```bash
-nvme connect -t tcp -a 10.30.48.88 -s 4420 -n nqn.2016-06.io.spdk:cnode1
-nvme list   # confirm a new /dev/ngXnY appears — see the note below
-```
+If `/dev/ng0n1` is simply **absent** (not `dead`, just not there — e.g. right
+after a host reboot, before the DPU side has come up): this is a known boot
+race, not a defect — retry `nvme list-subsys` after a short wait, or see the
+per-boot rebind procedure in the main project's `docs/HANDOFF.md` §3.4 (same
+underlying hardware class, same race).
 
-**The device index is not stable.** `/dev/ng0n1` is always `.100`'s own local,
-directly-attached Pensando DSC function (`nvme-subsys0`, PCIe `0000:1c:00.0`)
-— never hand that one to `AIC_XNVME_DEV`, it is a different device entirely.
-The one you want is whichever new `/dev/ngXnY` just appeared under
-`nvme-subsys1` — confirm with `nvme list-subsys` rather than assuming `ng1n1`.
-
-### 1.3 GPU driver (`.100`)
+### 1.2 GPU driver (`.100`)
 
 ```bash
 rocm-smi --showid
@@ -93,13 +74,17 @@ modprobe amdgpu
 rocm-smi --showid   # expect: AMD Instinct MI210
 ```
 
-### 1.4 Image built (`.100`)
+### 1.3 Image built (`.100`)
 
 ```bash
 docker images | grep rocm-aic
 ```
 
-If `rocm-aic:latest` is absent, build it — see §2. If present, skip to §3.
+If `rocm-aic:latest` is absent, build it — see §2. If present, **check
+whether it predates the 2026-10-05 patch surgery** (`setup-1/HANDOFF.md` §2 —
+dropped `SPDK_NVMe_KV`/MP-mode patches) before trusting it's the trimmed
+build; the image on `.100` as of this writing still predates that surgery.
+If present and known-current, skip to §3.
 
 ---
 
@@ -115,9 +100,12 @@ ROCM_ARCH=gfx90a bash build.sh
 the setup-3/setup-4 clusters this repo's main `scripts/` tree targets).
 
 Takes roughly 15–25 minutes cold (vendors `ROCm/rocm-aic` fresh, applies
-`patches/`, builds SPDK + stages the two NIXL plugins + builds the full
+`patches/`, stages and builds the `XNVME_KV` NIXL plugin + builds the full
 vLLM/LMCache/NIXL image). Rerunning is fast — the vendor checkout and Docker
-layer cache are both reused when nothing changed.
+layer cache are both reused when nothing changed. (Historical: before
+2026-10-05 this also built an `SPDK_NVMe_KV` plugin from a from-source SPDK
+checkout — dropped, see `setup-1/HANDOFF.md` §2. The image currently on
+`.100` predates that change and hasn't been rebuilt since.)
 
 **Known one-time snag:** the vendored `docker-compose.yml` expects
 `/opt/pip-cache/wheels` to exist as a bind-mount source, even though nothing
@@ -151,15 +139,13 @@ BACKEND=xnvme \
 MODE=inprocess \
 GPU=0 \
 TENSOR_PARALLEL_SIZE=1 \
-AIC_XNVME_DEV=/dev/ng1n1 \
+AIC_XNVME_DEV=/dev/ng0n1 \
 MODEL=Qwen/Qwen2.5-3B-Instruct \
 HF_TOKEN=none \
 IMAGE_REF=rocm-aic:latest \
 AIC_CHUNK_SIZE=16 \
 bash deploy.sh
 ```
-
-Replace `/dev/ng1n1` with whatever §1.2 actually showed if it differs.
 
 **`GPU=0 TENSOR_PARALLEL_SIZE=1` are not optional here, and are not
 `deploy.sh`'s defaults.** `deploy.sh`'s in-process-mode branch defaults to
@@ -170,26 +156,23 @@ devices` for every rank past 0, and the container exits before ever touching
 the storage backend (safe to retry — nothing reached NIXL/XNVME init yet at
 that point).
 
-**`AIC_CHUNK_SIZE=16` is likewise not optional for this model, and is not
-`deploy.sh`'s default (unset → LMCache's own default of 256).** At the
-default chunk size, Qwen2.5-3B-Instruct's KV shape makes each stored object
-~9 MiB — and `nvme1`'s negotiated kernel transfer ceiling
-(`/sys/class/nvme/nvme1/queue/max_hw_sectors_kb`, confirmed via
-`nvme list-subsys` + that path) is **1024 KB**. Every store past that ceiling
-fails, but fails **silently from LMCache's point of view**: the container log
-shows `[XNVME_KV] op=store ... t=complete ok=0 sct=7 sc=234` immediately
-followed by `getXferStatus: backend 'XNVME_KV' returned error status
-NIXL_ERR_BACKEND`, while LMCache's own line right next to it still reads
-`Stored 2048 out of total 2048 tokens` — it does not surface the failure as
-one. Nothing about serving breaks (generation is unaffected; this is purely
-the storage side-channel), so this is easy to miss entirely unless you grep
-the container log specifically for `NIXL_ERR` after deploying. `AIC_CHUNK_SIZE=16`
-keeps each object at 576 KiB, safely under the 1 MiB ceiling — confirmed by
-the same log line reading `ok=1 sct=0 sc=0` afterward. See §3.3 for the
-general form of this problem (`setup-1/README.md` documents the identical
-failure shape on Qwen2.5-72B at TP=4, a different chunk size, same root
-cause: object size vs. the governing transfer ceiling for whichever plugin
-you're on).
+**🔴 `AIC_CHUNK_SIZE=16` is NOT a validated value for `/dev/ng0n1`.** It was
+carried over from testing against the now-retired `/dev/ng1n1` (a kernel
+`nvme_tcp` path to a RAM-backed target), where it was confirmed safe. Against
+the real DSC (`ng0n1`), this exact value wedged the device on its very first
+real store — see `setup-1/HANDOFF.md` §0 for the full incident and why this
+isn't just "pick a smaller number": the real DSC's failure mode is a
+**transfer-time ceiling** (the write apparently takes longer than the
+kernel's own I/O timeout), not the sector-count ceiling the old `ng1n1`
+reasoning below assumed. Read HANDOFF §0 before deploying against `ng0n1`
+again, and do not treat anything below this point as "the known-good
+config" until that's resolved.
+
+The paragraph that used to be here described `ng1n1`'s specific
+`max_hw_sectors_kb=1024` ceiling and why `AIC_CHUNK_SIZE=16` (576 KiB/chunk)
+stayed under it. That reasoning is preserved as a pattern reference in
+`setup-1/HANDOFF.md` §4.3, but it's for a device this setup no longer uses —
+don't apply its numbers to `ng0n1`.
 
 `HF_TOKEN=none` is the explicit "public model, no auth needed" spelling
 `deploy.sh` wants — `Qwen/Qwen2.5-3B-Instruct` is public. First run against
@@ -212,7 +195,7 @@ Expect `READY after <N>s` and a one-line smoke-test completion, then:
 ```
 containers : aic-xnvme-single
 endpoint   : http://127.0.0.1:8301/v1
-stack      : vLLM -> LMCacheConnectorV1 (in-process) -> NixlStorageBackend -> XNVME_KV -> /dev/ng1n1
+stack      : vLLM -> LMCacheConnectorV1 (in-process) -> NixlStorageBackend -> XNVME_KV -> /dev/ng0n1
 ```
 
 ### 3.1 Confirm the storage backend actually came up
@@ -224,68 +207,37 @@ docker logs aic-xnvme-single 2>&1 | grep -iE "nixl|xnvme"
 Expect, among other lines:
 
 ```
-[XNVME_KV] 1 queue(s) ready on /dev/ng1n1 (nsid=1), lookup=KV Exist
+[XNVME_KV] 1 queue(s) ready on /dev/ng0n1 (nsid=1), lookup=KV Exist
 NIXL INFO    _api.py:390 Backend XNVME_KV was instantiated
 LMCache INFO: Created backend: NixlStorageBackend (NixlStaticStorageBackend)
 ```
 
+**Then immediately check `dmesg` and the container log for a timeout before
+doing anything else** — see §3.2. The backend coming up clean does not mean a
+store will succeed; the 2026-10-05 incident's smoke test passed this exact
+check before wedging the device on its first real store.
+
 ### 3.2 ⚠️ Safety — read before doing anything else to this container
 
-**Never `docker kill`/`docker stop`/`timeout`-wrap a container actually
-driving the real Pensando DSC NVMe-KV function once it's up.** Doing so can
-wedge the device's `CC.EN`/`CSTS.RDY` handshake with no clean recovery short
-of restarting the DPU-side app from the device's own management console —
-nothing host-side (rescan, FLR, a script re-run) clears it. `deploy.sh`'s own
-banner prints `category: 1 (real NVMe-KV device)` for **any** `AIC_XNVME_DEV`
-matching the `/dev/ngXnY` naming convention — it cannot tell from the device
-path alone whether real silicon or a RAM-backed stand-in is actually behind
-it, so treat that banner line as unverified and check §3.3 before deciding
-how careful to be with a given container.
+**Never `docker kill`/`docker stop`/`timeout`-wrap this container.** It is
+always driving the real Pensando DSC NVMe-KV function — `/dev/ng0n1` is the
+only device this procedure deploys against (§0). Doing so can wedge the
+device's `CC.EN`/`CSTS.RDY` handshake with no clean recovery short of
+restarting the DPU-side app from the device's own management console —
+nothing host-side (rescan, FLR, a script re-run) clears it.
+
+**This is not only a `docker kill` risk.** On 2026-10-05, `ng0n1` wedged from
+**normal operation** — a single real store at `AIC_CHUNK_SIZE=16` (576 KiB)
+took longer than the kernel's own NVMe I/O timeout, which triggered a kernel
+controller reset (a layer `deploy.sh`/the plugin don't control), and that
+reset is what actually failed and disabled the device. See
+`setup-1/HANDOFF.md` §0 for the full timeline — **after any store, check
+`dmesg` for `nvme0: ... timeout` before assuming success**, don't rely on the
+container log alone.
 
 The `docker rm -f` that `deploy.sh` itself does on a redeploy is the one
 sanctioned exception to "never kill", and only against an otherwise-idle
 container (see §3 above).
-
-### 3.3 Which device is actually behind `AIC_XNVME_DEV` — and why it changes
-the blast radius
-
-`.100` has **two** `/dev/ngXnY` devices, and they are architecturally nothing
-alike:
-
-- **`/dev/ng0n1`** — `.100`'s own real Pensando DSC function, PCIe
-  `0000:1c:00.0`. The host kernel sees this as a **plain local PCIe NVMe
-  controller** (`nvme-subsys0 ... nvme0 pcie 0000:1c:00.0` — `nvme.ko` over
-  PCIe, no `nvme_tcp`, no fabrics module, no network stack on the host side at
-  all). Whatever the DSC does internally to actually service that namespace —
-  talk to onboard flash, proxy it over the DSC's own network ports to some
-  backend — happens entirely inside the DPU's firmware/ASIC and is invisible
-  to `.100`'s OS. **This is the device the "never kill" warning above is
-  actually about.**
-- **`/dev/ng1n1`** — what this procedure deploys against. There is **no DSC
-  in this path at all**: `nvme connect` (§1.2) had the host's own kernel speak
-  `nvme_tcp` in plain software, over the ordinary management NIC, straight to
-  `.88`'s SPDK target process (`nvme-subsys1 ... nvme1 tcp
-  traddr=10.30.48.88`), which is itself backed by SPDK's RAM-only
-  `bdev_kvmalloc` (confirmed via `bdev_get_bdevs` on `.88` —
-  `"product_name": "KVMalloc disk"`), not any Pensando silicon. Killing a
-  container using *this* device cannot wedge DSC firmware, because there is
-  no DSC anywhere in the data path — worst case is a dropped TCP session and
-  an `nvme reconnect`.
-
-This also explains §3's `sct=7 sc=234` failure precisely: that status comes
-from the **host kernel's** `nvme_tcp` software queue
-(`/sys/class/nvme/nvme1/queue/max_hw_sectors_kb`), not from any DSC hardware
-limit — a constraint that is specific to `/dev/ng1n1`'s path and says nothing
-about what `/dev/ng0n1`'s real ceiling is (that one is whatever the DSC's own
-PCIe NVMe controller advertises, a separate and unmeasured number).
-
-**If you redeploy against `/dev/ng0n1` instead** (the real device, no `.88`
-dependency, no kernel NVMe-oF involved at all) — `BACKEND=xnvme
-AIC_XNVME_DEV=/dev/ng0n1`, dropping the `nvme connect` precondition in §1.2
-entirely — the "never kill" warning in §3.2 is the one that actually applies,
-in full, and `AIC_CHUNK_SIZE`'s correct value would need re-deriving against
-whatever that controller's own MDTS/transfer ceiling turns out to be, not the
-1024 KB measured here.
 
 ---
 

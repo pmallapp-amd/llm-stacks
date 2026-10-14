@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kv-cache <noreply@localhost>
 Date: Mon, 17 Sep 2001 00:00:00 +0000
-Subject: [PATCH] lmcache: accept SPDK_NVMe_KV and XNVME_KV in nixl_storage_backend
+Subject: [PATCH] lmcache: accept XNVME_KV in nixl_storage_backend
 
 Carried out-of-tree. See README.md.
 ---
@@ -12,7 +12,7 @@ Carried out-of-tree. See README.md.
      def validate_nixl_backend(backend: str, device: str) -> bool:
          device = device.split(":", 1)[0]
 -        if backend in ("GDS", "GDS_MT", "OBJ", "AIS_MT"):
-+        if backend in ("GDS", "GDS_MT", "OBJ", "AIS_MT", "SPDK_NVMe_KV", "XNVME_KV"):
++        if backend in ("GDS", "GDS_MT", "OBJ", "AIS_MT", "XNVME_KV"):
              return device == "cpu" or device == "cuda"
          elif backend in ("POSIX", "HF3FS", "AZURE_BLOB", "DOCA_MEMOS"):
              return device == "cpu"
@@ -21,7 +21,7 @@ Carried out-of-tree. See README.md.
          )
 
 -        if backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS"):
-+        if backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS", "SPDK_NVMe_KV", "XNVME_KV"):
++        if backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS", "XNVME_KV"):
              self.mem_type = "OBJ"
          else:
              self.mem_type = "FILE"
@@ -30,7 +30,7 @@ Carried out-of-tree. See README.md.
              )
              return NixlFilePool(size, sharder, use_direct_io, slot_size)
 -        elif backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS"):
-+        elif backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS", "SPDK_NVMe_KV", "XNVME_KV"):
++        elif backend in ("OBJ", "AZURE_BLOB", "DOCA_MEMOS", "XNVME_KV"):
              return NixlObjectPool(size, b128=(backend == "DOCA_MEMOS"))
          else:
              raise ValueError(f"Unsupported NIXL backend: {backend}")

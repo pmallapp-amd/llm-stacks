@@ -1,9 +1,21 @@
-# setup-1 — all-in-one vLLM + SPDK (the real-DSC MI210 pair)
+# setup-1 — all-in-one vLLM + real-DSC MI210
 
 **Not part of the P+D disaggregated stack this repo otherwise documents.**
 setup-1 is a single compute node running vLLM `kv_both` (prefill AND decode in
-one process — no disaggregation) against a key-addressed NVMe-KV storage tier,
-plus an independent SPDK NVMe-KV target. The scripts live entirely under
+one process — no disaggregation) against a key-addressed NVMe-KV storage tier
+— `.100`'s own real Pensando DSC NVMe-KV function (`/dev/ng0n1`), no second
+host involved. (Historical: earlier sessions also used `yw-dell-gen4-2`
+(`10.30.48.88`, §2 below) as an independent SPDK NVMe-KV target behind
+`/dev/ng1n1` — retired 2026-10-05, see `setup-1/HANDOFF.md` §1. §2-4 below are
+kept for the host facts, which are still true, but `.88` is no longer part of
+this setup's deploy path.)
+
+**🔴 `/dev/ng0n1` is currently wedged (`dead` per `nvme list-subsys`), as of
+2026-10-05.** It needs an out-of-band DPU-side restart before any deploy
+against it is actionable — see `setup-1/HANDOFF.md` §0 for the incident and
+current status.
+
+The scripts live entirely under
 [`../../setup-1/`](../../setup-1/) — a standalone extraction of `ROCm/rocm-aic`
 plus two out-of-tree NIXL storage plugins (`setup-1/plugins/`) and a patch
 series (`setup-1/patches/`). **Nothing under `setup-1/` is wired into
@@ -88,24 +100,32 @@ set <if> down`).
 would need a second listener bound to `10.30.48.88:4420` (or the existing one
 re-pointed) to be reachable from `.100` over that path — not yet done; see §4.
 
-## 4. Open items before a real two-host launch
+## 4. Status (superseded the original "open items" list below)
 
-1. **Confirm ownership of `.88`'s running `nvmf_tgt`** before touching it at
-   all (RPC listener add, restart, or kill).
+All of the below was resolved during the 2026-10-05 session: `.88`'s
+`nvmf_tgt` ownership was conversationally confirmed (an additive
+`10.30.48.88:4420` listener was added, non-disruptively), `.100` connected to
+it as `/dev/ng1n1` and ran successfully (confirmed `ok=1 sct=0 sc=0` stores),
+and `rocm-aic:latest` was built on `.100`. Then the deploy was deliberately
+switched to `/dev/ng0n1` (`.100`'s own real DSC, the actual end-goal
+hardware, no `.88` dependency) — and that wedged the device on its first real
+store. **Current status, and what to do next, is entirely in
+`setup-1/HANDOFF.md` §0-1** — this section is kept only as a historical
+record of the original plan, not as a current task list.
+
+<details>
+<summary>Original "open items" list (2026-10-04, pre-session) — resolved, kept for history</summary>
+
+1. Confirm ownership of `.88`'s running `nvmf_tgt` before touching it at all
+   (RPC listener add, restart, or kill).
 2. If it's ours: add a `10.30.48.88:4420` TCP listener via
-   `nvmf_subsystem_add_listener` (non-disruptive, additive — does not touch the
-   existing namespace or the `1.1.0.2` listener), then from `.100`:
-   `nvme connect -t tcp -a 10.30.48.88 -s 4420 -n nqn.2016-06.io.spdk:cnode1`
-   — expect a **new** char device (`/dev/ng1n1`, since `/dev/ng0n1` is already
-   `.100`'s own local DSC function) and use that as `AIC_XNVME_DEV` for
-   `setup-1/deploy.sh BACKEND=xnvme`.
-3. If it's not ours, or you'd rather not depend on `.88` at all: `.100` is
-   fully capable of an **all-in-one, single-host** deploy on its own —
-   `setup-1/target.sh` (loopback SPDK target) + `setup-1/deploy.sh
-   BACKEND=spdk MODE=mp` is the combination `setup-1/README.md`'s Status table
-   marks **verified end-to-end**, or `setup-1/deploy.sh BACKEND=xnvme
-   AIC_XNVME_DEV=/dev/ng0n1` drives `.100`'s own real DSC function directly,
-   no second host involved at all.
-4. Neither host has `setup-1/build.sh` run on it yet — no `rocm-aic:latest`
-   image exists on either. First build needs internet egress (clones
-   `ROCm/rocm-aic` fresh) and is the long pole before any deploy.
+   `nvmf_subsystem_add_listener` (non-disruptive, additive), then from
+   `.100`: `nvme connect -t tcp -a 10.30.48.88 -s 4420 -n
+   nqn.2016-06.io.spdk:cnode1` — expect a new char device (`/dev/ng1n1`) and
+   use that as `AIC_XNVME_DEV`.
+3. If not: `.100` is fully capable of an all-in-one, single-host deploy on
+   its own — `BACKEND=xnvme AIC_XNVME_DEV=/dev/ng0n1` drives `.100`'s own
+   real DSC function directly, no second host involved at all.
+4. Neither host has `setup-1/build.sh` run on it yet.
+
+</details>

@@ -1,7 +1,7 @@
 # Handoff — setup-1 (all-in-one vLLM + SPDK, real-DSC MI210 pair)
 
 State of the setup-1 bring-up, for whoever picks this up next. Last updated
-2026-10-05.
+2026-10-05 (late session).
 
 Read [`../docs/setups/setup-1.md`](../docs/setups/setup-1.md) for the host
 inventory/topology and [`../docs/BRINGUP-setup1.md`](../docs/BRINGUP-setup1.md)
@@ -13,34 +13,170 @@ Nothing here touches `scripts/`, `config/cluster.env`, or `creds/active.env`.
 
 ---
 
+## 0. 🔴 `/dev/ng0n1` (the real DSC) is currently DEAD — recovery not attempted
+
+**Read this before touching `.100` at all.** Late in the 2026-10-05 session,
+setup-1 was deliberately switched from `/dev/ng1n1` (a kernel `nvme_tcp`
+software path to `.88`'s RAM-backed SPDK target — see §4.4's old entry, now
+historical) to `/dev/ng0n1` — `.100`'s own real Pensando DSC NVMe-KV function,
+the actual category-(1) end-goal hardware. The **very first real store**
+against it wedged the device:
+
+```
+13:18:26  nvme0: I/O tag 320/321 timeout, aborting req_op:DRV_OUT size:589824   (576 KiB — AIC_CHUNK_SIZE=16)
+13:18:56  nvme0: I/O tag 320 timeout, reset controller
+13:22:05  nvme0: Device not ready; aborting reset, CSTS=0x1    (repeats at 13:24:13, 13:26:21)
+13:26:21  nvme0: Disabling device after reset failure: -19
+```
+
+`nvme list-subsys` now shows `nvme0 pcie 0000:1c:00.0 dead`. The container's
+own plugin log caught it in real time:
+
+```
+[XNVME_KV] ...xnvme_kv_backend.cpp:407: queue made no forward progress for 30s: 0 op(s) queued, 2 in flight.
+The device has stopped completing I/O; this is NOT the transient queue-full condition. No device
+reset is attempted: on the Pensando DSC only an out-of-band DPU-side restart recovers this, and
+host-side resets make it worse.
+```
+
+So: the plugin itself refuses to reset on purpose, but the **kernel's own**
+NVMe timeout handler doesn't know that and reset it anyway — and that reset is
+what actually wedged it. This is the same failure class the P+D disaggregated
+stack's own `docs/HANDOFF.md` hit on smc1/smc2 (both "followed sustained write
+load"), except here it took a single 576 KiB store, not sustained load.
+
+**Recovery has NOT been attempted.** `creds/setup-1.env` lists
+`COMPUTE_DSC_CONSOLE="telnet 10.30.15.122 2031"` (alt `2032`) but that's a bare
+address — no login, no command sequence is documented anywhere in this repo
+for *this* console, and the project's own precedent for this exact failure
+(`docs/HANDOFF.md` §0, TODO 6.22) says it needs **the hardware owner**, not a
+host-side script. Guessing at commands on a DPU firmware console with no way
+to verify them first is not something to do unsupervised. **Whoever has that
+access needs to restart the DPU-side app before anything below involving
+`ng0n1` is actionable again.**
+
+The container (`aic-xnvme-single`) is still `docker ps` `Up` and
+`/health` still returns `200` — generation is unaffected (GPU-only), but KV
+offload via `ng0n1` is dead until the DPU side is restarted.
+
+**Before trying again once it's back:** `AIC_CHUNK_SIZE=16` (576 KiB/chunk)
+was carried over unchanged from the `ng1n1` config on the assumption that
+`ng0n1`'s larger queue limits (`max_hw_sectors_kb=2048`,
+`max_sectors_kb=1280`, both measured higher than `ng1n1`'s) meant it was
+*more* headroom, not less. That assumption was wrong — the real DSC's
+**failure mode isn't a sector-count ceiling, it's a transfer-time ceiling**:
+whatever the DSC does internally to service a 576 KiB write apparently takes
+longer than the kernel's own I/O timeout (the default is 30s, and the
+timeout-to-reset gap above is consistent with that). This is a fundamentally
+different constraint than §4.3's old `max_hw_sectors_kb` story, which was
+about `ng1n1`'s kernel queue only. Don't reuse that section's arithmetic here
+— it answers a question the real DSC isn't asking. **Nothing in this repo
+has yet measured what single-value size (if any) `ng0n1` can actually
+service before a kernel-level timeout fires.** That has to be determined
+empirically, in small steps, once the device is back — and whether it's
+viable to raise the kernel's own nvme I/O timeout (`io_timeout`,
+`/sys/class/nvme/nvme0/...`) before testing again is an open question, not
+yet investigated.
+
+---
+
 ## 1. Current state (2026-10-05, end of session)
 
-A container is **live right now** on `.100` (`10.30.48.100`):
+A container is **live right now** on `.100` (`10.30.48.100`), serving
+generation but with KV-offload storage dead per §0:
 
 | | |
 |---|---|
 | container | `aic-xnvme-single` |
 | endpoint | `http://127.0.0.1:8301/v1` (and `http://10.30.48.100:8301/v1` externally) |
 | model | `Qwen/Qwen2.5-3B-Instruct` |
-| stack | vLLM 0.26.0 → `LMCacheConnectorV1` (in-process) → `NixlStorageBackend` → `XNVME_KV` → `/dev/ng1n1` |
+| stack | vLLM 0.26.0 → `LMCacheConnectorV1` (in-process) → `NixlStorageBackend` → `XNVME_KV` → `/dev/ng0n1` |
 | GPU | MI210, `GPU=0`, `TENSOR_PARALLEL_SIZE=1` |
-| chunk size | `AIC_CHUNK_SIZE=16` (see §3 — **not** the default) |
-| KV storage, confirmed working | yes — forced-store test shows `ok=1 sct=0 sc=0` in the container log |
+| chunk size | `AIC_CHUNK_SIZE=16` — carried over from the `ng1n1` config; **not validated against ng0n1**, see §0 |
+| KV storage | **dead** — see §0. Device disabled by the kernel after the first real store |
 
-`.88`'s target (`10.30.48.88`, pre-existing `nvmf_tgt`, confirmed in-session
-as safe to use) has an **additive** listener on `10.30.48.88:4420` alongside
-its original `1.1.0.2:4420` one. `.100` is connected via kernel `nvme_tcp`
-(`nvme-subsys1`, `/dev/ng1n1`). Image `rocm-aic:latest` (43.6 GB) is built on
-`.100`.
+**`/dev/ng1n1` and the `.88` target dependency have been fully retired from
+this setup.** Earlier in this session, setup-1 ran against `/dev/ng1n1` — a
+kernel `nvme_tcp` connection to `.88`'s RAM-backed (`bdev_kvmalloc`) SPDK
+target, confirmed safe to kill, confirmed working (`ok=1 sct=0 sc=0` stores) —
+but that was explicitly a stand-in, not the end goal. This session switched
+the deployment, the build (`patches/`, `build.sh`), and these docs over to
+`/dev/ng0n1` only:
 
-**This is a real, working deployment — not a dry run.** Treat `aic-xnvme-single`
-as something to extend, not something to casually `docker rm -f` and
-re-create, unless you're intentionally redeploying (which is a sanctioned,
-normal operation — see `BRINGUP-setup1.md` §3).
+- `.88`'s SPDK target, its additive `10.30.48.88:4420` listener, and `.100`'s
+  `nvme connect` to it are **no longer part of this setup**. `.88` is
+  untouched (the listener it already had is still there, harmless, just
+  unused) — see `docs/setups/setup-1.md` §2 for what's still true about that
+  host if this setup ever goes back to it.
+- The `SPDK_NVMe_KV` NIXL plugin, the from-source SPDK build, and the 4
+  `*-spdk-*.patch` KV-command-set patches are **removed from the build
+  entirely** (not just undeployed) — see §2.
 
 ---
 
-## 2. How to resume
+## 2. Patches/build.sh surgery (2026-10-05)
+
+`setup-1/patches/` dropped from 13 files to 4. Removed:
+
+| Patch | Why removed |
+|---|---|
+| `0001-0004-spdk-*.patch` | SPDK KV-command-set diffs — only needed to build `target.sh`/`SPDK_NVMe_KV`, which this setup no longer uses at all |
+| `0006-lmcache-l2-adapter-kv-backends.patch`, `0007-lmcache-l2-adapter-value-size-split.patch` | `MODE=mp`-only (`nixl_store_l2_adapter.py`, the standalone `lmcache server` path) — setup-1 only ever runs `MODE=inprocess` |
+| `0010/0011-*-guard-mp-connector-num-external-tokens.patch` | `LMCacheMPConnector`-specific, same `MODE=mp`-only reasoning |
+| `0012-rocm-aic-dockerfile-ionic-provider-and-router.patch` | RDMA (`libionic1`) + `vllm-router`, both exclusively for the MP-mode P/D architecture. Removing this also **drops the `AINIC_DEB_REPO` hard dependency** from `build.sh` — one fewer thing a future rebuild needs present on the host |
+
+Kept and edited:
+
+- **`0005-rocm-aic-dockerfile-build-plugins.patch`** — rewritten to build only
+  the `XNVME_KV` plugin (libxnvme + Abseil), with the `SPDK_NVMe_KV` build
+  block (from-source SPDK checkout, `prepare-spdk-libs.sh`, the
+  `spdk-host-patches/*.diff` staging and its hard-fail check) removed
+  entirely. **Validated by round-trip**: applied the original patch to a
+  fresh `rocm-aic@bb386562` checkout, hand-edited the resulting
+  `docker/Dockerfile`, regenerated the patch via `git diff` (so line counts
+  are derived, not hand-computed), then confirmed the new patch re-applies
+  cleanly to a pristine checkout.
+- **`0008-lmcache-nixl-storage-backend-kv.patch`** — trimmed the dead
+  `SPDK_NVMe_KV` entries out of its three backend-allowlist edits; `XNVME_KV`
+  entries untouched.
+
+Kept, unedited (both are backend/mode-agnostic):
+
+- `0009-lmcache-fused-kv-plane-count.patch` — the KV-plane correctness fix,
+  "every backend on this path was corrupt" before this.
+- `0013-vllm-do-not-assert-on-late-transfer-completion.patch` — general vLLM
+  scheduler robustness fix for async KV-transfer completions; not MP-mode- or
+  SPDK-specific, reproduced on a P/D pair but applies to the vLLM core
+  regardless of mode, kept defensively.
+
+`build.sh` updated to match: no more `spdk-host-patches/` staging, no more
+`d -eq 4` hard-fail check, no more `nvme-kv-plugin` copy, and the whole
+"3b/4: stage the ionic userspace verbs provider" block (and its
+`AINIC_DEB_REPO` requirement) is gone. `plugins/nvme-kv/` (the `SPDK_NVMe_KV`
+plugin source) is left on disk, untouched, just no longer staged or built —
+it's source of truth per `setup-1/README.md`, not ours to delete outright.
+
+**Full pipeline validated with `SKIP_BUILD=1` against a fresh vendor checkout**
+(vendor + patch + stage, no Docker build) — applied cleanly, staged
+`xnvme-kv-plugin/` only, no leftover `nvme-kv-plugin`/`spdk-host-patches`/
+`libionic`/`vllm-router`/`ainic` references anywhere in the resulting
+`docker/Dockerfile`. **Not yet validated with an actual `make build`** — that
+takes 15-25 minutes and wasn't run this session; the existing `rocm-aic:latest`
+image on `.100` predates this patch surgery (built from the old 13-patch
+series) and is what `aic-xnvme-single` is still running. A future rebuild on
+`.100` is the first real test of the trimmed Dockerfile under Docker itself,
+not just `git apply --check`.
+
+`setup-1/README.md` still documents the old 3-backend-and-mode-inclusive
+picture (SPDK_NVMe_KV, MP mode, ionic/RDMA) — that's the general rocm-aic
+track writeup, not setup-1-specific, and was not rewritten this session. Treat
+its SPDK_NVMe_KV/MP-mode sections as describing a configuration this setup no
+longer builds, not as a factual description of what's in `rocm-aic:latest`
+going forward.
+
+---
+
+## 3. How to resume
 
 ```bash
 ssh root@10.30.48.100   # root/docker, see ../creds/setup-1.env
@@ -48,38 +184,16 @@ docker ps --filter name=aic-xnvme-single
 curl -s http://127.0.0.1:8301/health
 ```
 
-If the container is gone (host rebooted, etc.) — redo
-`docs/BRINGUP-setup1.md` §1 (preconditions: `.88` listener, `.100`'s
-`nvme connect`, `amdgpu` modprobe) **in order**, then §3 (deploy) with
-`AIC_CHUNK_SIZE=16` included. Nothing here survives a reboot of either host —
-§1 is a checklist, not a one-time setup.
+**Before doing anything with the device:** confirm `/dev/ng0n1` is actually
+back (`nvme list-subsys` should show `nvme0 ... live`, not `dead`) — that
+requires the DPU-side restart in §0, which has not happened as of this
+writing. Don't retry a deploy against a device subsystem still showing
+`dead`; nothing host-side will fix it and repeated attempts don't help.
 
----
-
-## 3. Known-good config — don't rediscover these the hard way
-
-This exact combination of overrides was arrived at by hitting each default's
-failure mode once this session. All of them are **non-default** for
-`deploy.sh`, which was written for the 8-GPU setup-3/setup-4 nodes, not a
-single-MI210 box:
-
-```bash
-BACKEND=xnvme
-MODE=inprocess
-GPU=0                              # default: 0,1,...,7 — wrong, only 1 GPU here
-TENSOR_PARALLEL_SIZE=1             # default: 8 — same reason
-AIC_XNVME_DEV=/dev/ng1n1           # the .88-backed device, NOT /dev/ng0n1 (see §4.4)
-AIC_CHUNK_SIZE=16                  # default: 256 (LMCache's) — overflows nvme1's
-                                    # 1 MiB kernel transfer ceiling for anything
-                                    # bigger than TinyLlama; see §4.3
-MODEL=Qwen/Qwen2.5-3B-Instruct
-HF_TOKEN=none                      # public model, explicit "no auth" spelling
-IMAGE_REF=rocm-aic:latest
-```
-
-If you change the **model**, re-check `AIC_CHUNK_SIZE` — it's a function of
-the model's KV shape (layers × kv_heads × head_size), not a universal
-constant. §4.3 has the arithmetic.
+Once it's confirmed live: redeploy per `docs/BRINGUP-setup1.md` §3, but
+**do not reuse `AIC_CHUNK_SIZE=16` blindly** — see §0's last paragraph. Start
+smaller than 576 KiB and work up, watching `dmesg` for I/O timeouts after
+every single store, not just the aggregate smoke test result.
 
 ---
 
@@ -88,10 +202,11 @@ constant. §4.3 has the arithmetic.
 ### 4.1 `deploy.sh` in-process mode defaults to an 8-GPU host
 
 `GPU=0,1,...,7` / `TENSOR_PARALLEL_SIZE=8` are the unconditional defaults in
-the in-process branch, regardless of `PD_ROLE`. Omitting the overrides in §3
-produces `AssertionError: DP adjusted local rank N is out of bounds for 1
-devices` for ranks 1–7 — happens during GPU worker init, before NIXL/storage
-is ever touched, so it's safe to just retry with the right env.
+the in-process branch, regardless of `PD_ROLE`. Omitting `GPU=0
+TENSOR_PARALLEL_SIZE=1` produces `AssertionError: DP adjusted local rank N is
+out of bounds for 1 devices` for ranks 1–7 — happens during GPU worker init,
+before NIXL/storage is ever touched, so it's safe to just retry with the
+right env.
 
 ### 4.2 `build.sh`'s compose step needs `/opt/pip-cache/wheels` to exist
 
@@ -99,104 +214,76 @@ Even though nothing needs to be in it. Symptom: `failed to get build context
 pip-wheels: stat /opt/pip-cache/wheels: no such file or directory`. Fix:
 `mkdir -p /opt/pip-cache/wheels`, then re-run the `docker compose ... build`
 command `build.sh` printed — **with `ROCM_ARCH` still exported**, or it fails
-later and more confusingly on `ROCM_ARCH is not set` (this cost one full
-extra build cycle in-session: dropped `ROCM_ARCH` copying the resumed command
-by hand).
+later and more confusingly on `ROCM_ARCH is not set`.
 
-### 4.3 Silent KV-store failures: `sct=7 sc=234` / `NIXL_ERR_BACKEND`
+### 4.3 (historical) `ng1n1`'s kernel queue ceiling — does NOT apply to `ng0n1`
 
-At LMCache's default `chunk_size=256`, Qwen2.5-3B-Instruct's KV chunks are
-~9 MiB. `.100`'s `nvme1` (the kernel `nvme_tcp` connection to `.88`) has a
-negotiated `max_hw_sectors_kb` of **1024** (1 MiB) —
-`/sys/class/nvme/nvme1/queue/max_hw_sectors_kb`. Every store past that
-ceiling fails, and **fails silently as far as LMCache's own log line is
-concerned** — `[XNVME_KV] op=store ... t=complete ok=0 sct=7 sc=234` and
-`getXferStatus: ... NIXL_ERR_BACKEND` appear right next to a LMCache line
-still claiming `Stored 2048 out of total 2048 tokens`. Generation is
-unaffected (this is purely the storage side-channel), so **this does not
-show up as a user-visible failure at all** — the only way to catch it is
-grepping the container log for `NIXL_ERR` after deploying, which is not
-something `deploy.sh`'s own health check does.
+This entire section described `/dev/ng1n1`'s (the retired `.88`-backed kernel
+`nvme_tcp` path) `max_hw_sectors_kb=1024` ceiling and the `AIC_CHUNK_SIZE=16`
+fix for it. **Kept only as a pattern reference** — the general shape
+(chunk byte size = `layers * chunk_size * (kv_heads/TP) * head_size * 4`,
+checked against whichever ceiling governs your path) is still correct
+methodology, but the specific numbers were for a device this setup no longer
+uses, and §0 shows `ng0n1`'s actual failure mode isn't even the same kind of
+ceiling (transfer-time, not sector-count). Do not carry `AIC_CHUNK_SIZE=16`
+forward as "the validated value" — it was validated for `ng1n1` only, and
+§0's incident is exactly what happened when that assumption was carried to
+`ng0n1` unchecked.
 
-Fix: `AIC_CHUNK_SIZE=16` → 576 KiB/chunk, confirmed via the same log line
-reading `ok=1 sct=0 sc=0` afterward. The general rule, from `setup-1/README.md`'s
-own description of the same bug class on Qwen2.5-72B at TP=4 (different chunk
-size, same root cause): chunk byte size is
-`layers * chunk_size * (kv_heads/TP) * head_size * 4`, and it must stay under
-whichever ceiling governs your path — the kernel's `max_hw_sectors_kb` for
-`XNVME_KV` over a kernel NVMe-oF connection, or the SPDK target's own
-`max_io_size`/SGL-entries product for `SPDK_NVMe_KV`. These are **different
-ceilings on different paths** — don't carry a validated chunk size from one
-backend to the other without re-checking.
+### 4.4 `/dev/ng0n1` and `/dev/ng1n1` were never interchangeable — now moot
 
-### 4.4 `/dev/ng0n1` and `/dev/ng1n1` are not interchangeable, at all
+`ng1n1` is retired (§1), so this is historical: `ng0n1` was always `.100`'s
+real local Pensando DSC function (PCIe `0000:1c:00.0`), confirmed via
+`nvme list-subsys` (`nvme-subsys0`, NQN `nqn.2019-08.com.pensando:...`) and
+`nvme id-ctrl` (`Model: PDSNVME`). `ng1n1` was a kernel `nvme_tcp` path to
+`.88`'s RAM-backed SPDK target, confirmed via the same tools (`nvme-subsys1`,
+NQN `nqn.2016-06.io.spdk:cnode1`, `bdev_get_bdevs` → `"product_name": "KVMalloc
+disk"` on `.88`). `deploy.sh`'s own banner prints `category: 1 (real NVMe-KV
+device)` for **either** device path — it only pattern-matches `/dev/ngXnY`,
+it doesn't know what's actually behind it. This distinction is why §0's
+incident was foreseeable in hindsight (the hazard always applied in full to
+`ng0n1`) but wasn't foreseen in practice (the chunk size that was safe on
+`ng1n1` was carried over without re-validating against a structurally
+different failure mode).
 
-`.100` has two `/dev/ngXnY` devices and they are architecturally unrelated:
+### 4.5 (historical) `.88`'s `nvmf_tgt` predates this session — no longer relevant
 
-- **`/dev/ng0n1`** — the real local Pensando DSC function, PCIe `0000:1c:00.0`.
-  Plain local PCIe NVMe from the kernel's point of view (`nvme.ko`, no
-  `nvme_tcp`, no network stack visible to the host at all). **This is the
-  device the "never `docker kill`" hazard is about** — wedging its
-  `CC.EN`/`CSTS.RDY` handshake needs a DPU-console restart to clear, nothing
-  host-side works.
-- **`/dev/ng1n1`** — what this deployment actually uses. No DSC anywhere in
-  this path: plain kernel `nvme_tcp` software fabric, over the ordinary
-  management NIC, to `.88`'s SPDK target, which is itself RAM-backed
-  (`bdev_kvmalloc`, confirmed via `bdev_get_bdevs` — `"product_name": "KVMalloc
-  disk"`). Killing a container using *this* device cannot wedge DSC firmware
-  — there's no DSC in the data path at all. Worst case is a dropped TCP
-  session.
-
-`deploy.sh`'s own banner prints `category: 1 (real NVMe-KV device)` for
-**either** device — it only pattern-matches the `/dev/ngXnY` path, it doesn't
-know what's actually behind it. Don't trust that line; know which device
-you're pointed at instead.
-
-### 4.5 `.88`'s `nvmf_tgt` predates this session
-
-A live `nvmf_tgt` (`/root/kv_spdk/build/bin/nvmf_tgt`, `kv_spdk` tree) was
-already running on `.88` before this session touched anything, serving
-`nqn.2016-06.io.spdk:cnode1` with a single `KVMalloc` namespace, listening
-only on `1.1.0.2:4420` (a DSC-fabric address `.100` cannot reach — the two
-hosts' DSC ports are not wired together, confirmed by bringing both of
-`.100`'s DSC ports up and getting `Destination Host Unreachable` pinging
-`.88`'s side). Its ownership was confirmed conversationally this session
-before an **additive** listener on `10.30.48.88:4420` was added via RPC — the
-original `1.1.0.2:4420` listener and its one namespace were never touched.
-**Treat this target as shared infrastructure, not something this project
-provisioned** — don't restart `nvmf_tgt` itself, don't remove the listener,
-and re-verify the additive listener is still there after any reboot of `.88`
-(§1.1 of `BRINGUP-setup1.md`).
+`.88`'s target is untouched and still shared infrastructure (see
+`docs/setups/setup-1.md` §2) but is no longer part of this setup's deploy
+path at all (§1). Kept here only so a future reader doesn't go looking for a
+`.88` dependency that isn't there anymore.
 
 ---
 
 ## 5. Not done yet
 
-- **The Qwen2.5-3B llama-benchy sweep on record predates the
-  `AIC_CHUNK_SIZE` fix.** `/root/rixl-bench/results/yw-dell-gen4-1/2026-10-05-llama-benchy/llama-benchy-20261005-122401.md`
-  was run against a deployment where every KV store was silently failing
-  (§4.3) — its throughput/latency numbers are still valid (generation never
-  depended on storage succeeding), but it says nothing about the KV-offload
-  path, because that path was broken for the entire run. A sweep against the
-  current, chunk-size-fixed deployment has **not** been run.
-- **No RETRIEVE correctness check.** Nothing in this session proved a
-  RETRIEVE actually loads from storage rather than vLLM re-prefilling from
-  its own GPU prefix cache — `deploy.sh`'s own "ALSO" line (grep the log for
-  `need to load: [1-9]` or `Retrieved`, with `--no-enable-prefix-caching` on
-  the request path) was never followed through. Store-side correctness is
-  confirmed (§4.3's fix); retrieve-side is not.
-- **`/dev/ng0n1` (the real DSC) has never been deployed against in this
-  session.** Everything above used `/dev/ng1n1` (`.88`-backed, RAM
-  underneath). A `BACKEND=xnvme AIC_XNVME_DEV=/dev/ng0n1` deploy against the
-  real local device — the actual category-(1) end-goal hardware — is
-  untried, would need `AIC_CHUNK_SIZE` re-derived against that controller's
-  own (unmeasured) transfer ceiling, not the 1024 KB measured for `ng1n1`,
-  and **would** carry the real "never kill" hazard for real this time (§4.4).
-- **The Genoa/`.59` address in the original ask was stale** — corrected to
-  `.88` early in-session (see `docs/setups/setup-1.md` §2) — but the
-  possibility that the *original* `.59` host exists somewhere else on the
-  network, separate from `.88`, was never chased down. If that host turns up
-  later, it is not the same machine as anything referenced in this handoff.
+- **🔴 Get `/dev/ng0n1` back.** Nothing below is actionable until the DPU-side
+  app is restarted — see §0. This needs the hardware owner.
+- **Determine `ng0n1`'s actual safe transfer size**, empirically, once it's
+  back — §0's last paragraph. `AIC_CHUNK_SIZE=16` is not known-good for this
+  device; it was only ever validated for the now-retired `ng1n1`.
+- **Rebuild `rocm-aic:latest` from the trimmed patch series** (§2) and confirm
+  it still produces a working `XNVME_KV`-only image under an actual
+  `make build` — only `SKIP_BUILD=1` (vendor+patch+stage) has been validated
+  so far, not the Docker build itself. The image currently running on `.100`
+  predates this patch surgery.
+- **The Qwen2.5-3B llama-benchy sweep on record predates all of this.**
+  `/root/rixl-bench/results/yw-dell-gen4-1/2026-10-05-llama-benchy/llama-benchy-20261005-122401.md`
+  was run against the `ng1n1` deployment before even that chunk-size fix
+  landed — every KV store in it was silently failing. Its throughput/latency
+  numbers are still valid for generation (which never depended on storage
+  succeeding), but say nothing about the KV-offload path. No sweep has been
+  run against a working KV-offload path on either device this session.
+- **No RETRIEVE correctness check**, on either device. Nothing in this
+  session proved a RETRIEVE actually loads from storage rather than vLLM
+  re-prefilling from its own GPU prefix cache — `deploy.sh`'s own "ALSO" line
+  (grep the log for `need to load: [1-9]` or `Retrieved`, with
+  `--no-enable-prefix-caching` on the request path) was never followed
+  through, on `ng1n1` or `ng0n1`.
+- **`setup-1/README.md` is stale** relative to this session's patch surgery
+  (§2) — its SPDK_NVMe_KV/MP-mode sections describe a configuration this
+  track no longer builds. Not rewritten this session; flagged for whoever
+  next has reason to touch that file.
 
 ---
 
@@ -204,17 +291,17 @@ and re-verify the additive listener is still there after any reboot of `.88`
 
 | What | Where |
 |---|---|
-| Scripts (vendored from `rocm-aic`) | `setup-1/{build,deploy,target}.sh`, `setup-1/{patches,plugins}/` |
+| Scripts (vendored from `rocm-aic`) | `setup-1/{build,deploy,target}.sh`, `setup-1/{patches,plugins}/` — `target.sh` and `plugins/nvme-kv/` are now dead weight for this setup (§1-2) but left in place |
 | Benchmark harness (vendored from `attic/kv-cache/bench`) | copied to `.100:/root/rixl-bench/` — **not** checked into this worktree under `setup-1/` (see below) |
 | Topology/host facts | `docs/setups/setup-1.md` |
 | Step-by-step procedure | `docs/BRINGUP-setup1.md` |
 | This file | `setup-1/HANDOFF.md` |
-| Credentials | `creds/setup-1.env` (gitignored — SSH creds, BMC IPs, DSC console telnet endpoints) |
-| On `.100` | `/root/setup-1/` (scripts, copied from this worktree's `setup-1/`), `/root/rixl-bench/` (bench harness), `rocm-aic:latest` (docker image), `aic-xnvme-single` (running container) |
-| On `.88` | nothing deployed by this project — only the additive RPC listener (§4.5) |
+| Credentials | `creds/setup-1.env` (gitignored — SSH creds, BMC IPs, DSC console telnet endpoints — **no console login/command docs**, see §0) |
+| On `.100` | `/root/setup-1/` (scripts, copied from this worktree's `setup-1/` — **predates §2's patch surgery**, not yet re-copied), `/root/rixl-bench/` (bench harness), `rocm-aic:latest` (docker image — also predates §2), `aic-xnvme-single` (running container, KV storage dead per §0) |
+| On `.88` | nothing deployed by this project — only the additive RPC listener from earlier in this session, now unused by this setup (§1) |
 
 **`setup-1/bench/` is not in this worktree.** It was copied directly from
-`attic/kv-cache/bench` to `.100:/root/rixl-bench/` for convenience during this
-session and was not added to this repo's tracked tree. If you want it
+`attic/kv-cache/bench` to `.100:/root/rixl-bench/` for convenience during an
+earlier session and was not added to this repo's tracked tree. If you want it
 versioned here too, that's a deliberate follow-up, not something this handoff
 assumes already happened.
